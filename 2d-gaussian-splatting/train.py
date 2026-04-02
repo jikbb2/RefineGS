@@ -85,7 +85,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         dist_loss = lambda_dist * (rend_dist).mean()
 
         # loss
-        total_loss = loss + dist_loss + normal_loss
+        lambda_shading = 0.005  
+
+        shading_values = render_pkg.get('shading_map')
+        if shading_values is not None:
+            L_shading = torch.nn.functional.mse_loss(
+                shading_values, torch.ones_like(shading_values)
+            )
+        else:
+            L_shading = torch.tensor(0.0, device="cuda")
+
+        total_loss = loss + dist_loss + normal_loss + lambda_shading * L_shading
         
         total_loss.backward()
 
@@ -103,6 +113,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     "Loss": f"{ema_loss_for_log:.{5}f}",
                     "distort": f"{ema_dist_for_log:.{5}f}",
                     "normal": f"{ema_normal_for_log:.{5}f}",
+                    "shading": f"{L_shading.item():.{5}f}",
                     "Points": f"{len(gaussians.get_xyz)}"
                 }
                 progress_bar.set_postfix(loss_dict)

@@ -43,7 +43,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         scale_modifier=scaling_modifier,
         viewmatrix=viewpoint_camera.world_view_transform,
         projmatrix=viewpoint_camera.full_proj_transform,
-        sh_degree=pc.active_sh_degree,
+        sh_degree=0,
         campos=viewpoint_camera.camera_center,
         prefiltered=False,
         debug=False,
@@ -79,18 +79,29 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     
     # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors
     # from SHs in Python, do it. If not, then SH -> RGB conversion will be done by rasterizer.
-    pipe.convert_SHs_python = False
+    
     shs = None
     colors_precomp = None
     if override_color is None:
-        if pipe.convert_SHs_python:
-            shs_view = pc.get_features.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
-            dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.repeat(pc.get_features.shape[0], 1))
-            dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True)
-            sh2rgb = eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized)
-            colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
-        else:
-            shs = pc.get_features
+        # Intrinsic Decomposition: color = albedo × shading
+        albedo = pc.get_albedo  # [N, 3]
+
+        # 카메라→가우시안 방향 벡터
+        dir_pp = pc.get_xyz - viewpoint_camera.camera_center.repeat(
+            pc.get_xyz.shape[0], 1
+        )
+        dir_pp_normalized = dir_pp / (dir_pp.norm(dim=1, keepdim=True) + 1e-8)
+
+        # Shading 계산
+        normals = pc.get_normal  # [N, 3] ← 2DGS가 이미 제공
+        shading = pc.get_shading(normals, pc.get_xyz, dir_pp_normalized)  # [N, 1]
+
+        # 합성 색상
+        colors_precomp = albedo * shading  # [N, 3]
+
+        # 캐싱 (loss 계산 및 디버깅용)
+        pc._cached_shading = shading.detach()
+        pc._cached_albedo_render = albedo.detach()
     else:
         colors_precomp = override_color
     
@@ -153,6 +164,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             'rend_dist': render_dist,
             'surf_depth': surf_depth,
             'surf_normal': surf_normal,
+            'albedo_map': pc._cached_albedo_render,
+            'shading_map': pc._cached_shading
     })
 
     return rets
