@@ -72,3 +72,18 @@ def _ssim(img1, img2, window, window_size, channel, size_average=True):
     else:
         return ssim_map.mean(1).mean(1).mean(1)
 
+
+def chromaticity_consistency_loss(rendered_color, rendered_albedo):
+    """
+    Shading이 scalar이면 color와 albedo의 chromaticity(색 비율)가 동일해야 함.
+    rendered_color:  [3, H, W]
+    rendered_albedo: [3, H, W]
+    """
+    eps = 1e-6
+    color_sum  = rendered_color.sum(dim=0, keepdim=True)  + eps  # [1, H, W]
+    albedo_sum = rendered_albedo.sum(dim=0, keepdim=True) + eps
+
+    color_chrom  = rendered_color  / color_sum   # [3, H, W]
+    albedo_chrom = rendered_albedo / albedo_sum
+
+    return F.l1_loss(color_chrom, albedo_chrom)

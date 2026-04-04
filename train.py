@@ -22,6 +22,8 @@ from tqdm import tqdm
 from utils.image_utils import psnr, render_net_image
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
+from utils.loss_utils import l1_loss, ssim, chromaticity_consistency_loss
+
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -29,6 +31,8 @@ except ImportError:
     TENSORBOARD_FOUND = False
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint):
+    lambda_chrom   = 0.02
+    lambda_shading = 0.005
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree)
@@ -95,7 +99,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         else:
             L_shading = torch.tensor(0.0, device="cuda")
 
-        total_loss = loss + dist_loss + normal_loss + lambda_shading * L_shading
+        L_chrom = torch.tensor(0.0, device="cuda")
+        if render_pkg.get('albedo_map') is not None:
+            L_chrom = chromaticity_consistency_loss(image, render_pkg['albedo_map'])
+
+        total_loss = loss + dist_loss + normal_loss + lambda_shading * L_shading + lambda_chrom * L_chrom
         
         total_loss.backward()
 
@@ -114,6 +122,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     "distort": f"{ema_dist_for_log:.{5}f}",
                     "normal": f"{ema_normal_for_log:.{5}f}",
                     "shading": f"{L_shading.item():.{5}f}",
+                    "chrom":   f"{L_chrom.item():.{5}f}",
                     "Points": f"{len(gaussians.get_xyz)}"
                 }
                 progress_bar.set_postfix(loss_dict)

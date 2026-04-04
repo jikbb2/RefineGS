@@ -116,6 +116,20 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         cov3D_precomp = cov3D_precomp
     )
     
+    # Albedo 렌더링 이미지 (chromaticity loss용)
+    rendered_albedo = None
+    if override_color is None:
+        rendered_albedo, _, _ = rasterizer(
+            means3D=means3D,
+            means2D=means2D,
+            shs=None,
+            colors_precomp=pc._cached_albedo_render,
+            opacities=opacity,
+            scales=scales,
+            rotations=rotations,
+            cov3D_precomp=cov3D_precomp,
+        )
+    
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
     rets =  {"render": rendered_image,
@@ -164,7 +178,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             'rend_dist': render_dist,
             'surf_depth': surf_depth,
             'surf_normal': surf_normal,
-            'albedo_map': pc._cached_albedo_render,
+            'albedo_map': rendered_albedo,
             'shading_map': pc._cached_shading
     })
 
