@@ -31,7 +31,7 @@ except ImportError:
     TENSORBOARD_FOUND = False
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint):
-    lambda_chrom   = 0.02
+    lambda_chrom   = 0.01
     lambda_shading = 0.005
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
@@ -101,7 +101,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         L_chrom = torch.tensor(0.0, device="cuda")
         if render_pkg.get('albedo_map') is not None:
-            L_chrom = chromaticity_consistency_loss(image, render_pkg['albedo_map'])
+            L_chrom = chromaticity_consistency_loss(
+                image,
+                render_pkg['albedo_map'],
+                alpha_mask=render_pkg.get('rend_alpha')
+            )
 
         total_loss = loss + dist_loss + normal_loss + lambda_shading * L_shading + lambda_chrom * L_chrom
         
