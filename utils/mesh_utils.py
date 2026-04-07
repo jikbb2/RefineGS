@@ -274,8 +274,18 @@ class GaussianExtractor(object):
         torch.cuda.empty_cache()
         mesh = mesh.as_open3d
         print("texturing mesh ... ")
-        _, rgbs = compute_unbounded_tsdf(torch.tensor(np.asarray(mesh.vertices)).float().cuda(), inv_contraction=None, voxel_size=voxel_size, return_rgb=True)
-        mesh.vertex_colors = o3d.utility.Vector3dVector(rgbs.cpu().numpy())
+        vertices_np = np.asarray(mesh.vertices)
+        chunk_size = 500_000
+        all_rgbs = []
+        for i in range(0, len(vertices_np), chunk_size):
+            verts_chunk = torch.tensor(vertices_np[i:i+chunk_size]).float().cuda()
+            _, rgb_chunk = compute_unbounded_tsdf(
+                verts_chunk, inv_contraction=None, voxel_size=voxel_size, return_rgb=True
+            )
+            all_rgbs.append(rgb_chunk.cpu())
+            torch.cuda.empty_cache()
+        rgbs = torch.cat(all_rgbs, dim=0)
+        mesh.vertex_colors = o3d.utility.Vector3dVector(rgbs.numpy())
         return mesh
 
     @torch.no_grad()

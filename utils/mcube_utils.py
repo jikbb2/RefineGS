@@ -1,19 +1,8 @@
-#
-# Copyright (C) 2024, ShanghaiTech
-# SVIP research group, https://github.com/svip-lab
-# All rights reserved.
-#
-# This software is free for non-commercial, research and evaluation use 
-# under the terms of the LICENSE.md file.
-#
-# For inquiries contact  huangbb@shanghaitech.edu.cn
-#
-
 import numpy as np
 import torch
 import trimesh
 from skimage import measure
-# modified from here https://github.com/autonomousvision/sdfstudio/blob/370902a10dbef08cb3fe4391bd3ed1e227b5c165/nerfstudio/utils/marching_cubes.py#L201
+
 def marching_cubes_with_contraction(
     sdf,
     resolution=512,
@@ -26,18 +15,15 @@ def marching_cubes_with_contraction(
     max_range=32.0,
 ):
     assert resolution % 512 == 0
-
     resN = resolution
     cropN = 512
     level = 0
     N = resN // cropN
-
     grid_min = bounding_box_min
     grid_max = bounding_box_max
     xs = np.linspace(grid_min[0], grid_max[0], N + 1)
     ys = np.linspace(grid_min[1], grid_max[1], N + 1)
     zs = np.linspace(grid_min[2], grid_max[2], N + 1)
-
     meshes = []
     for i in range(N):
         for j in range(N):
@@ -46,13 +32,12 @@ def marching_cubes_with_contraction(
                 x_min, x_max = xs[i], xs[i + 1]
                 y_min, y_max = ys[j], ys[j + 1]
                 z_min, z_max = zs[k], zs[k + 1]
-
                 x = torch.linspace(x_min, x_max, cropN).cuda()
                 y = torch.linspace(y_min, y_max, cropN).cuda()
                 z = torch.linspace(z_min, z_max, cropN).cuda()
-
                 xx, yy, zz = torch.meshgrid(x, y, z, indexing="ij")
-                points = torch.tensor(torch.vstack([xx.ravel(), yy.ravel(), zz.ravel()]).T, dtype=torch.float).cuda()
+                # Fix: use detach().clone() instead of torch.tensor()
+                points = torch.vstack([xx.ravel(), yy.ravel(), zz.ravel()]).T.detach().clone().float()
 
                 @torch.no_grad()
                 def evaluate(points):
@@ -62,7 +47,6 @@ def marching_cubes_with_contraction(
                     z = torch.cat(z, axis=0)
                     return z
 
-                # construct point pyramids
                 points = points.reshape(cropN, cropN, cropN, 3)
                 points = points.reshape(-1, 3)
                 pts_sdf = evaluate(points.contiguous())
@@ -81,15 +65,34 @@ def marching_cubes_with_contraction(
                     verts = verts + np.array([x_min, y_min, z_min])
                     meshcrop = trimesh.Trimesh(verts, faces, normals)
                     meshes.append(meshcrop)
-                
+
                 print("finished one block")
 
-    combined = trimesh.util.concatenate(meshes)
-    combined.merge_vertices(digits_vertex=6)
+    # Guard against empty mesh list
+    if len(meshes) == 0:
+        print("Warning: no surfaces found in any block!")
+        return trimesh.Trimesh()
 
-    # inverse contraction and clipping the points range
+    combined = trimesh.util.concatenate(meshes)
+    print(f"Combined mesh: {len(combined.vertices)} vertices, {len(combined.faces)} faces")
+
+    # merge_vertices can segfault on large meshes — skip if too large
+    if len(combined.vertices) < 5_000_000:
+        try:
+            combined.merge_vertices(digits_vertex=6)
+        except Exception as e:
+            print(f"merge_vertices failed ({e}), skipping")
+    else:
+        print(f"Skipping merge_vertices (mesh too large: {len(combined.vertices)} verts)")
+
+    # inverse contraction in chunks to avoid CUDA OOM
     if inv_contraction is not None:
-        combined.vertices = inv_contraction(torch.from_numpy(combined.vertices).float().cuda()).cpu().numpy()
+        verts = torch.from_numpy(combined.vertices).float()
+        chunk_size = 1_000_000
+        out_verts = []
+        for chunk in torch.split(verts, chunk_size):
+            out_verts.append(inv_contraction(chunk.cuda()).cpu())
+        combined.vertices = torch.cat(out_verts, dim=0).numpy()
         combined.vertices = np.clip(combined.vertices, -max_range, max_range)
-    
+
     return combined
