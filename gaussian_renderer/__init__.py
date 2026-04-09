@@ -17,6 +17,7 @@ from utils.sh_utils import eval_sh
 from utils.point_utils import depth_to_normal
 
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None):
+    
     """
     Render the scene. 
     
@@ -183,3 +184,113 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     })
 
     return rets
+"""
+gaussian_renderer/__init__.py 에 추가할 render_semantic 함수.
+기존 render() 함수 바로 아래에 붙여넣으세요.
+
+필요한 import는 이미 __init__.py 상단에 있음:
+    import math
+    from diff_surfel_rasterization import GaussianRasterizationSettings, GaussianRasterizer
+"""
+
+
+def render_semantic(
+    viewpoint_camera,
+    pc,
+    pipe,
+    scaling_modifier: float = 1.0,
+) -> torch.Tensor:
+    """
+    Semantic feature map을 multi-pass rasterization으로 렌더링합니다.
+    3채널씩 나눠서 ceil(feature_dim / 3)번 rasterizer를 호출하고 concat합니다.
+
+    Returns:
+        rendered_feature  [F_dim, H, W]  float32  (gradient 흐름 있음)
+    """
+    # ── screenspace points (gradient anchor) ─────────────────────
+    screenspace_points = (
+        torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype,
+                         requires_grad=True, device="cuda") + 0
+    )
+    try:
+        screenspace_points.retain_grad()
+    except Exception:
+        pass
+
+    # ── rasterizer settings ───────────────────────────────────────
+    tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
+    tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
+
+    # feature background = 0 (unoccupied pixels will be 0)
+    bg_feat = torch.zeros(3, device="cuda")
+
+    raster_settings = GaussianRasterizationSettings(
+        image_height=int(viewpoint_camera.image_height),
+        image_width=int(viewpoint_camera.image_width),
+        tanfovx=tanfovx,
+        tanfovy=tanfovy,
+        bg=bg_feat,
+        scale_modifier=scaling_modifier,
+        viewmatrix=viewpoint_camera.world_view_transform,
+        projmatrix=viewpoint_camera.full_proj_transform,
+        sh_degree=0,
+        campos=viewpoint_camera.camera_center,
+        prefiltered=False,
+        debug=False,
+    )
+    rasterizer = GaussianRasterizer(raster_settings=raster_settings)
+
+    # ── geometry (shared across all passes) ───────────────────────
+    means3D = pc.get_xyz
+    means2D = screenspace_points
+    opacity = pc.get_opacity
+
+    if pipe.compute_cov3D_python:
+        splat2world = pc.get_covariance(scaling_modifier)
+        W_img = viewpoint_camera.image_width
+        H_img = viewpoint_camera.image_height
+        near, far = viewpoint_camera.znear, viewpoint_camera.zfar
+        ndc2pix = torch.tensor([
+            [W_img / 2,       0, 0, (W_img - 1) / 2],
+            [0,       H_img / 2, 0, (H_img - 1) / 2],
+            [0,               0, far - near,     near],
+            [0,               0, 0,                 1],
+        ]).float().cuda().T
+        world2pix    = viewpoint_camera.full_proj_transform @ ndc2pix
+        cov3D_precomp = (
+            splat2world[:, [0, 1, 3]] @ world2pix[:, [0, 1, 3]]
+        ).permute(0, 2, 1).reshape(-1, 9)
+        scales, rotations = None, None
+    else:
+        cov3D_precomp = None
+        scales    = pc.get_scaling
+        rotations = pc.get_rotation
+
+    # ── multi-pass feature rendering ─────────────────────────────
+    features  = pc.get_semantic_feature   # [N, F_dim]
+    F_dim     = features.shape[1]
+    rendered_chunks = []
+
+    for start in range(0, F_dim, 3):
+        end             = min(start + 3, F_dim)
+        actual_ch       = end - start
+        chunk           = features[:, start:end]           # [N, actual_ch]
+
+        # rasterizer requires exactly 3 channels: pad if needed
+        if actual_ch < 3:
+            chunk = F.pad(chunk, (0, 3 - actual_ch))       # [N, 3]
+
+        rendered_chunk, _, _ = rasterizer(
+            means3D       = means3D,
+            means2D       = means2D,
+            shs           = None,
+            colors_precomp= chunk,
+            opacities     = opacity,
+            scales        = scales,
+            rotations     = rotations,
+            cov3D_precomp = cov3D_precomp,
+        )
+        # strip padding channels before appending
+        rendered_chunks.append(rendered_chunk[:actual_ch])   # [actual_ch, H, W]
+
+    return torch.cat(rendered_chunks, dim=0)   # [F_dim, H, W]
