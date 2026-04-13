@@ -129,7 +129,7 @@ class GaussianModel:
 
     def restore(self, model_args, training_args):
         # old checkpoints (Stage 1) don't have _semantic_feature → handle gracefully
-        if len(model_args) == 14:
+        if len(model_args) == 13:
             # Stage 2 checkpoint (with semantic_feature)
             (self.active_sh_degree,
              self._xyz,

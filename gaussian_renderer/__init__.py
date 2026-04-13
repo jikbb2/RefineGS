@@ -15,6 +15,7 @@ from diff_surfel_rasterization import GaussianRasterizationSettings, GaussianRas
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 from utils.point_utils import depth_to_normal
+import torch.nn.functional as F
 
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None):
     

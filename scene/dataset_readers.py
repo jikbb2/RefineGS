@@ -198,7 +198,8 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
             T = w2c[:3, 3]
 
             image_path = os.path.join(path, cam_name)
-            image_name = Path(cam_name).stem
+            _p = Path(cam_name)
+            image_name = f"{_p.parent.name}_{_p.stem}" if _p.parent.name not in ('.', '') else _p.stem
             image = Image.open(image_path)
 
             im_data = np.array(image.convert("RGBA"))
