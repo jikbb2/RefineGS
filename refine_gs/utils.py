@@ -24,9 +24,15 @@ def load_cameras_from_transforms(transforms_path):
     fov_x = meta["camera_angle_x"]
     frames = meta["frames"]
 
+    # Blender (OpenGL) → OpenCV coordinate conversion
+    # Blender: +X right, +Y up, -Z forward
+    # OpenCV:  +X right, +Y down, +Z forward
+    blender_to_opencv = np.diag([1, -1, -1, 1]).astype(np.float64)
+
     cameras = []
     for frame in frames:
-        c2w = np.array(frame["transform_matrix"], dtype=np.float64)  # [4,4]
+        c2w_blender = np.array(frame["transform_matrix"], dtype=np.float64)  # [4,4]
+        c2w = c2w_blender @ blender_to_opencv  # convert to OpenCV convention
         w2c = np.linalg.inv(c2w)
 
         # Resolve image path
