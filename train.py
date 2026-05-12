@@ -13,7 +13,7 @@ import os
 import torch
 from random import randint
 from utils.loss_utils import l1_loss, ssim
-from gaussian_renderer import render, render_semantic, network_gui
+from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
@@ -22,9 +22,6 @@ from tqdm import tqdm
 from utils.image_utils import psnr, render_net_image
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
-from utils.loss_utils import l1_loss, ssim, chromaticity_consistency_loss
-
-
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -32,34 +29,14 @@ except ImportError:
     TENSORBOARD_FOUND = False
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint):
-    lambda_chrom   = 0.01
-    lambda_shading = 0.005
-    lambda_semantic       = 0.05
-    semantic_start_iter   = 3000
-        
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
     if checkpoint:
-        (model_params, first_iter) = torch.load(checkpoint, weights_only=False)
+        (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
-        
-    semantic_feature_cache = {}
-    _cache_dir = os.path.join(dataset.source_path, "semantic_feature_cache")
-    if os.path.isdir(_cache_dir):
-        for cam in scene.getTrainCameras():
-            _feat_path = os.path.join(_cache_dir, f"{cam.image_name}.pt")
-            if os.path.isfile(_feat_path):
-                semantic_feature_cache[cam.image_name] = torch.load(
-                    _feat_path, map_location="cpu"
-                )
-        print(f"[Stage 2] Loaded {len(semantic_feature_cache)} semantic feature maps "
-              f"from {_cache_dir}")
-    else:
-        print(f"[Stage 2] WARNING: No semantic feature cache found at {_cache_dir}")
-        print(f"          Run first:  python utils/feature_extractor.py -s {dataset.source_path}")
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -107,43 +84,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         normal_loss = lambda_normal * (normal_error).mean()
         dist_loss = lambda_dist * (rend_dist).mean()
 
-        shading_values = render_pkg.get('shading_map')
-        if shading_values is not None:
-            L_shading = torch.nn.functional.mse_loss(
-                shading_values, torch.ones_like(shading_values)
-            )
-        else:
-            L_shading = torch.tensor(0.0, device="cuda")
-
-        L_chrom = torch.tensor(0.0, device="cuda")
-        if render_pkg.get('albedo_map') is not None:
-            L_chrom = chromaticity_consistency_loss(
-                image,
-                render_pkg['albedo_map'],
-                alpha_mask=render_pkg.get('rend_alpha')
-            )
-
-        L_semantic = torch.tensor(0.0, device="cuda")
-        if semantic_feature_cache and iteration >= semantic_start_iter:
-            gt_feat = semantic_feature_cache.get(viewpoint_cam.image_name)
-            if gt_feat is not None:
-                rendered_feat = render_semantic(viewpoint_cam, gaussians, pipe)
-                gt_feat = gt_feat.cuda()
-                F_dim = rendered_feat.shape[0]
-                r_flat = rendered_feat.reshape(F_dim, -1).T
-                g_flat = gt_feat.reshape(F_dim, -1).T
-                L_semantic = 1.0 - torch.nn.functional.cosine_similarity(
-                    r_flat, g_flat, dim=1
-                ).mean()
-
-        total_loss = (
-            loss
-            + dist_loss
-            + normal_loss
-            + lambda_shading * L_shading
-            + lambda_chrom   * L_chrom
-            + lambda_semantic * L_semantic
-        )
+        # loss
+        total_loss = loss + dist_loss + normal_loss
         
         total_loss.backward()
 
@@ -161,9 +103,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     "Loss": f"{ema_loss_for_log:.{5}f}",
                     "distort": f"{ema_dist_for_log:.{5}f}",
                     "normal": f"{ema_normal_for_log:.{5}f}",
-                    "shading": f"{L_shading.item():.{5}f}",
-                    "chrom":   f"{L_chrom.item():.{5}f}",
-                    "sem":     f"{L_semantic.item():.{5}f}",
                     "Points": f"{len(gaussians.get_xyz)}"
                 }
                 progress_bar.set_postfix(loss_dict)
@@ -176,7 +115,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if tb_writer is not None:
                 tb_writer.add_scalar('train_loss_patches/dist_loss', ema_dist_for_log, iteration)
                 tb_writer.add_scalar('train_loss_patches/normal_loss', ema_normal_for_log, iteration)
-                tb_writer.add_scalar('train_loss_patches/semantic_loss',  L_semantic.item(),  iteration)
 
             training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
             if (iteration in saving_iterations):

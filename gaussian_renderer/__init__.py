@@ -15,10 +15,8 @@ from diff_surfel_rasterization import GaussianRasterizationSettings, GaussianRas
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 from utils.point_utils import depth_to_normal
-import torch.nn.functional as F
 
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None):
-    
     """
     Render the scene. 
     
@@ -45,7 +43,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         scale_modifier=scaling_modifier,
         viewmatrix=viewpoint_camera.world_view_transform,
         projmatrix=viewpoint_camera.full_proj_transform,
-        sh_degree=0,
+        sh_degree=pc.active_sh_degree,
         campos=viewpoint_camera.camera_center,
         prefiltered=False,
         debug=False,
@@ -81,29 +79,18 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     
     # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors
     # from SHs in Python, do it. If not, then SH -> RGB conversion will be done by rasterizer.
-    
+    pipe.convert_SHs_python = False
     shs = None
     colors_precomp = None
     if override_color is None:
-        # Intrinsic Decomposition: color = albedo × shading
-        albedo = pc.get_albedo  # [N, 3]
-
-        # 카메라→가우시안 방향 벡터
-        dir_pp = pc.get_xyz - viewpoint_camera.camera_center.repeat(
-            pc.get_xyz.shape[0], 1
-        )
-        dir_pp_normalized = dir_pp / (dir_pp.norm(dim=1, keepdim=True) + 1e-8)
-
-        # Shading 계산
-        normals = pc.get_normal  # [N, 3] ← 2DGS가 이미 제공
-        shading = pc.get_shading(normals, pc.get_xyz, dir_pp_normalized)  # [N, 1]
-
-        # 합성 색상
-        colors_precomp = albedo * shading  # [N, 3]
-
-        # 캐싱 (loss 계산 및 디버깅용)
-        pc._cached_shading = shading.detach()
-        pc._cached_albedo_render = albedo.detach()
+        if pipe.convert_SHs_python:
+            shs_view = pc.get_features.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
+            dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.repeat(pc.get_features.shape[0], 1))
+            dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True)
+            sh2rgb = eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized)
+            colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
+        else:
+            shs = pc.get_features
     else:
         colors_precomp = override_color
     
@@ -117,20 +104,6 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         rotations = rotations,
         cov3D_precomp = cov3D_precomp
     )
-    
-    # Albedo 렌더링 이미지 (chromaticity loss용)
-    rendered_albedo = None
-    if override_color is None:
-        rendered_albedo, _, _ = rasterizer(
-            means3D=means3D,
-            means2D=means2D,
-            shs=None,
-            colors_precomp=pc._cached_albedo_render,
-            opacities=opacity,
-            scales=scales,
-            rotations=rotations,
-            cov3D_precomp=cov3D_precomp,
-        )
     
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
@@ -180,118 +153,6 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             'rend_dist': render_dist,
             'surf_depth': surf_depth,
             'surf_normal': surf_normal,
-            'albedo_map': rendered_albedo,
-            'shading_map': pc._cached_shading
     })
 
     return rets
-"""
-gaussian_renderer/__init__.py 에 추가할 render_semantic 함수.
-기존 render() 함수 바로 아래에 붙여넣으세요.
-
-필요한 import는 이미 __init__.py 상단에 있음:
-    import math
-    from diff_surfel_rasterization import GaussianRasterizationSettings, GaussianRasterizer
-"""
-
-
-def render_semantic(
-    viewpoint_camera,
-    pc,
-    pipe,
-    scaling_modifier: float = 1.0,
-) -> torch.Tensor:
-    """
-    Semantic feature map을 multi-pass rasterization으로 렌더링합니다.
-    3채널씩 나눠서 ceil(feature_dim / 3)번 rasterizer를 호출하고 concat합니다.
-
-    Returns:
-        rendered_feature  [F_dim, H, W]  float32  (gradient 흐름 있음)
-    """
-    # ── screenspace points (gradient anchor) ─────────────────────
-    screenspace_points = (
-        torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype,
-                         requires_grad=True, device="cuda") + 0
-    )
-    try:
-        screenspace_points.retain_grad()
-    except Exception:
-        pass
-
-    # ── rasterizer settings ───────────────────────────────────────
-    tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
-    tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
-
-    # feature background = 0 (unoccupied pixels will be 0)
-    bg_feat = torch.zeros(3, device="cuda")
-
-    raster_settings = GaussianRasterizationSettings(
-        image_height=int(viewpoint_camera.image_height),
-        image_width=int(viewpoint_camera.image_width),
-        tanfovx=tanfovx,
-        tanfovy=tanfovy,
-        bg=bg_feat,
-        scale_modifier=scaling_modifier,
-        viewmatrix=viewpoint_camera.world_view_transform,
-        projmatrix=viewpoint_camera.full_proj_transform,
-        sh_degree=0,
-        campos=viewpoint_camera.camera_center,
-        prefiltered=False,
-        debug=False,
-    )
-    rasterizer = GaussianRasterizer(raster_settings=raster_settings)
-
-    # ── geometry (shared across all passes) ───────────────────────
-    means3D = pc.get_xyz
-    means2D = screenspace_points
-    opacity = pc.get_opacity
-
-    if pipe.compute_cov3D_python:
-        splat2world = pc.get_covariance(scaling_modifier)
-        W_img = viewpoint_camera.image_width
-        H_img = viewpoint_camera.image_height
-        near, far = viewpoint_camera.znear, viewpoint_camera.zfar
-        ndc2pix = torch.tensor([
-            [W_img / 2,       0, 0, (W_img - 1) / 2],
-            [0,       H_img / 2, 0, (H_img - 1) / 2],
-            [0,               0, far - near,     near],
-            [0,               0, 0,                 1],
-        ]).float().cuda().T
-        world2pix    = viewpoint_camera.full_proj_transform @ ndc2pix
-        cov3D_precomp = (
-            splat2world[:, [0, 1, 3]] @ world2pix[:, [0, 1, 3]]
-        ).permute(0, 2, 1).reshape(-1, 9)
-        scales, rotations = None, None
-    else:
-        cov3D_precomp = None
-        scales    = pc.get_scaling
-        rotations = pc.get_rotation
-
-    # ── multi-pass feature rendering ─────────────────────────────
-    features  = pc.get_semantic_feature   # [N, F_dim]
-    F_dim     = features.shape[1]
-    rendered_chunks = []
-
-    for start in range(0, F_dim, 3):
-        end             = min(start + 3, F_dim)
-        actual_ch       = end - start
-        chunk           = features[:, start:end]           # [N, actual_ch]
-
-        # rasterizer requires exactly 3 channels: pad if needed
-        if actual_ch < 3:
-            chunk = F.pad(chunk, (0, 3 - actual_ch))       # [N, 3]
-
-        rendered_chunk, _, _ = rasterizer(
-            means3D       = means3D,
-            means2D       = means2D,
-            shs           = None,
-            colors_precomp= chunk,
-            opacities     = opacity,
-            scales        = scales,
-            rotations     = rotations,
-            cov3D_precomp = cov3D_precomp,
-        )
-        # strip padding channels before appending
-        rendered_chunks.append(rendered_chunk[:actual_ch])   # [actual_ch, H, W]
-
-    return torch.cat(rendered_chunks, dim=0)   # [F_dim, H, W]

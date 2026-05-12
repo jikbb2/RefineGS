@@ -72,23 +72,3 @@ def _ssim(img1, img2, window, window_size, channel, size_average=True):
     else:
         return ssim_map.mean(1).mean(1).mean(1)
 
-
-def chromaticity_consistency_loss(rendered_color, rendered_albedo, alpha_mask=None):
-    eps = 1e-6
-
-    # 전경 픽셀에만 적용 (alpha > 0.5인 픽셀)
-    if alpha_mask is not None:
-        mask = (alpha_mask > 0.5).squeeze(0)  # [H, W]
-        rendered_color  = rendered_color[:, mask]   # [3, N_fg]
-        rendered_albedo = rendered_albedo[:, mask]  # [3, N_fg]
-
-    if rendered_color.numel() == 0:
-        return torch.tensor(0.0, device=rendered_color.device)
-
-    color_sum  = rendered_color.sum(dim=0, keepdim=True)  + eps
-    albedo_sum = rendered_albedo.sum(dim=0, keepdim=True) + eps
-
-    color_chrom  = rendered_color  / color_sum
-    albedo_chrom = rendered_albedo / albedo_sum
-
-    return F.l1_loss(color_chrom, albedo_chrom)
