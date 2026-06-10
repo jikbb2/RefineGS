@@ -139,15 +139,21 @@ def camera_to_JSON(id, camera : Camera):
     pos = W2C[:3, 3]
     rot = W2C[:3, :3]
     serializable_array_2d = [x.tolist() for x in rot]
+    # [RefineGS fix] cameras.py 의 Camera 속성명에 맞춤
+    #   width/height/FovX/FovY  ->  image_width/image_height/FoVx/FoVy
+    width = getattr(camera, "image_width", getattr(camera, "width", None))
+    height = getattr(camera, "image_height", getattr(camera, "height", None))
+    fovx = getattr(camera, "FoVx", getattr(camera, "FovX", None))
+    fovy = getattr(camera, "FoVy", getattr(camera, "FovY", None))
     camera_entry = {
         'id' : id,
         'img_name' : camera.image_name,
-        'width' : camera.width,
-        'height' : camera.height,
+        'width' : width,
+        'height' : height,
         'position': pos.tolist(),
         'rotation': serializable_array_2d,
-        'fy' : fov2focal(camera.FovY, camera.height),
-        'fx' : fov2focal(camera.FovX, camera.width)
+        'fy' : fov2focal(fovy, height),
+        'fx' : fov2focal(fovx, width)
     }
     return camera_entry
 
