@@ -12,3 +12,6 @@ data
 eval
 *.npz
 **/tmp
+checkpoints/
+*.pt
+submodules/

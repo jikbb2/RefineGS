@@ -47,6 +47,8 @@ if __name__ == "__main__":
     dataset, opt, pipe = lp.extract(args), op.extract(args), pp.extract(args)
 
     print("[1] build GaussianModel + Scene ...")
+    
+    os.makedirs(dataset.model_path, exist_ok=True)   # Scene 이 input.ply/cameras.json 를 여기 기록
     gaussians = GaussianModel(dataset.sh_degree, 0, opt.optimizer_type)   # per-object: active_sh_degree=0
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
