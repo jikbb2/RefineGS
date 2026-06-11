@@ -15,7 +15,7 @@ from sklearn.cluster import DBSCAN
 from sam2.build_sam import build_sam2
 from sam2.sam2_image_predictor import SAM2ImagePredictor
 import matplotlib
-matplotlib.use("TkAgg")  
+matplotlib.use("Agg")  
 import open3d as o3d
 
 from collections import Counter
@@ -589,7 +589,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Open-vocabulary segmentation evaluation")
 
     parser.add_argument(
-        "-dataset",
+        "--scene",
         type=str, 
         default=None,
         help="Dataset to perform propagation"
@@ -603,7 +603,7 @@ if __name__ == "__main__":
     
     args = parser.parse_args()
      
-    DATASET = args.dataset
+    DATASET = args.scene
     
     VERBOSE = args.verbose
 
