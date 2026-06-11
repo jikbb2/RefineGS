@@ -17,7 +17,7 @@ def image_filter(gaussians, cameras, pipe, dataset):
 
     alpha = 0.001
     for v in cameras:
-        render_pkg = render(v, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=False)
+        render_pkg = render(v, gaussians, pipe, bg)
 
         image = render_pkg["render"]
 
@@ -65,7 +65,7 @@ def mask_filter(gaussians, cameras, pipe, dataset, id, obj_id):
         else:
             continue
     
-        render_pkg = render(v, gaussians, pipe, bg, use_trained_exp = dataset.train_test_exp, separate_sh=False, id_filter=obj_id)
+        render_pkg = render(v, gaussians, pipe, bg, id_filter=obj_id)
         mask =  render_pkg["mask"]
 
         mask_np = mask.detach().cpu().numpy()

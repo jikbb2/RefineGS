@@ -120,8 +120,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value) + Ll1_mask * 0.25
 
         # ---- [2DGS] regularization: depth distortion + normal consistency ----
-        lambda_normal = opt.lambda_normal if iteration > 7000 else 0.0
-        lambda_dist = opt.lambda_dist if iteration > 3000 else 0.0
+#         lambda_normal = opt.lambda_normal if iteration > 7000 else 0.0
+#         lambda_dist = opt.lambda_dist if iteration > 3000 else 0.0
+        lambda_normal = opt.lambda_normal if iteration > 1500 else 0.0
+        lambda_dist   = opt.lambda_dist   if iteration > 500  else 0.0
 
         rend_dist = render_pkg["rend_dist"]
         rend_normal = render_pkg["rend_normal"]
