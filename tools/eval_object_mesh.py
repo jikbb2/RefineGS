@@ -527,6 +527,67 @@ def cmd_eval(args):
         print(f"saved -> {args.out}")
 
 
+def cmd_diagnose(args):
+    """Pinpoint failure stage: global frame vs instance identity vs masks."""
+    vertices, tris, tri_ids = load_semantic_mesh(args.gt_mesh)
+    recon = _load_recon(args.recon)
+    r_pts, r_nrm = sample_with_normals(recon, 5000)
+
+    print("== 1. global frames ==")
+    print(f"  recon bbox min/max : {recon.vertices.min(0).round(2)} / "
+          f"{recon.vertices.max(0).round(2)}")
+    print(f"  GT scene bbox      : {vertices.min(0).round(2)} / "
+          f"{vertices.max(0).round(2)}")
+    # one-way distance recon -> FULL GT scene (all instances incl. walls)
+    scene = trimesh.Trimesh(vertices=vertices, faces=tris, process=False)
+    sub, _ = sample_with_normals(scene, 200_000)
+    d, _ = cKDTree(sub).query(r_pts, k=1)
+    print(f"  recon -> full GT scene: mean {np.mean(d)*1000:.1f} mm, "
+          f"median {np.median(d)*1000:.1f} mm")
+    print("  -> median < ~50mm: frames ALIGNED (problem is instance identity)")
+    print("  -> median large  : frame MISMATCH (transform needed)")
+
+    if args.colmap_dir and args.masks_dir:
+        print("== 2. cameras & masks ==")
+        cams = load_instance_cameras(args.colmap_dir)
+        vmasks = load_instance_masks(args.masks_dir, cams)
+        n_match = sum(1 for c in cams if vmasks.get(c["stem"]) is not None)
+        print(f"  views: {len(cams)}, masks matched by stem: {n_match}")
+        if n_match == 0:
+            stems = [c["stem"] for c in cams[:3]]
+            files = sorted(os.listdir(args.masks_dir))[:3]
+            print(f"  MASK NAME MISMATCH. camera stems e.g. {stems}")
+            print(f"                      mask files   e.g. {files}")
+        else:
+            in_img = in_mask = front = 0
+            n_cam_used = 0
+            for cam in cams:
+                m = vmasks.get(cam["stem"])
+                if m is None:
+                    continue
+                n_cam_used += 1
+                Xc = r_pts @ cam["R"].T + cam["t"]
+                z = Xc[:, 2]
+                ok = z > 1e-6
+                Hm, Wm = m.shape
+                u = (cam["fx"] * Xc[:, 0] / np.where(ok, z, 1) + cam["cx"]) * (Wm / cam["W"])
+                v = (cam["fy"] * Xc[:, 1] / np.where(ok, z, 1) + cam["cy"]) * (Hm / cam["H"])
+                ui, vi = u.astype(np.int64), v.astype(np.int64)
+                ok &= (ui >= 0) & (ui < Wm) & (vi >= 0) & (vi < Hm)
+                in_img += ok.mean()
+                im = np.zeros(len(r_pts), bool)
+                im[ok] = m[vi[ok], ui[ok]]
+                in_mask += im.mean()
+                C = -cam["R"].T @ cam["t"]
+                front += ((np.einsum("ij,ij->i", r_nrm, C[None] - r_pts) > 0) & im).mean()
+            print(f"  recon pts avg over {n_cam_used} views: "
+                  f"in-image {in_img/n_cam_used:.3f}, in-mask {in_mask/n_cam_used:.3f}, "
+                  f"in-mask&front {front/n_cam_used:.3f}")
+            print("  -> in-image~0: camera/recon frame mismatch")
+            print("  -> in-image ok, in-mask~0: wrong masks_dir or empty masks")
+            print("  -> in-mask ok, front~0: normal orientation flipped")
+
+
 def cmd_batch(args):
     gt_data = load_semantic_mesh(args.gt_mesh)
 
@@ -622,6 +683,13 @@ def main():
     p.add_argument("--gt_id", type=int, default=None)
     p.add_argument("--out", default=None, help="save metrics JSON")
     p.set_defaults(func=cmd_eval)
+
+    p = sub.add_parser("diagnose", help="pinpoint failure stage (frames/masks)")
+    p.add_argument("--gt_mesh", required=True)
+    p.add_argument("--recon", required=True)
+    p.add_argument("--colmap_dir", default=None)
+    p.add_argument("--masks_dir", default=None)
+    p.set_defaults(func=cmd_diagnose)
 
     p = sub.add_parser("batch", help="evaluate many recon meshes -> CSV")
     _add_common_eval_args(p)
