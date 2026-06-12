@@ -165,6 +165,23 @@ def main():
     SQ = np.mean([v[1] for v in tp_pairs.values()]) if TP > 0 else 0.0
     RQ = TP / (TP + 0.5 * FP + 0.5 * FN + 1e-9)
     PQ = SQ * RQ
+    
+    # --- recall @ IoU thresholds: "진짜 부재" vs "찾았는데 마스크 부정확" 분리 ---
+    gt_best = {}
+    for gid in gt_area:
+        if gt_area[gid] == 0:
+            continue
+        best = 0.0
+        for lab in pred:
+            ic = inter[lab].get(gid, 0)
+            if ic:
+                iou = ic / (pred_area[lab] + gt_area[gid] - ic + 1e-9)
+                best = max(best, iou)
+        gt_best[gid] = best
+    print("---- object discovery (recall) ----")
+    for tau in (0.1, 0.25, 0.5):
+        hit = sum(v >= tau for v in gt_best.values())
+        print(f"recall@{tau:<4}: {hit/len(gt_best):.4f}  ({hit}/{len(gt_best)} GT)")
 
     print("\n================ Axis 1 평가 결과 ================")
     print(f"pred 라벨 수            : {n_pred}")
