@@ -258,7 +258,8 @@ def load_instance_masks(masks_dir, cameras):
         if path is None:
             out[cam["stem"]] = None  # treated as not visible in this view
         else:
-            out[cam["stem"]] = np.asarray(Image.open(path).convert("L")) > 127
+            # nonzero = object (handles both 0/1 and 0/255 encodings)
+            out[cam["stem"]] = np.asarray(Image.open(path).convert("L")) > 0
     return out
 
 
@@ -404,15 +405,27 @@ def auto_match_gt_id(recon_mesh, vertices, tris, tri_ids, shortlist_k=8,
     r_pts, _ = sample_with_normals(recon_mesh, n_probe)
     r_centroid = r_pts.mean(0)
 
+    r_min, r_max = r_pts.min(0), r_pts.max(0)
+
     ids, counts = np.unique(tri_ids, return_counts=True)
-    cand = []
+    by_centroid, by_overlap = [], []
     for oid, cnt in zip(ids, counts):
         if int(oid) in exclude_ids or cnt < min_faces:
             continue
         vsel = vertices[np.unique(tris[tri_ids == oid].reshape(-1))]
-        cand.append((int(oid), float(np.linalg.norm(vsel.mean(0) - r_centroid))))
-    cand.sort(key=lambda x: x[1])
-    cand = cand[:shortlist_k]
+        by_centroid.append((int(oid), float(np.linalg.norm(vsel.mean(0) - r_centroid))))
+        # bbox overlap (catches room-scale instances: floor/walls/ceiling,
+        # whose centroids mislead the shortlist)
+        g_min, g_max = vsel.min(0), vsel.max(0)
+        inter = np.maximum(np.minimum(r_max, g_max) - np.maximum(r_min, g_min), 0)
+        v_int = float(np.prod(inter))
+        v_min = float(min(np.prod(np.maximum(r_max - r_min, 1e-6)),
+                          np.prod(np.maximum(g_max - g_min, 1e-6))))
+        if v_int / v_min > 0.3:
+            by_overlap.append(int(oid))
+    by_centroid.sort(key=lambda x: x[1])
+    cand_ids = [oid for oid, _ in by_centroid[:shortlist_k]] + by_overlap
+    cand = [(oid, 0.0) for oid in dict.fromkeys(cand_ids)][:25]
 
     ranking = []
     for oid, _ in cand:
