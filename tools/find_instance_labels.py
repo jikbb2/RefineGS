@@ -2,8 +2,12 @@
 """
 Find RefineGS label → GT furniture id correspondence.
 
+Uses points3d.ply (exists for ALL instances before training) by default.
+Falls back to fuse_post.ply if points3d.ply is not found.
+
 Usage (run from /home/elicer/RefineGS):
     python tools/find_instance_labels.py
+    python tools/find_instance_labels.py --data_root data/replica_room0/masks
     python tools/find_instance_labels.py --recon_glob "output/replica_room0/raw_graph_reg/*/train/ours_7000/fuse_post.ply"
     python tools/find_instance_labels.py --dist_thresh 0.3   # tighter threshold
 
@@ -141,28 +145,38 @@ def read_centroid(path):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--recon_glob", default=
-        "output/replica_room0/raw_graph_reg/*/train/ours_7000/fuse_post.ply")
+    ap.add_argument("--data_root", default="data/replica_room0/masks",
+        help="Directory with per-instance subdirs, each containing points3d.ply")
+    ap.add_argument("--recon_glob", default=None,
+        help="Override: glob for fuse_post.ply files (use when meshes already exist)")
     ap.add_argument("--dist_thresh", type=float, default=0.5,
         help="Max centroid distance (m) to consider a valid match")
     args = ap.parse_args()
 
-    paths = sorted(glob.glob(args.recon_glob))
+    # prefer points3d.ply (exists pre-training) unless explicit recon_glob given
+    if args.recon_glob:
+        paths = sorted(glob.glob(args.recon_glob))
+        label_from_path = lambda p: p.replace("\\","/").split("/")[-4]
+    else:
+        paths = sorted(glob.glob(os.path.join(args.data_root, "*/points3d.ply")))
+        label_from_path = lambda p: os.path.basename(os.path.dirname(p))
+
     if not paths:
-        print(f"No files found: {args.recon_glob}")
-        sys.exit(1)
-    print(f"Scanning {len(paths)} recon meshes …")
+        # final fallback
+        paths = sorted(glob.glob(
+            "output/replica_room0/raw_graph_reg/*/train/ours_7000/fuse_post.ply"))
+        label_from_path = lambda p: p.replace("\\","/").split("/")[-4]
+        if not paths:
+            print("No points3d.ply found in data_root and no fuse_post.ply found.")
+            print(f"  data_root tried: {args.data_root}")
+            sys.exit(1)
+
+    print(f"Scanning {len(paths)} point clouds …")
 
     # compute centroid for each recon
     recon = {}   # label -> centroid
     for path in paths:
-        parts = path.replace("\\", "/").split("/")
-        # label is the numeric directory just before 'train'
-        try:
-            train_idx = parts.index("train")
-            label = parts[train_idx - 1]
-        except ValueError:
-            label = os.path.basename(os.path.dirname(os.path.dirname(os.path.dirname(path))))
+        label = label_from_path(path)
         c = read_centroid(path)
         if c is not None:
             recon[label] = c
@@ -237,13 +251,20 @@ def main():
 
     if picks:
         labels_str = " ".join(p[2] for p in picks)
-        gt_map_lines = "\n".join(f"{p[2]},{p[0]}" for p in picks)
         print(f"\n# Run sweep with:")
         print(f'  INSTANCES="{labels_str}" bash run_axis3_reg_sweep.sh')
-        print(f"\n# Or pass GT map directly (label,gt_id CSV):")
-        print(f'  GT_MAP=gt_map.csv INSTANCES="{labels_str}" bash run_axis3_reg_sweep.sh')
-        print(f"\n# gt_map.csv content:")
-        print(gt_map_lines)
+        # write gt_map.csv
+        csv_path = "gt_map.csv"
+        with open(csv_path, "w") as f:
+            f.write("label,gt_id\n")
+            for p in picks:
+                f.write(f"{p[2]},{p[0]}\n")
+        print(f"\n# gt_map.csv saved → {csv_path}")
+        print(f'  GT_MAP={csv_path} INSTANCES="{labels_str}" bash run_axis3_reg_sweep.sh')
+        print("\n# gt_map.csv content:")
+        print("label,gt_id")
+        for p in picks:
+            print(f"{p[2]},{p[0]}")
 
 
 if __name__ == "__main__":
