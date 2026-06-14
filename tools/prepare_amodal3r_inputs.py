@@ -33,12 +33,28 @@ from PIL import Image
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
+def load_alpha_mask(path: Path) -> np.ndarray:
+    """Load binary mask from RGBA PNG: uses alpha channel (index 3).
+    Returns uint8 array with 0/255 values."""
+    arr = np.array(Image.open(path))
+    if arr.ndim == 3 and arr.shape[2] == 4:
+        # RGBA: real mask is in alpha channel
+        return (arr[:, :, 3] > 0).astype(np.uint8) * 255
+    elif arr.ndim == 3 and arr.shape[2] == 3:
+        # RGB (no alpha): use any non-zero channel
+        return ((arr.max(axis=2)) > 0).astype(np.uint8) * 255
+    else:
+        # Grayscale
+        return (arr > 0).astype(np.uint8) * 255
+
+
 def find_best_views(masks_dir: Path, top_k: int = 3):
-    """Return list of (mask_area, stem) sorted descending by mask area."""
+    """Return list of (mask_area, stem) sorted descending by mask area.
+    Uses alpha channel for RGBA masks."""
     results = []
     for p in sorted(masks_dir.glob("*.png")):
-        arr = np.array(Image.open(p).convert("L"))
-        area = int((arr > 0).sum())
+        mask = load_alpha_mask(p)
+        area = int((mask > 0).sum())
         if area > 0:
             results.append((area, p.stem))
     results.sort(reverse=True)
@@ -108,9 +124,8 @@ def main():
             rgb_out = out_inst / f"rgb_{rank}.png"
             img.save(rgb_out)
 
-            # load mask, binarise → 0/255 L
-            mask_arr = np.array(Image.open(mask_path).convert("L"))
-            mask_bin = ((mask_arr > 0).astype(np.uint8) * 255)
+            # load mask from alpha channel → 0/255 L
+            mask_bin = load_alpha_mask(mask_path)
             if args.mask_dilate > 0:
                 import cv2
                 k = cv2.getStructuringElement(
