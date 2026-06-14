@@ -46,20 +46,23 @@ def rot_z(a):
 
 
 def build_candidates():
-    """8 rotation candidates:
-    Amodal3R canonical: y-up (object sits on XZ plane, faces +Z).
-    Replica world: z-up. Need to rotate y→z, then try 4 azimuths.
+    """32 rotation candidates covering the most common canonical ambiguities.
+
+    Amodal3R may output objects in y-up or z-up canonical frame.
+    We try:
+      - 8 azimuths (0..315° in 45° steps) × y-up→z-up flip  = 16
+      - 8 azimuths × no flip (already z-up)                  = 16
+    Total = 32 candidates.
     """
-    # y-up → z-up: rotate -90° around X (y becomes z)
-    R_yup_to_zup = rot_x(-np.pi / 2)
+    R_yup_to_zup = rot_x(-np.pi / 2)   # y→z: rotate -90° around X
+    R_yup_inv    = rot_x( np.pi / 2)   # y→-z variant
     candidates = []
-    for az in [0, 90, 180, 270]:
+    for az in range(0, 360, 45):
         R_az = rot_z(np.radians(az))
-        candidates.append(R_az @ R_yup_to_zup)
-    # Also try without y→z flip (in case canonical already z-up)
-    for az in [0, 90, 180, 270]:
-        R_az = rot_z(np.radians(az))
-        candidates.append(R_az)
+        candidates.append(R_az @ R_yup_to_zup)   # with y-up flip
+        candidates.append(R_az @ R_yup_inv)       # with inverted flip
+        candidates.append(R_az)                   # no flip
+        candidates.append(R_az @ rot_y(np.pi/2)) # x-up→z-up
     return candidates
 
 
@@ -80,6 +83,50 @@ def chamfer_l1(a: np.ndarray, b: np.ndarray, n_sample: int = 10000) -> float:
 
 
 # ── single registration ───────────────────────────────────────────────────────
+
+def fpfh_global_register(src_pcd, tgt_pcd, voxel: float = 0.05):
+    """FPFH-based global registration (RANSAC). Falls back to None on error."""
+    try:
+        src_d = src_pcd.voxel_down_sample(voxel)
+        tgt_d = tgt_pcd.voxel_down_sample(voxel)
+        src_d.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(voxel*2, 30))
+        tgt_d.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(voxel*2, 30))
+        src_f = o3d.pipelines.registration.compute_fpfh_feature(
+            src_d, o3d.geometry.KDTreeSearchParamHybrid(voxel*5, 100))
+        tgt_f = o3d.pipelines.registration.compute_fpfh_feature(
+            tgt_d, o3d.geometry.KDTreeSearchParamHybrid(voxel*5, 100))
+        result = o3d.pipelines.registration.registration_ransac_based_on_feature_matching(
+            src_d, tgt_d, src_f, tgt_f,
+            mutual_filter=True,
+            max_correspondence_distance=voxel*1.5,
+            estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(False),
+            ransac_n=3,
+            checkers=[
+                o3d.pipelines.registration.CorrespondenceCheckerBasedOnEdgeLength(0.9),
+                o3d.pipelines.registration.CorrespondenceCheckerBasedOnDistance(voxel*1.5),
+            ],
+            criteria=o3d.pipelines.registration.RANSACConvergenceCriteria(100000, 0.999))
+        return result
+    except Exception:
+        return None
+
+
+def icp_refine(src_pcd, tgt_pcd, init_T, dist):
+    """Multi-resolution ICP: coarse pass (2× dist) then fine pass (dist)."""
+    r1 = o3d.pipelines.registration.registration_icp(
+        src_pcd, tgt_pcd,
+        max_correspondence_distance=dist * 2,
+        init=init_T,
+        estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(),
+        criteria=o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=50))
+    r2 = o3d.pipelines.registration.registration_icp(
+        src_pcd, tgt_pcd,
+        max_correspondence_distance=dist,
+        init=r1.transformation,
+        estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(),
+        criteria=o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=100))
+    return r2
+
 
 def register(gen_path: Path, recon_path: Path, out_path: Path,
              icp_dist: float = 0.15, verbose: bool = True):
@@ -103,11 +150,14 @@ def register(gen_path: Path, recon_path: Path, out_path: Path,
     recon_centroid = rv.mean(0)
     trans_init = recon_centroid - gen_centroid
 
+    # adaptive ICP distance: larger objects need bigger correspondence radius
+    icp_dist_eff = max(icp_dist, scale * 0.12)
+
     # Chamfer before registration
     gv_init = gv_scaled + trans_init
     cd_before = chamfer_l1(gv_init, rv)
 
-    # ── 2-3. Rotation search + ICP ────────────────────────────────────────────
+    # ── 2-3. Rotation search + multi-res ICP ─────────────────────────────────
     candidates = build_candidates()
     best = {"fitness": -1, "rmse": 1e9, "T": np.eye(4), "cd": 1e9, "rot_idx": -1}
 
@@ -115,19 +165,13 @@ def register(gen_path: Path, recon_path: Path, out_path: Path,
     tgt_pcd.points = o3d.utility.Vector3dVector(rv)
 
     for idx, R in enumerate(candidates):
-        # apply rotation around centroid, then translate
+        # apply rotation around centroid, then translate to recon centroid
         gv_rot = (R @ (gv_scaled - gen_centroid).T).T + recon_centroid
 
         src_pcd = o3d.geometry.PointCloud()
         src_pcd.points = o3d.utility.Vector3dVector(gv_rot)
 
-        result = o3d.pipelines.registration.registration_icp(
-            src_pcd, tgt_pcd,
-            max_correspondence_distance=icp_dist,
-            init=np.eye(4),
-            estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(),
-            criteria=o3d.pipelines.registration.ICPConvergenceCriteria(
-                max_iteration=100))
+        result = icp_refine(src_pcd, tgt_pcd, np.eye(4), icp_dist_eff)
 
         if result.fitness > best["fitness"] or (
                 result.fitness == best["fitness"] and result.inlier_rmse < best["rmse"]):
@@ -135,16 +179,39 @@ def register(gen_path: Path, recon_path: Path, out_path: Path,
             best["rmse"]     = result.inlier_rmse
             best["T"]        = result.transformation
             best["rot_idx"]  = idx
-            # store intermediate for CD computation
             src_pcd_final = o3d.geometry.PointCloud(src_pcd)
             src_pcd_final.transform(result.transformation)
             best["gv_aligned"] = np.asarray(src_pcd_final.points)
 
+    # ── 3b. FPFH global registration fallback (if fitness < 0.5) ─────────────
+    if best["fitness"] < 0.5:
+        voxel = icp_dist_eff * 0.5
+        # use best rotation candidate as starting point for FPFH
+        R_best_so_far = candidates[best["rot_idx"]]
+        gv_rot = (R_best_so_far @ (gv_scaled - gen_centroid).T).T + recon_centroid
+        src_pcd_fpfh = o3d.geometry.PointCloud()
+        src_pcd_fpfh.points = o3d.utility.Vector3dVector(gv_rot)
+
+        fpfh_result = fpfh_global_register(src_pcd_fpfh, tgt_pcd, voxel=voxel)
+        if fpfh_result is not None and fpfh_result.fitness > best["fitness"]:
+            # refine with ICP
+            result2 = icp_refine(src_pcd_fpfh, tgt_pcd,
+                                  fpfh_result.transformation, icp_dist_eff)
+            if result2.fitness > best["fitness"]:
+                best["fitness"] = result2.fitness
+                best["rmse"]    = result2.inlier_rmse
+                best["T"]       = result2.transformation
+                best["rot_idx"] = best["rot_idx"]  # keep rot_idx (FPFH refines on top)
+                src_pcd_fpfh.transform(result2.transformation)
+                best["gv_aligned"] = np.asarray(src_pcd_fpfh.points)
+                if verbose:
+                    print(f"  [FPFH] improved fitness: {result2.fitness:.3f}")
+
     # ── 4. Save aligned mesh ──────────────────────────────────────────────────
     R_best = candidates[best["rot_idx"]]
-    gv_rot = (R_best @ (gv_scaled - gen_centroid).T).T + recon_centroid
+    gv_rot_final = (R_best @ (gv_scaled - gen_centroid).T).T + recon_centroid
     gen_mesh_aligned = o3d.geometry.TriangleMesh(gen_mesh)
-    gen_mesh_aligned.vertices = o3d.utility.Vector3dVector(gv_rot)
+    gen_mesh_aligned.vertices = o3d.utility.Vector3dVector(gv_rot_final)
     gen_mesh_aligned.transform(best["T"])
     o3d.io.write_triangle_mesh(str(out_path), gen_mesh_aligned)
 
@@ -161,7 +228,7 @@ def register(gen_path: Path, recon_path: Path, out_path: Path,
     }
 
     if verbose:
-        print(f"  scale={scale:.3f}  rot_idx={best['rot_idx']}")
+        print(f"  scale={scale:.3f}  icp_dist_eff={icp_dist_eff:.3f}m  rot_idx={best['rot_idx']}")
         print(f"  ICP  fitness={best['fitness']:.3f}  RMSE={best['rmse']*1000:.1f}mm")
         print(f"  Chamfer before={cd_before*1000:.1f}mm  after={cd_after*1000:.1f}mm  "
               f"({result_dict['improvement_pct']:+.1f}%)")
