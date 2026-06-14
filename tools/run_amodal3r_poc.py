@@ -80,16 +80,61 @@ def save_multiview(result, out_dir: Path, prefix: str, mode: str = 'gs', nviews:
         cv2.imwrite(str(out_dir / f"{prefix}_{i:03d}.png"), bgr)
 
 
-def load_views(input_dir: Path, n_views: int):
-    """Load up to n_views RGB + mask pairs from input dir."""
+def crop_to_mask_bbox(img: Image.Image, mask: Image.Image,
+                      pad_frac: float = 0.25, out_size: int = 518) -> tuple:
+    """Crop both img and mask to the mask bounding box + padding, resize square.
+    Amodal3R preprocessing resizes 1200x680→518x518 directly, making tiny objects
+    (~0.7% area) invisible. We must pre-crop so the object fills the frame.
+    Returns (cropped_img, cropped_mask).
+    """
+    mask_arr = np.array(mask)
+    ys, xs = np.where(mask_arr > 0)
+    if len(ys) == 0:
+        return (img.resize((out_size, out_size), Image.LANCZOS),
+                mask.resize((out_size, out_size), Image.NEAREST))
+
+    H, W = mask_arr.shape
+    y0, y1, x0, x1 = int(ys.min()), int(ys.max()), int(xs.min()), int(xs.max())
+    bh, bw = y1 - y0, x1 - x0
+    py = max(int(bh * pad_frac), 20)
+    px = max(int(bw * pad_frac), 20)
+    y0c, y1c = max(0, y0 - py), min(H, y1 + py)
+    x0c, x1c = max(0, x0 - px), min(W, x1 + px)
+
+    # make square
+    bh_c, bw_c = y1c - y0c, x1c - x0c
+    if bh_c < bw_c:
+        d = bw_c - bh_c
+        y0c = max(0, y0c - d // 2); y1c = min(H, y0c + bw_c)
+    elif bw_c < bh_c:
+        d = bh_c - bw_c
+        x0c = max(0, x0c - d // 2); x1c = min(W, x0c + bh_c)
+
+    img_c  = img.crop((x0c, y0c, x1c, y1c)).resize((out_size, out_size), Image.LANCZOS)
+    mask_c = mask.crop((x0c, y0c, x1c, y1c)).resize((out_size, out_size), Image.NEAREST)
+    return img_c, mask_c
+
+
+def load_views(input_dir: Path, n_views: int, crop: bool = True):
+    """Load up to n_views RGB + mask pairs from input dir.
+    crop=True: crop to mask bbox before passing to pipeline (required when images
+    are full-frame and object occupies < ~5% of the frame).
+    """
     images, masks = [], []
     for rank in range(n_views):
         rgb_p = input_dir / f"rgb_{rank}.png"
         mask_p = input_dir / f"mask_{rank}.png"
         if not rgb_p.exists() or not mask_p.exists():
             break
-        images.append(Image.open(rgb_p).convert("RGB"))
-        masks.append(Image.open(mask_p).convert("L"))
+        img  = Image.open(rgb_p).convert("RGB")
+        msk  = Image.open(mask_p).convert("L")
+        if crop:
+            img, msk = crop_to_mask_bbox(img, msk)
+        images.append(img)
+        masks.append(msk)
+        if rank == 0:
+            arr = np.array(msk)
+            print(f"    view{rank}: {img.size} mask_nonzero={(arr>0).sum()}")
     return images, masks
 
 
