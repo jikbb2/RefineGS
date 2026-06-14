@@ -47,57 +47,33 @@ import open3d as o3d
 def load_gt_object_verts(gt_mesh_path: Path, gt_id: int) -> np.ndarray:
     """Extract vertices for a specific object from Replica mesh_semantic.ply.
 
-    Replica stores object IDs as a face-level 'object_id' (uint16) attribute.
-    Open3D cannot parse this header → use trimesh's raw PLY loader instead.
-    Returns (N, 3) float64 array, or None on failure.
+    Replica face format (confirmed via _ply_raw inspection):
+      face_data dtype: [('vertex_indices', [('f0','u1'),('f1','<u4',(4,))]),
+                        ('object_id', '<u2')]
+    Faces are quads; object_id is per-face uint16.
     """
     try:
         import trimesh
-        # trimesh.exchange.ply.load_ply returns raw dict with 'vertices', 'faces', etc.
         with open(str(gt_mesh_path), 'rb') as f:
             data = trimesh.exchange.ply.load_ply(f)
 
         verts = np.array(data['vertices'], dtype=np.float64)  # (V, 3)
-        faces_raw = data.get('faces', None)
 
-        # face attribute: object_id may live in data['face']['object_id']
-        # or in data['face_attributes']['object_id']
-        obj_ids = None
-        for key in ('face', 'face_attributes'):
-            grp = data.get(key, {})
-            if isinstance(grp, dict) and 'object_id' in grp:
-                obj_ids = np.asarray(grp['object_id']).flatten()
-                break
-            # structured numpy array (trimesh returns this for face block)
-            if hasattr(grp, 'dtype') and 'object_id' in grp.dtype.names:
-                obj_ids = grp['object_id'].flatten()
-                break
+        # Access raw face data via _ply_raw
+        face_data = data['metadata']['_ply_raw']['face']['data']
 
-        if obj_ids is not None and faces_raw is not None:
-            faces = np.asarray(faces_raw)
-            if faces.ndim == 1:
-                # variable-length face list → flatten
-                faces = np.vstack([f for f in faces])
-            face_mask = (obj_ids == gt_id)
-            if face_mask.sum() == 0:
-                print(f"  [WARN] gt_id={gt_id} not found in face object_ids "
-                      f"(unique ids: {np.unique(obj_ids)[:10]}…)")
-                return None
-            sel_verts = np.unique(faces[face_mask].flatten())
-            return verts[sel_verts]
+        obj_ids   = face_data['object_id']                    # (N,) uint16
+        face_vids = face_data['vertex_indices']['f1']         # (N, 4) uint32
 
-        # Fallback: vertex-level object_id
-        for key in ('vertex', 'vertex_attributes'):
-            grp = data.get(key, {})
-            check = grp if isinstance(grp, dict) else {}
-            if hasattr(grp, 'dtype'):
-                check = {n: grp[n] for n in grp.dtype.names}
-            if 'object_id' in check:
-                vid = np.asarray(check['object_id']).flatten()
-                return verts[vid == gt_id]
+        face_mask = (obj_ids == gt_id)
+        if face_mask.sum() == 0:
+            avail = np.unique(obj_ids)
+            print(f"  [WARN] gt_id={gt_id} not found. "
+                  f"Available ids (first 20): {avail[:20]}")
+            return None
 
-        print("  [WARN] No object_id attribute found in GT mesh.")
-        return None
+        sel_verts = np.unique(face_vids[face_mask].flatten())
+        return verts[sel_verts]
 
     except Exception as e:
         print(f"  [WARN] load_gt_object_verts failed: {e}")
