@@ -44,6 +44,66 @@ import numpy as np
 import open3d as o3d
 
 
+def load_gt_object_verts(gt_mesh_path: Path, gt_id: int) -> np.ndarray:
+    """Extract vertices for a specific object from Replica mesh_semantic.ply.
+
+    Replica stores object IDs as a face-level 'object_id' (uint16) attribute.
+    Open3D cannot parse this header → use trimesh's raw PLY loader instead.
+    Returns (N, 3) float64 array, or None on failure.
+    """
+    try:
+        import trimesh
+        # trimesh.exchange.ply.load_ply returns raw dict with 'vertices', 'faces', etc.
+        with open(str(gt_mesh_path), 'rb') as f:
+            data = trimesh.exchange.ply.load_ply(f)
+
+        verts = np.array(data['vertices'], dtype=np.float64)  # (V, 3)
+        faces_raw = data.get('faces', None)
+
+        # face attribute: object_id may live in data['face']['object_id']
+        # or in data['face_attributes']['object_id']
+        obj_ids = None
+        for key in ('face', 'face_attributes'):
+            grp = data.get(key, {})
+            if isinstance(grp, dict) and 'object_id' in grp:
+                obj_ids = np.asarray(grp['object_id']).flatten()
+                break
+            # structured numpy array (trimesh returns this for face block)
+            if hasattr(grp, 'dtype') and 'object_id' in grp.dtype.names:
+                obj_ids = grp['object_id'].flatten()
+                break
+
+        if obj_ids is not None and faces_raw is not None:
+            faces = np.asarray(faces_raw)
+            if faces.ndim == 1:
+                # variable-length face list → flatten
+                faces = np.vstack([f for f in faces])
+            face_mask = (obj_ids == gt_id)
+            if face_mask.sum() == 0:
+                print(f"  [WARN] gt_id={gt_id} not found in face object_ids "
+                      f"(unique ids: {np.unique(obj_ids)[:10]}…)")
+                return None
+            sel_verts = np.unique(faces[face_mask].flatten())
+            return verts[sel_verts]
+
+        # Fallback: vertex-level object_id
+        for key in ('vertex', 'vertex_attributes'):
+            grp = data.get(key, {})
+            check = grp if isinstance(grp, dict) else {}
+            if hasattr(grp, 'dtype'):
+                check = {n: grp[n] for n in grp.dtype.names}
+            if 'object_id' in check:
+                vid = np.asarray(check['object_id']).flatten()
+                return verts[vid == gt_id]
+
+        print("  [WARN] No object_id attribute found in GT mesh.")
+        return None
+
+    except Exception as e:
+        print(f"  [WARN] load_gt_object_verts failed: {e}")
+        return None
+
+
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 def load_mesh(path: Path) -> o3d.geometry.TriangleMesh:
@@ -189,16 +249,19 @@ def fuse(recon_path: Path, gen_path: Path, out_path: Path,
 
     # CD vs GT (if provided)
     if gt_mesh_path is not None and gt_id is not None and gt_mesh_path.exists():
-        gt_mesh  = load_mesh(gt_mesh_path)
-        gt_verts = np.asarray(gt_mesh.vertices)
-        if len(gt_verts) > 0:
+        gt_verts = load_gt_object_verts(gt_mesh_path, gt_id)
+        if gt_verts is not None and len(gt_verts) > 0:
+            if verbose:
+                print(f"  GT object {gt_id}: {len(gt_verts)} verts")
             cd_gt_recon  = chamfer_l1(rv,  gt_verts)
-            cd_gt_fused  = chamfer_l1(fv, gt_verts)
+            cd_gt_fused  = chamfer_l1(fv,  gt_verts)
             result["cd_vs_gt_recon_mm"]  = round(cd_gt_recon  * 1000, 1)
             result["cd_vs_gt_fused_mm"]  = round(cd_gt_fused  * 1000, 1)
             result["cd_improvement_mm"]  = round((cd_gt_recon - cd_gt_fused) * 1000, 1)
             result["cd_improvement_pct"] = round(
                 (1 - cd_gt_fused / cd_gt_recon) * 100, 1) if cd_gt_recon > 0 else 0
+        else:
+            print(f"  [WARN] GT verts not extracted for gt_id={gt_id}")
 
     if verbose:
         print(f"  fused verts: {len(fv)}")
