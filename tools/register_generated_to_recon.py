@@ -1,22 +1,33 @@
 #!/usr/bin/env python3
 """
-Registration PoC (A-1): Amodal3R canonical mesh → world-space TSDF recon.
+Registration (A-1, v2): Amodal3R canonical mesh → world-space TSDF recon.
 
-Steps:
-  1. Scale normalization (diagonal extent ratio)
-  2. Centroid alignment
-  3. Rotation search: 8 candidates (y-up→z-up flip × 4 rotations around vertical)
-  4. ICP refinement for each candidate → pick best by fitness+RMSE
-  5. Save aligned mesh, report Chamfer before/after
+v2 fixes (vs v1) — addresses mis-registration found in the stage4 diagnostics
+(centroid offset 2-10cm, per-axis ext_ratio off, most gen verts >5cm from recon):
 
-Usage (run from /home/elicer/RefineGS with either conda env):
+  1. ROTATION SELECTION BY CHAMFER, NOT ICP FITNESS.
+     v1 picked the rotation candidate with the highest ICP `fitness`, but fitness
+     = fraction of correspondences within a *generous* radius (icp_dist_eff up to
+     15cm), so wrong rotations (e.g. a table rotated 90° → z_ratio 3.19) could
+     win. v2 runs a coarse-to-fine ICP for every candidate and selects by tight
+     symmetric Chamfer-L1 on the aligned surfaces.
+
+  2. COARSE-TO-FINE ICP SCHEDULE scaled to the object size (fractions of the
+     recon bounding-box diagonal) ending at a tight radius, so ICP can't settle
+     in a loose local minimum.
+
+  3. FINAL SCALED ICP (Umeyama, with_scaling=True) after the best rigid pose is
+     fixed, to absorb residual *uniform* scale error (e.g. cushion x_ratio 0.80).
+     Only accepted if it improves Chamfer.
+
+  4. ext_ratio (per-axis bbox ratio gen/recon) reported for verification — should
+     converge to ~1.0 on all three axes when registration is healthy.
+
+Interface (CLI / batch / output keys) is unchanged so the rest of the pipeline
+(fuse_generated_recon.py, eval_object_mesh.py) keeps working.
+
+Usage (run from /home/elicer/RefineGS):
     conda activate split_and_splat
-    python tools/register_generated_to_recon.py \
-        --gen  ~/Amodal3R/poc_output/75/seed_1/mesh.ply \
-        --recon output/replica_room0/axis3_sweep/reg_strong/75/train/ours_7000/fuse_post.ply \
-        --out  ~/Amodal3R/poc_output/75/seed_1/mesh_registered.ply
-
-    # batch over all instances and seeds:
     python tools/register_generated_to_recon.py --batch \
         --gen_root  ~/Amodal3R/poc_output \
         --recon_root output/replica_room0/axis3_sweep/reg_strong \
@@ -34,99 +45,85 @@ import open3d as o3d
 
 def rot_x(a):
     c, s = np.cos(a), np.sin(a)
-    return np.array([[1,0,0],[0,c,-s],[0,s,c]], dtype=np.float64)
+    return np.array([[1, 0, 0], [0, c, -s], [0, s, c]], dtype=np.float64)
 
 def rot_y(a):
     c, s = np.cos(a), np.sin(a)
-    return np.array([[c,0,s],[0,1,0],[-s,0,c]], dtype=np.float64)
+    return np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]], dtype=np.float64)
 
 def rot_z(a):
     c, s = np.cos(a), np.sin(a)
-    return np.array([[c,-s,0],[s,c,0],[0,0,1]], dtype=np.float64)
+    return np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]], dtype=np.float64)
 
 
 def build_candidates():
-    """32 rotation candidates covering the most common canonical ambiguities.
-
-    Amodal3R may output objects in y-up or z-up canonical frame.
-    We try:
-      - 8 azimuths (0..315° in 45° steps) × y-up→z-up flip  = 16
-      - 8 azimuths × no flip (already z-up)                  = 16
-    Total = 32 candidates.
-    """
-    R_yup_to_zup = rot_x(-np.pi / 2)   # y→z: rotate -90° around X
-    R_yup_inv    = rot_x( np.pi / 2)   # y→-z variant
+    """32 rotation candidates covering common canonical ambiguities
+    (y-up/z-up/x-up flips × 8 azimuths)."""
+    R_yup_to_zup = rot_x(-np.pi / 2)
+    R_yup_inv    = rot_x( np.pi / 2)
     candidates = []
     for az in range(0, 360, 45):
         R_az = rot_z(np.radians(az))
-        candidates.append(R_az @ R_yup_to_zup)   # with y-up flip
-        candidates.append(R_az @ R_yup_inv)       # with inverted flip
-        candidates.append(R_az)                   # no flip
-        candidates.append(R_az @ rot_y(np.pi/2)) # x-up→z-up
+        candidates.append(R_az @ R_yup_to_zup)
+        candidates.append(R_az @ R_yup_inv)
+        candidates.append(R_az)
+        candidates.append(R_az @ rot_y(np.pi / 2))
     return candidates
 
 
-def chamfer_l1(a: np.ndarray, b: np.ndarray, n_sample: int = 10000) -> float:
-    """Approximate Chamfer-L1 between two point sets (random subsample)."""
+def _pcd(pts):
+    p = o3d.geometry.PointCloud()
+    p.points = o3d.utility.Vector3dVector(np.asarray(pts, dtype=np.float64))
+    return p
+
+
+def chamfer_l1(a_pts, b_pts, n_sample: int = 20000) -> float:
+    """Fast symmetric Chamfer-L1 using open3d KDTree distances (subsampled)."""
     rng = np.random.default_rng(0)
-    a_ = a[rng.choice(len(a), min(n_sample, len(a)), replace=False)]
-    b_ = b[rng.choice(len(b), min(n_sample, len(b)), replace=False)]
-
-    # a → b
-    diff_ab = a_[:, None, :] - b_[None, :, :]  # (Na, Nb, 3)
-    dist_ab = np.linalg.norm(diff_ab, axis=2)
-    acc = dist_ab.min(axis=1).mean()
-
-    # b → a
-    dist_ba = dist_ab.min(axis=0).mean()
-    return float((acc + dist_ba) / 2)
+    a = np.asarray(a_pts); b = np.asarray(b_pts)
+    if len(a) > n_sample:
+        a = a[rng.choice(len(a), n_sample, replace=False)]
+    if len(b) > n_sample:
+        b = b[rng.choice(len(b), n_sample, replace=False)]
+    pa, pb = _pcd(a), _pcd(b)
+    d_ab = np.asarray(pa.compute_point_cloud_distance(pb))
+    d_ba = np.asarray(pb.compute_point_cloud_distance(pa))
+    return float(0.5 * (d_ab.mean() + d_ba.mean()))
 
 
-# ── single registration ───────────────────────────────────────────────────────
-
-def fpfh_global_register(src_pcd, tgt_pcd, voxel: float = 0.05):
-    """FPFH-based global registration (RANSAC). Falls back to None on error."""
-    try:
-        src_d = src_pcd.voxel_down_sample(voxel)
-        tgt_d = tgt_pcd.voxel_down_sample(voxel)
-        src_d.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(voxel*2, 30))
-        tgt_d.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(voxel*2, 30))
-        src_f = o3d.pipelines.registration.compute_fpfh_feature(
-            src_d, o3d.geometry.KDTreeSearchParamHybrid(voxel*5, 100))
-        tgt_f = o3d.pipelines.registration.compute_fpfh_feature(
-            tgt_d, o3d.geometry.KDTreeSearchParamHybrid(voxel*5, 100))
-        result = o3d.pipelines.registration.registration_ransac_based_on_feature_matching(
-            src_d, tgt_d, src_f, tgt_f,
-            mutual_filter=True,
-            max_correspondence_distance=voxel*1.5,
-            estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(False),
-            ransac_n=3,
-            checkers=[
-                o3d.pipelines.registration.CorrespondenceCheckerBasedOnEdgeLength(0.9),
-                o3d.pipelines.registration.CorrespondenceCheckerBasedOnDistance(voxel*1.5),
-            ],
-            criteria=o3d.pipelines.registration.RANSACConvergenceCriteria(100000, 0.999))
-        return result
-    except Exception:
-        return None
+def ext_ratio(gen_pts, recon_pts):
+    """Per-axis bbox extent ratio gen/recon (≈1.0 each axis = good scale+rot)."""
+    g = np.asarray(gen_pts); r = np.asarray(recon_pts)
+    ge = g.max(0) - g.min(0)
+    re = r.max(0) - r.min(0)
+    return ge / np.maximum(re, 1e-9)
 
 
-def icp_refine(src_pcd, tgt_pcd, init_T, dist):
-    """Multi-resolution ICP: coarse pass (2× dist) then fine pass (dist)."""
-    r1 = o3d.pipelines.registration.registration_icp(
-        src_pcd, tgt_pcd,
-        max_correspondence_distance=dist * 2,
-        init=init_T,
-        estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(),
-        criteria=o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=50))
-    r2 = o3d.pipelines.registration.registration_icp(
-        src_pcd, tgt_pcd,
+# ── ICP ─────────────────────────────────────────────────────────────────────
+
+def _icp(src, tgt, init_T, dist, with_scaling=False, iters=60):
+    return o3d.pipelines.registration.registration_icp(
+        src, tgt,
         max_correspondence_distance=dist,
-        init=r1.transformation,
-        estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(),
-        criteria=o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=100))
-    return r2
+        init=init_T,
+        estimation_method=o3d.pipelines.registration.
+            TransformationEstimationPointToPoint(with_scaling),
+        criteria=o3d.pipelines.registration.
+            ICPConvergenceCriteria(max_iteration=iters))
 
+
+def multi_res_icp(src, tgt, init_T, schedule, with_scaling_last=False):
+    """Coarse-to-fine ICP over a list of decreasing correspondence distances."""
+    T = init_T
+    res = None
+    for i, dist in enumerate(schedule):
+        sc = with_scaling_last and (i == len(schedule) - 1)
+        res = _icp(src, tgt, T, dist, with_scaling=sc)
+        T = res.transformation
+    return res
+
+
+# ── single registration ──────────────────────────────────────────────────────
 
 def register(gen_path: Path, recon_path: Path, out_path: Path,
              icp_dist: float = 0.15, verbose: bool = True):
@@ -135,101 +132,91 @@ def register(gen_path: Path, recon_path: Path, out_path: Path,
 
     gv = np.asarray(gen_mesh.vertices)
     rv = np.asarray(recon_mesh.vertices)
-
     if len(gv) == 0 or len(rv) == 0:
         print(f"  [ERROR] empty mesh: gen={len(gv)}, recon={len(rv)}")
         return None
 
-    # ── 1. Scale ──────────────────────────────────────────────────────────────
-    gen_diag  = np.linalg.norm(gv.max(0) - gv.min(0))
+    # ── 1. uniform pre-scale by bbox diagonal ratio ───────────────────────────
+    gen_diag   = np.linalg.norm(gv.max(0) - gv.min(0))
     recon_diag = np.linalg.norm(rv.max(0) - rv.min(0))
     scale = recon_diag / gen_diag if gen_diag > 1e-6 else 1.0
 
-    gv_scaled = gv * scale
+    gv_scaled     = gv * scale
     gen_centroid  = gv_scaled.mean(0)
     recon_centroid = rv.mean(0)
-    trans_init = recon_centroid - gen_centroid
 
-    # adaptive ICP distance: larger objects need bigger correspondence radius
-    icp_dist_eff = max(icp_dist, scale * 0.12)
+    # coarse-to-fine schedule scaled to object size (fractions of recon diagonal)
+    schedule = [f * recon_diag for f in (0.15, 0.06, 0.025)]
+    schedule = [max(d, 0.01) for d in schedule]
 
-    # Chamfer before registration
-    gv_init = gv_scaled + trans_init
-    cd_before = chamfer_l1(gv_init, rv)
+    # Chamfer before (centroid-aligned only)
+    cd_before = chamfer_l1(gv_scaled - gen_centroid + recon_centroid, rv)
 
-    # ── 2-3. Rotation search + multi-res ICP ─────────────────────────────────
+    # downsampled target for ICP speed (full rv kept for final metrics)
+    voxel = max(recon_diag * 0.01, 0.005)
+    tgt_full = _pcd(rv)
+    tgt_icp  = tgt_full.voxel_down_sample(voxel)
+
+    # ── 2. rotation search, selected by Chamfer (not fitness) ─────────────────
     candidates = build_candidates()
-    best = {"fitness": -1, "rmse": 1e9, "T": np.eye(4), "cd": 1e9, "rot_idx": -1}
-
-    tgt_pcd = o3d.geometry.PointCloud()
-    tgt_pcd.points = o3d.utility.Vector3dVector(rv)
+    best = {"cd": 1e9, "rot_idx": -1, "fitness": 0.0, "rmse": 1e9,
+            "aligned": None}
 
     for idx, R in enumerate(candidates):
-        # apply rotation around centroid, then translate to recon centroid
         gv_rot = (R @ (gv_scaled - gen_centroid).T).T + recon_centroid
+        src_full = _pcd(gv_rot)
+        src_icp  = src_full.voxel_down_sample(voxel)
 
-        src_pcd = o3d.geometry.PointCloud()
-        src_pcd.points = o3d.utility.Vector3dVector(gv_rot)
+        res = multi_res_icp(src_icp, tgt_icp, np.eye(4), schedule,
+                            with_scaling_last=False)
 
-        result = icp_refine(src_pcd, tgt_pcd, np.eye(4), icp_dist_eff)
+        src_aligned = _pcd(gv_rot)
+        src_aligned.transform(res.transformation)
+        gv_aligned = np.asarray(src_aligned.points)
+        cd = chamfer_l1(gv_aligned, rv)
 
-        if result.fitness > best["fitness"] or (
-                result.fitness == best["fitness"] and result.inlier_rmse < best["rmse"]):
-            best["fitness"]  = result.fitness
-            best["rmse"]     = result.inlier_rmse
-            best["T"]        = result.transformation
-            best["rot_idx"]  = idx
-            src_pcd_final = o3d.geometry.PointCloud(src_pcd)
-            src_pcd_final.transform(result.transformation)
-            best["gv_aligned"] = np.asarray(src_pcd_final.points)
+        if cd < best["cd"]:
+            best.update(cd=cd, rot_idx=idx, fitness=res.fitness,
+                        rmse=res.inlier_rmse, aligned=gv_aligned)
 
-    # ── 3b. FPFH global registration fallback (if fitness < 0.5) ─────────────
-    if best["fitness"] < 0.5:
-        voxel = icp_dist_eff * 0.5
-        # use best rotation candidate as starting point for FPFH
-        R_best_so_far = candidates[best["rot_idx"]]
-        gv_rot = (R_best_so_far @ (gv_scaled - gen_centroid).T).T + recon_centroid
-        src_pcd_fpfh = o3d.geometry.PointCloud()
-        src_pcd_fpfh.points = o3d.utility.Vector3dVector(gv_rot)
+    # ── 3. final scaled-ICP refinement (absorb residual uniform scale) ────────
+    src_ref = _pcd(best["aligned"])
+    src_ref_icp = src_ref.voxel_down_sample(voxel)
+    res_s = multi_res_icp(src_ref_icp, tgt_icp, np.eye(4),
+                          schedule[-2:], with_scaling_last=True)
+    src_ref.transform(res_s.transformation)
+    gv_scaled_aligned = np.asarray(src_ref.points)
+    cd_scaled = chamfer_l1(gv_scaled_aligned, rv)
+    used_scaled = cd_scaled < best["cd"]
+    final_aligned = gv_scaled_aligned if used_scaled else best["aligned"]
+    cd_after = min(cd_scaled, best["cd"])
 
-        fpfh_result = fpfh_global_register(src_pcd_fpfh, tgt_pcd, voxel=voxel)
-        if fpfh_result is not None and fpfh_result.fitness > best["fitness"]:
-            # refine with ICP
-            result2 = icp_refine(src_pcd_fpfh, tgt_pcd,
-                                  fpfh_result.transformation, icp_dist_eff)
-            if result2.fitness > best["fitness"]:
-                best["fitness"] = result2.fitness
-                best["rmse"]    = result2.inlier_rmse
-                best["T"]       = result2.transformation
-                best["rot_idx"] = best["rot_idx"]  # keep rot_idx (FPFH refines on top)
-                src_pcd_fpfh.transform(result2.transformation)
-                best["gv_aligned"] = np.asarray(src_pcd_fpfh.points)
-                if verbose:
-                    print(f"  [FPFH] improved fitness: {result2.fitness:.3f}")
-
-    # ── 4. Save aligned mesh ──────────────────────────────────────────────────
-    R_best = candidates[best["rot_idx"]]
-    gv_rot_final = (R_best @ (gv_scaled - gen_centroid).T).T + recon_centroid
+    # ── 4. save aligned mesh (rebuild from final vertex positions) ────────────
     gen_mesh_aligned = o3d.geometry.TriangleMesh(gen_mesh)
-    gen_mesh_aligned.vertices = o3d.utility.Vector3dVector(gv_rot_final)
-    gen_mesh_aligned.transform(best["T"])
+    gen_mesh_aligned.vertices = o3d.utility.Vector3dVector(final_aligned)
+    gen_mesh_aligned.compute_vertex_normals()
     o3d.io.write_triangle_mesh(str(out_path), gen_mesh_aligned)
 
-    cd_after = chamfer_l1(best["gv_aligned"], rv)
-
+    er = ext_ratio(final_aligned, rv)
     result_dict = {
-        "scale": round(scale, 4),
+        "scale": round(float(scale), 4),
         "rot_candidate": best["rot_idx"],
-        "icp_fitness": round(best["fitness"], 4),
-        "icp_rmse_m": round(best["rmse"], 4),
-        "chamfer_l1_before_m": round(cd_before, 4),
-        "chamfer_l1_after_m":  round(cd_after, 4),
-        "improvement_pct": round((1 - cd_after / cd_before) * 100, 1) if cd_before > 0 else 0,
+        "icp_fitness": round(float(best["fitness"]), 4),
+        "icp_rmse_m": round(float(best["rmse"]), 4),
+        "chamfer_l1_before_m": round(float(cd_before), 4),
+        "chamfer_l1_after_m":  round(float(cd_after), 4),
+        "improvement_pct": round((1 - cd_after / cd_before) * 100, 1)
+                           if cd_before > 0 else 0,
+        "ext_ratio": [round(float(x), 3) for x in er],
+        "scaled_icp_used": bool(used_scaled),
     }
 
     if verbose:
-        print(f"  scale={scale:.3f}  icp_dist_eff={icp_dist_eff:.3f}m  rot_idx={best['rot_idx']}")
+        print(f"  scale={scale:.3f}  rot_idx={best['rot_idx']}  "
+              f"sched={[round(s,3) for s in schedule]}")
         print(f"  ICP  fitness={best['fitness']:.3f}  RMSE={best['rmse']*1000:.1f}mm")
+        print(f"  ext_ratio (x,y,z) = ({er[0]:.2f}, {er[1]:.2f}, {er[2]:.2f})"
+              f"   scaled_icp={'yes' if used_scaled else 'no'}")
         print(f"  Chamfer before={cd_before*1000:.1f}mm  after={cd_after*1000:.1f}mm  "
               f"({result_dict['improvement_pct']:+.1f}%)")
         print(f"  → {out_path}")
@@ -242,17 +229,15 @@ def register(gen_path: Path, recon_path: Path, out_path: Path,
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--batch", action="store_true")
-    # single mode
     ap.add_argument("--gen",   type=Path)
     ap.add_argument("--recon", type=Path)
     ap.add_argument("--out",   type=Path)
-    # batch mode
     ap.add_argument("--gen_root",   default="~/Amodal3R/poc_output", type=Path)
     ap.add_argument("--recon_root", default="output/replica_room0/axis3_sweep/reg_strong", type=Path)
-    ap.add_argument("--labels", nargs="+", default=["97","98","75"])
-    ap.add_argument("--seeds",  nargs="+", type=int, default=[1,2,3])
+    ap.add_argument("--labels", nargs="+", default=["97", "98", "75"])
+    ap.add_argument("--seeds",  nargs="+", type=int, default=[1, 2, 3])
     ap.add_argument("--icp_dist", type=float, default=0.15,
-                    help="ICP max correspondence distance (m)")
+                    help="(kept for CLI compat; schedule is now size-relative)")
     args = ap.parse_args()
 
     if not args.batch:
@@ -263,24 +248,21 @@ def main():
             print(json.dumps(r, indent=2))
         return
 
-    # batch
-    gen_root   = Path(args.gen_root).expanduser()
-    recon_root = Path(args.recon_root)
+    gen_root   = Path(str(args.gen_root)).expanduser()
+    recon_root = Path(str(args.recon_root))
     all_results = []
 
-    print(f"\n{'label':>6} {'seed':>5} {'scale':>6} {'fit':>6} "
-          f"{'RMSE(mm)':>9} {'CD_bef(mm)':>11} {'CD_aft(mm)':>11} {'improv%':>8}")
-    print("-" * 75)
+    print(f"\n{'label':>6} {'seed':>5} {'scale':>6} {'fit':>6} {'RMSE(mm)':>9} "
+          f"{'CD_bef':>8} {'CD_aft':>8} {'improv%':>8} {'ext_ratio(x,y,z)':>22} {'sc':>3}")
+    print("-" * 100)
 
     for label in args.labels:
         iters = "7000" if "reg_strong" in str(recon_root) else "*"
-        recon_glob = list(recon_root.glob(
-            f"{label}/train/ours_{iters}/fuse_post.ply"))
+        recon_glob = list(recon_root.glob(f"{label}/train/ours_{iters}/fuse_post.ply"))
         if not recon_glob:
-            recon_glob = list(recon_root.glob(
-                f"{label}/train/ours_*/fuse_post.ply"))
+            recon_glob = list(recon_root.glob(f"{label}/train/ours_*/fuse_post.ply"))
         if not recon_glob:
-            print(f"  [SKIP] label {label}: no recon mesh found under {recon_root}/{label}/")
+            print(f"  [SKIP] label {label}: no recon mesh under {recon_root}/{label}/")
             continue
         recon_path = recon_glob[0]
 
@@ -294,29 +276,34 @@ def main():
             r = register(gen_path, recon_path, out_path,
                          icp_dist=args.icp_dist, verbose=False)
             if r:
+                er = r["ext_ratio"]
                 print(f"{label:>6} {seed:>5} {r['scale']:>6.2f} "
                       f"{r['icp_fitness']:>6.3f} {r['icp_rmse_m']*1000:>9.1f} "
-                      f"{r['chamfer_l1_before_m']*1000:>11.1f} "
-                      f"{r['chamfer_l1_after_m']*1000:>11.1f} "
-                      f"{r['improvement_pct']:>7.1f}%")
+                      f"{r['chamfer_l1_before_m']*1000:>8.1f} "
+                      f"{r['chamfer_l1_after_m']*1000:>8.1f} "
+                      f"{r['improvement_pct']:>7.1f}% "
+                      f"({er[0]:>5.2f},{er[1]:>5.2f},{er[2]:>5.2f}) "
+                      f"{'Y' if r['scaled_icp_used'] else '-':>3}")
                 all_results.append({"label": label, "seed": seed, **r})
 
-    # summary
     if all_results:
         print("\n── per-label summary (mean over seeds) ──")
         for label in args.labels:
             rs = [r for r in all_results if r["label"] == label]
-            if not rs: continue
+            if not rs:
+                continue
+            mean_er = np.mean([r["ext_ratio"] for r in rs], axis=0)
             print(f"  label {label}: "
                   f"CD_before={1000*np.mean([r['chamfer_l1_before_m'] for r in rs]):.1f}mm  "
                   f"CD_after={1000*np.mean([r['chamfer_l1_after_m'] for r in rs]):.1f}mm  "
-                  f"fitness={np.mean([r['icp_fitness'] for r in rs]):.3f}")
+                  f"ext_ratio=({mean_er[0]:.2f},{mean_er[1]:.2f},{mean_er[2]:.2f})")
 
         best_seed = min(all_results, key=lambda r: r["chamfer_l1_after_m"])
         print(f"\nBest overall: label={best_seed['label']} seed={best_seed['seed']} "
               f"CD={best_seed['chamfer_l1_after_m']*1000:.1f}mm")
-        print("\nRegistered meshes saved to: <gen_root>/<label>/seed_<k>/mesh_registered.ply")
-        print("Next: screened Poisson fusion with free-space veto (A-2)")
+        print("\nRegistered meshes → <gen_root>/<label>/seed_<k>/mesh_registered.ply")
+        print("Verify: ext_ratio should be ~1.0 on all axes; re-run diag_registration.py.")
+        print("Next: fuse_generated_recon.py --method append (occ_thresh now meaningful).")
 
 
 if __name__ == "__main__":
