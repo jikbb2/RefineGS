@@ -133,7 +133,54 @@ def load_gt_id_map(csv_path: Path) -> dict:
 
 # ── core fusion ───────────────────────────────────────────────────────────────
 
+def _filter_gen_faces(gen_mesh: o3d.geometry.TriangleMesh,
+                      recon_verts: np.ndarray,
+                      occ_thresh: float):
+    """Return (filtered_mesh, n_occ_faces).
+
+    Keeps only Amodal3R faces whose mean vertex distance to the nearest TSDF
+    vertex exceeds occ_thresh. This preserves mesh topology instead of
+    creating a closed Poisson surface.
+    """
+    gv = np.asarray(gen_mesh.vertices)
+    gf = np.asarray(gen_mesh.triangles)
+    if len(gf) == 0:
+        return gen_mesh, 0
+
+    # KD-tree on TSDF vertices
+    recon_pcd = o3d.geometry.PointCloud()
+    recon_pcd.points = o3d.utility.Vector3dVector(recon_verts)
+    tree = o3d.geometry.KDTreeFlann(recon_pcd)
+
+    # per-vertex distance to nearest TSDF point
+    vert_dist = np.zeros(len(gv))
+    for i, pt in enumerate(gv):
+        [_, _, d2] = tree.search_knn_vector_3d(pt, 1)
+        vert_dist[i] = d2[0] ** 0.5
+
+    # keep face if mean vertex dist > occ_thresh
+    face_dist = vert_dist[gf].mean(axis=1)
+    occ_mask  = face_dist > occ_thresh
+    n_occ     = int(occ_mask.sum())
+
+    if n_occ == 0:
+        empty = o3d.geometry.TriangleMesh()
+        return empty, 0
+
+    sel_faces   = gf[occ_mask]                                   # (M, 3)
+    unique_vi, new_idx = np.unique(sel_faces, return_inverse=True)
+    sel_verts   = gv[unique_vi]
+    sel_faces_r = new_idx.reshape(sel_faces.shape)
+
+    out = o3d.geometry.TriangleMesh()
+    out.vertices  = o3d.utility.Vector3dVector(sel_verts)
+    out.triangles = o3d.utility.Vector3iVector(sel_faces_r)
+    out.compute_vertex_normals()
+    return out, n_occ
+
+
 def fuse(recon_path: Path, gen_path: Path, out_path: Path,
+         method: str = "append",
          occ_thresh: float = 0.05,
          n_recon: int = 80000,
          n_gen: int = 80000,
@@ -143,13 +190,13 @@ def fuse(recon_path: Path, gen_path: Path, out_path: Path,
          gt_id: int = None,
          verbose: bool = True) -> dict:
     """
-    Fuse registered generated mesh into TSDF recon via screened Poisson.
+    Fuse registered Amodal3R mesh into TSDF recon.
 
-    occ_thresh: distance (m) from TSDF surface above which generated points
-                are considered 'occluded' and included in fusion.
-                ~5cm = TSDF voxel resolution × 5.  Increase for noisy recons.
-    poisson_depth: Poisson octree depth. 9 → ~5mm resolution, 8 → ~1cm.
-    density_trim: remove lowest X% density vertices from Poisson output.
+    method='append'  (default): directly concatenate meshes — TSDF recon kept
+                     exactly as-is, only Amodal3R faces in occluded regions
+                     (mean vertex dist > occ_thresh) are appended.
+                     Avoids Poisson's "closed surface" artifact.
+    method='poisson': screened Poisson on merged point clouds (original method).
     """
     recon_mesh = load_mesh(recon_path)
     gen_mesh   = load_mesh(gen_path)
@@ -157,82 +204,83 @@ def fuse(recon_path: Path, gen_path: Path, out_path: Path,
     rv = np.asarray(recon_mesh.vertices)
     gv = np.asarray(gen_mesh.vertices)
     if len(rv) == 0:
-        print(f"  [ERROR] empty recon mesh: {recon_path}")
-        return None
+        print(f"  [ERROR] empty recon mesh: {recon_path}"); return None
     if len(gv) == 0:
-        print(f"  [ERROR] empty gen mesh: {gen_path}")
-        return None
+        print(f"  [ERROR] empty gen mesh: {gen_path}"); return None
 
-    # ── 1. Sample PCDs ────────────────────────────────────────────────────────
-    recon_pcd = sample_pcd_with_normals(recon_mesh, n_recon)
-    gen_pcd   = sample_pcd_with_normals(gen_mesh,   n_gen)
+    # ── Method: append ────────────────────────────────────────────────────────
+    if method == "append":
+        gen_occ, n_occ = _filter_gen_faces(gen_mesh, rv, occ_thresh)
 
-    # ── 2. Filter generated → occluded region only ────────────────────────────
-    recon_tree = o3d.geometry.KDTreeFlann(recon_pcd)
-    gen_pts    = np.asarray(gen_pcd.points)
-    gen_nrm    = np.asarray(gen_pcd.normals)
-
-    mask = occluded_mask(gen_pts, recon_tree, occ_thresh)
-    n_occ = mask.sum()
-    n_vis = (~mask).sum()
-
-    if verbose:
-        print(f"  generated pts: {len(gen_pts)}  "
-              f"occluded={n_occ}  visible={n_vis}  "
-              f"(occ_thresh={occ_thresh*100:.0f}cm)")
-
-    # ── 3. Merge ──────────────────────────────────────────────────────────────
-    if n_occ == 0:
         if verbose:
-            print("  [WARN] no occluded points found — using recon only")
-        merged = recon_pcd
+            print(f"  occ faces={n_occ}  (occ_thresh={occ_thresh*100:.0f}cm)")
+
+        if n_occ > 0:
+            # Concatenate: TSDF + occluded Amodal3R faces
+            n_rv = len(rv)
+            occ_verts = np.asarray(gen_occ.vertices)
+            occ_faces = np.asarray(gen_occ.triangles) + n_rv
+            recon_faces = np.asarray(recon_mesh.triangles)
+
+            fused_mesh = o3d.geometry.TriangleMesh()
+            fused_mesh.vertices  = o3d.utility.Vector3dVector(
+                np.vstack([rv, occ_verts]))
+            fused_mesh.triangles = o3d.utility.Vector3iVector(
+                np.vstack([recon_faces, occ_faces]))
+            fused_mesh.compute_vertex_normals()
+        else:
+            if verbose:
+                print("  [WARN] no occluded faces — fused = recon only")
+            fused_mesh = recon_mesh
+
+    # ── Method: poisson ───────────────────────────────────────────────────────
     else:
-        gen_pcd_occ = gen_pcd.select_by_index(np.where(mask)[0])
-        merged = recon_pcd + gen_pcd_occ
-
-    # Re-orient normals consistently (Poisson needs this)
-    merged.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(0.1, 30))
-    merged.orient_normals_consistent_tangent_plane(30)
-
-    # ── 4. Screened Poisson ───────────────────────────────────────────────────
-    fused_mesh, densities = \
-        o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
-            merged, depth=poisson_depth, scale=1.1, linear_fit=False)
-
-    # Trim low-density outliers (floaters)
-    if density_trim > 0 and len(densities) > 0:
-        d_arr   = np.asarray(densities)
-        thresh  = np.quantile(d_arr, density_trim)
-        keep    = d_arr > thresh
-        fused_mesh = fused_mesh.select_by_index(
-            np.where(keep)[0])
+        recon_pcd = sample_pcd_with_normals(recon_mesh, n_recon)
+        gen_pcd   = sample_pcd_with_normals(gen_mesh,   n_gen)
+        recon_tree = o3d.geometry.KDTreeFlann(recon_pcd)
+        gen_pts    = np.asarray(gen_pcd.points)
+        mask = occluded_mask(gen_pts, recon_tree, occ_thresh)
+        n_occ = int(mask.sum())
+        if verbose:
+            print(f"  occ pts={n_occ}  (occ_thresh={occ_thresh*100:.0f}cm)")
+        if n_occ > 0:
+            gen_pcd_occ = gen_pcd.select_by_index(np.where(mask)[0])
+            merged = recon_pcd + gen_pcd_occ
+        else:
+            merged = recon_pcd
+        merged.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(0.1, 30))
+        merged.orient_normals_consistent_tangent_plane(30)
+        fused_mesh, densities = \
+            o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+                merged, depth=poisson_depth, scale=1.1, linear_fit=False)
+        if density_trim > 0 and len(densities) > 0:
+            d_arr = np.asarray(densities)
+            keep  = d_arr > np.quantile(d_arr, density_trim)
+            fused_mesh = fused_mesh.select_by_index(np.where(keep)[0])
 
     o3d.io.write_triangle_mesh(str(out_path), fused_mesh)
-
     fv = np.asarray(fused_mesh.vertices)
 
-    # ── 5. Evaluate ───────────────────────────────────────────────────────────
+    # ── Evaluate ──────────────────────────────────────────────────────────────
     result = {
-        "n_recon_pts": len(np.asarray(recon_pcd.points)),
-        "n_gen_occ_pts": int(n_occ),
+        "method": method,
+        "n_occ": n_occ,
         "n_fused_verts": len(fv),
         "occ_thresh_m": occ_thresh,
     }
 
-    # CD vs recon (alignment quality proxy)
     cd_recon = chamfer_l1(fv, rv)
     result["cd_vs_recon_mm"] = round(cd_recon * 1000, 1)
 
-    # CD vs GT (if provided)
     if gt_mesh_path is not None and gt_id is not None and gt_mesh_path.exists():
         gt_verts = load_gt_object_verts(gt_mesh_path, gt_id)
         if gt_verts is not None and len(gt_verts) > 0:
             if verbose:
                 print(f"  GT object {gt_id}: {len(gt_verts)} verts")
-            cd_gt_recon  = chamfer_l1(rv,  gt_verts)
-            cd_gt_fused  = chamfer_l1(fv,  gt_verts)
-            result["cd_vs_gt_recon_mm"]  = round(cd_gt_recon  * 1000, 1)
-            result["cd_vs_gt_fused_mm"]  = round(cd_gt_fused  * 1000, 1)
+            cd_gt_recon = chamfer_l1(rv,  gt_verts)
+            cd_gt_fused = chamfer_l1(fv, gt_verts)
+            result["cd_vs_gt_recon_mm"]  = round(cd_gt_recon * 1000, 1)
+            result["cd_vs_gt_fused_mm"]  = round(cd_gt_fused * 1000, 1)
             result["cd_improvement_mm"]  = round((cd_gt_recon - cd_gt_fused) * 1000, 1)
             result["cd_improvement_pct"] = round(
                 (1 - cd_gt_fused / cd_gt_recon) * 100, 1) if cd_gt_recon > 0 else 0
@@ -241,7 +289,6 @@ def fuse(recon_path: Path, gen_path: Path, out_path: Path,
 
     if verbose:
         print(f"  fused verts: {len(fv)}")
-        print(f"  CD vs recon: {result['cd_vs_recon_mm']}mm")
         if "cd_vs_gt_fused_mm" in result:
             print(f"  CD vs GT:  recon={result['cd_vs_gt_recon_mm']}mm  "
                   f"fused={result['cd_vs_gt_fused_mm']}mm  "
@@ -270,15 +317,19 @@ def main():
     ap.add_argument("--labels",     nargs="+", default=["97", "98", "75"])
     ap.add_argument("--seeds",      nargs="+", type=int, default=[1, 2, 3])
     # fusion params
+    ap.add_argument("--method",        default="append",
+                    choices=["append", "poisson"],
+                    help="append: direct mesh concatenation (default); poisson: screened Poisson")
     ap.add_argument("--occ_thresh",    type=float, default=0.05,
-                    help="Distance (m) to TSDF surface below which gen points are excluded")
+                    help="Distance (m) to TSDF surface below which gen faces/pts are excluded")
     ap.add_argument("--n_pts",         type=int,   default=80000)
     ap.add_argument("--poisson_depth", type=int,   default=9)
     ap.add_argument("--density_trim",  type=float, default=0.05,
-                    help="Trim lowest X fraction of Poisson density (removes floaters)")
+                    help="Trim lowest X fraction of Poisson density (poisson method only)")
     args = ap.parse_args()
 
     kwargs = dict(
+        method=args.method,
         occ_thresh=args.occ_thresh,
         n_recon=args.n_pts,
         n_gen=args.n_pts,
