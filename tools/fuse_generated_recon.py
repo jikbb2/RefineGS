@@ -386,7 +386,7 @@ def main():
                      gt_mesh_path=gt_mesh_path, gt_id=gt_id,
                      verbose=False, **kwargs)
             if r:
-                row = (f"{label:>6} {seed:>5} {r['n_gen_occ_pts']:>8} "
+                row = (f"{label:>6} {seed:>5} {r['n_occ']:>8} "
                        f"{r['cd_vs_recon_mm']:>9.1f}")
                 if has_gt and "cd_vs_gt_fused_mm" in r:
                     row += (f" {r['cd_vs_gt_recon_mm']:>10.1f}"
