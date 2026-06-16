@@ -19,25 +19,29 @@ SCENE=${SCENE:-replica_room0}
 ROOT=/home/elicer/RefineGS
 FRAMES=${FRAMES:-${ROOT}/data/${SCENE}/images}
 IMG_EXT=${IMG_EXT:-.jpg}
-SCENE_COLMAP=${SCENE_COLMAP:-${ROOT}/data/${SCENE}/sparse}        # scene COLMAP(points3D 포함)
+SCENE_COLMAP=${SCENE_COLMAP:-${ROOT}/data/${SCENE}/sparse/0}      # scene COLMAP(cameras/images/points3D)
+IMG_EXT=${IMG_EXT:-.JPEG}
 VOCAB=${VOCAB:-/home/elicer/sam3/vocab.json}
 BPE=${BPE:-/home/elicer/sam3/sam3/assets/bpe_simple_vocab_16e6.txt.gz}
 GT_MESH=${GT_MESH:-/home/elicer/room_0/habitat/mesh_semantic.ply}
 STRIDE=${STRIDE:-2}
+NPF=${NPF:-8}; DEDUP=${DEDUP:-0.3}                                # video relabel: keyframe수, cross-concept 병합
+EXCLUDE=${EXCLUDE:-"door,blind,vent,window,wall,floor,ceiling,light switch,thermostat"}
 ITERS=${ITERS:-7000}; LDIST=${LDIST:-300}; LNORM=${LNORM:-0.05}   # reg_strong
 RELABEL=${RELABEL:-$HOME/relabel_${SCENE}}
 AMODAL=${AMODAL:-$HOME/amodal_${SCENE}}
 OUT=${OUT:-output/${SCENE}/refinegs_full}
-SR=sam3_relabel.py; AM=amodal_mask.py; AC=amodal_complete_general.py
+SR=sam3_relabel_video.py; AM=amodal_mask.py; AC=amodal_complete_general.py   # ❶=video predictor 기반
 
 cd ${ROOT}
 
-echo "=== [1] SAM3 re-labeling (+conflation) ==="
+echo "=== [1] SAM3 video re-labeling (native 추적 + cross-concept dedup) ==="
 if [ ! -d "${RELABEL}" ]; then
   LD_LIBRARY_PATH= conda run -n sam3 python ${SR} \
     --frames ${FRAMES} --img_ext ${IMG_EXT} --colmap_dir ${SCENE_COLMAP} \
     --vocab_json ${VOCAB} --bpe ${BPE} --stride ${STRIDE} \
-    --min_area 0.003 --jac_th 0.2 --min_track 3 --out_root ${RELABEL}
+    --n_prompt_frames ${NPF} --min_area 0.003 --min_track 3 --dedup_th ${DEDUP} \
+    --exclude_concepts "${EXCLUDE}" --out_root ${RELABEL}
 fi
 NOBJ=$(ls -d ${RELABEL}/*/ 2>/dev/null | wc -l); echo "re-labeled objects: ${NOBJ}"
 
