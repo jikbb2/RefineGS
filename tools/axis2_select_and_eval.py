@@ -121,6 +121,8 @@ def main():
     ap.add_argument("--gt_dir",required=True); ap.add_argument("--gt_id",type=int,required=True)
     ap.add_argument("--concept",default="table")
     ap.add_argument("--bpe",default=None); ap.add_argument("--stride",type=int,default=10)
+    ap.add_argument("--margin",type=float,default=0.10,
+                    help="do-no-harm 게이트: 3D 선택이 naive보다 이만큼 더 객체-일관적일 때만 override")
     ap.add_argument("--out_dir",default=os.path.expanduser("~/axis2_selected"))
     args=ap.parse_args(); os.makedirs(args.out_dir,exist_ok=True)
 
@@ -132,9 +134,9 @@ def main():
     model=build_sam3_image_model(**mk); proc=Sam3Processor(model)
 
     imgs=sorted(glob.glob(os.path.join(args.images_dir,"*")))[::args.stride]
-    naive,ax,ora=[],[],[]
-    print(f"{'frame':>12} {'naive':>8} {'axis2':>8} {'oracle':>8}")
-    print("-"*42)
+    naive,ax,fin,ora=[],[],[],[]; n_override=0
+    print(f"{'frame':>12} {'naive':>8} {'axis2':>8} {'final':>8} {'oracle':>8}")
+    print("-"*52)
     with torch.inference_mode(), torch.autocast("cuda",dtype=torch.bfloat16):
         for ip in imgs:
             stem=os.path.splitext(os.path.basename(ip))[0]
@@ -162,18 +164,23 @@ def main():
                 gtio.append(iou(resize_to(m,gt.shape),gt))
             i_ax=int(np.argmax(s3d))
             i_na=int(np.argmax(scores)) if scores is not None and len(scores)==len(masks) else int(np.argmax([m.sum() for m in masks]))
-            naive.append(gtio[i_na]); ax.append(gtio[i_ax]); ora.append(max(gtio))
-            Image.fromarray((resize_to(masks[i_ax],(cam["H"],cam["W"]))*255).astype(np.uint8)).save(
+            # do-no-harm 게이트: 3D 선택이 naive보다 margin 이상 더 객체-일관적일 때만 override
+            i_fin = i_ax if s3d[i_ax] > s3d[i_na] + args.margin else i_na
+            if i_fin != i_na: n_override += 1
+            naive.append(gtio[i_na]); ax.append(gtio[i_ax]); fin.append(gtio[i_fin]); ora.append(max(gtio))
+            Image.fromarray((resize_to(masks[i_fin],(cam["H"],cam["W"]))*255).astype(np.uint8)).save(
                 os.path.join(args.out_dir,f"{stem}.png"))
-            print(f"{stem:>12} {gtio[i_na]:>8.3f} {gtio[i_ax]:>8.3f} {max(gtio):>8.3f}")
+            print(f"{stem:>12} {gtio[i_na]:>8.3f} {gtio[i_ax]:>8.3f} {gtio[i_fin]:>8.3f} {max(gtio):>8.3f}")
     def stat(a):
         a=np.array(a); return f"mean={a.mean():.3f} std={a.std():.3f} min={a.min():.3f} n={len(a)}"
-    print("-"*42)
-    print(f"naive (SAM conf) : {stat(naive)}")
-    print(f"axis2 (3D select): {stat(ax)}")
-    print(f"oracle (best→GT) : {stat(ora)}")
+    print("-"*52)
+    print(f"naive (SAM conf)     : {stat(naive)}")
+    print(f"axis2 (3D, 무조건)   : {stat(ax)}")
+    print(f"final (게이트 적용)  : {stat(fin)}   override={n_override}/{len(fin)}")
+    print(f"oracle (best→GT)     : {stat(ora)}")
     print(f"\n저장 선택 마스크: {args.out_dir}")
-    print("판정: axis2가 naive보다 std↓·min↑(일관성)이고 oracle에 근접하면 축2 mask-selection 가치.")
+    print("판정(do-no-harm): final이 naive보다 나쁘지 않아야(mean≥, min↑). "
+          "override가 0이면 이 객체엔 개입 불필요(일관)=무해. override>0인데 final↑이면 흔들리는 뷰를 고친 것.")
 
 
 if __name__=="__main__":
