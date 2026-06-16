@@ -115,9 +115,11 @@ def main():
     ap.add_argument("--stride",type=int,default=2)
     ap.add_argument("--min_area",type=float,default=0.003,help="인스턴스 최소 면적(프레임 비율)")
     ap.add_argument("--jac_th",type=float,default=0.2,help="3D signature Jaccard 클러스터 임계")
-    ap.add_argument("--merge_th",type=float,default=0.5,
-                    help="병합 패스: containment(|A∩B|/min) 이 이상이면 같은 객체로 병합(over-fragmentation 해소)")
+    ap.add_argument("--merge_th",type=float,default=0.3,
+                    help="병합 패스: Jaccard(|A∩B|/|A∪B|) 이 이상이면 같은 객체 파편으로 병합")
     ap.add_argument("--min_track",type=int,default=3,help="유효 객체로 인정할 최소 관측 뷰")
+    ap.add_argument("--exclude_concepts",default="",
+                    help="쉼표 구분, 이 concept이 dominant인 객체는 출력 제외(예: door,blind,vent,window,wall,floor,ceiling)")
     ap.add_argument("--out_root",required=True)
     args=ap.parse_args(); os.makedirs(args.out_root,exist_ok=True)
 
@@ -169,26 +171,32 @@ def main():
         else:
             clusters.append(dict(sig=set(obs[i][3]),members=[i],views={obs[i][0]},
                                  concepts=Counter([obs[i][1]])))
-    # ── 병합 패스: over-fragmentation 해소 (containment 기반, concept 무관) ──
-    def cont(a, b):
+    # ── 병합 패스: over-fragmentation 해소 (Jaccard 대칭, concept 무관) ──
+    # Jaccard라 같은 객체 파편(상호겹침 큼)만 합치고, 작은-객체-in-큰-평면(겹침 작음)은 안 합침.
+    def jacm(a, b):
         if not a or not b: return 0.0
-        return len(a & b) / min(len(a), len(b))
+        i = len(a & b); return i / (len(a) + len(b) - i)
     n_before = len(clusters)
     changed = True
     while changed:
         changed = False
         for i in range(len(clusters)):
             for j in range(i + 1, len(clusters)):
-                if cont(clusters[i]["sig"], clusters[j]["sig"]) > args.merge_th:
+                if jacm(clusters[i]["sig"], clusters[j]["sig"]) > args.merge_th:
                     clusters[i]["sig"] |= clusters[j]["sig"]
                     clusters[i]["members"] += clusters[j]["members"]
                     clusters[i]["views"] |= clusters[j]["views"]
                     clusters[i]["concepts"] += clusters[j]["concepts"]
                     del clusters[j]; changed = True; break
             if changed: break
-    print(f"병합: {n_before} → {len(clusters)} 클러스터 (containment>{args.merge_th})")
+    print(f"병합: {n_before} → {len(clusters)} 클러스터 (Jaccard>{args.merge_th})")
 
+    excl = {c.strip() for c in args.exclude_concepts.split(",") if c.strip()}
     objs=[c for c in clusters if len(c["views"])>=args.min_track]
+    if excl:
+        kept=[c for c in objs if c["concepts"].most_common(1)[0][0] not in excl]
+        print(f"구조물 제외({sorted(excl)}): {len(objs)} → {len(kept)} 객체")
+        objs=kept
     objs.sort(key=lambda c:-len(c["views"]))
     print(f"유효 객체(views>={args.min_track}) {len(objs)}")
 
