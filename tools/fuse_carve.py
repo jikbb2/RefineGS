@@ -148,31 +148,86 @@ def silhouette_violating_vertices(verts, cameras, masks):
     return viol, in_img_count
 
 
-def carve_faces(occ_mesh, cameras, masks):
-    """Remove faces with any silhouette-violating vertex. Returns
-    (carved_mesh, n_in, n_kept)."""
+def _build_raycast_scene(recon_mesh):
+    scene = o3d.t.geometry.RaycastingScene()
+    scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(recon_mesh))
+    return scene
+
+
+def freespace_violating_vertices(verts, scene, cameras, masks, margin=0.02):
+    """True = vertex lies IN FRONT of the observed recon surface (closer to
+    camera than the recon ray-hit) while projecting inside the silhouette in
+    >=1 view. It would have occluded the observed surface but recon shows the
+    surface behind it -> provably should have been seen -> evidence-violating.
+    Catches protrusions (e.g. z=3.07 blow-ups) that silhouette veto misses."""
+    viol = np.zeros(len(verts), dtype=bool)
+    for cam in cameras:
+        m = masks.get(cam["stem"])
+        if m is None:
+            continue
+        Xc = verts @ cam["R"].T + cam["t"]
+        z = Xc[:, 2]
+        ok = z > 1e-6
+        u = cam["fx"] * Xc[:, 0] / np.where(ok, z, 1) + cam["cx"]
+        v = cam["fy"] * Xc[:, 1] / np.where(ok, z, 1) + cam["cy"]
+        Hm, Wm = m.shape
+        sy = Hm / cam["H"]; sx = Wm / cam["W"]
+        ui = (u * sx).astype(np.int64); vi = (v * sy).astype(np.int64)
+        in_img = ok & (ui >= 0) & (ui < Wm) & (vi >= 0) & (vi < Hm)
+        in_mask = np.zeros(len(verts), dtype=bool)
+        in_mask[in_img] = m[vi[in_img], ui[in_img]]
+        cand = in_img & in_mask          # inside silhouette: free-space testable
+        if not cand.any():
+            continue
+        C = (-cam["R"].T @ cam["t"]).astype(np.float64)
+        P = verts[cand]
+        d = P - C[None, :]
+        tgen = np.linalg.norm(d, axis=1)
+        d = d / np.maximum(tgen[:, None], 1e-9)
+        rays = np.hstack([np.broadcast_to(C, P.shape), d]).astype(np.float32)
+        thit = scene.cast_rays(o3d.core.Tensor(rays))["t_hit"].numpy()
+        hit = np.isfinite(thit)
+        front = np.zeros(cand.sum(), dtype=bool)
+        front[hit] = tgen[hit] < (thit[hit] - margin)   # in front of surface
+        idx = np.where(cand)[0]
+        viol[idx[front]] = True
+    return viol
+
+
+def carve_faces(occ_mesh, recon_mesh, cameras, masks, margin=0.02,
+                use_freespace=True):
+    """Remove faces with any evidence-violating vertex (silhouette OR free-space).
+    Returns (carved_mesh, n_in, n_kept, n_vert_sil, n_vert_fs)."""
     gv = np.asarray(occ_mesh.vertices)
     gf = np.asarray(occ_mesh.triangles)
     if len(gf) == 0:
-        return occ_mesh, 0, 0
-    viol, _ = silhouette_violating_vertices(gv, cameras, masks)
+        return occ_mesh, 0, 0, 0, 0
+    viol_sil, _ = silhouette_violating_vertices(gv, cameras, masks)
+    if use_freespace:
+        scene = _build_raycast_scene(recon_mesh)
+        viol_fs = freespace_violating_vertices(gv, scene, cameras, masks, margin)
+    else:
+        viol_fs = np.zeros(len(gv), dtype=bool)
+    viol = viol_sil | viol_fs
     keep_face = ~viol[gf].any(axis=1)
     n_in = len(gf)
+    n_vsil, n_vfs = int(viol_sil.sum()), int(viol_fs.sum())
     if keep_face.sum() == 0:
-        return o3d.geometry.TriangleMesh(), n_in, 0
+        return o3d.geometry.TriangleMesh(), n_in, 0, n_vsil, n_vfs
     sf = gf[keep_face]
     uv, ni = np.unique(sf, return_inverse=True)
     out = o3d.geometry.TriangleMesh()
     out.vertices = o3d.utility.Vector3dVector(gv[uv])
     out.triangles = o3d.utility.Vector3iVector(ni.reshape(sf.shape))
     out.compute_vertex_normals()
-    return out, n_in, int(keep_face.sum())
+    return out, n_in, int(keep_face.sum()), n_vsil, n_vfs
 
 
 # ── per-object fusion ─────────────────────────────────────────────────────────
 
 def fuse_carve(recon_path, gen_path, out_path, colmap_dir, masks_dir,
-               occ_thresh=0.05, gt_mesh_path=None, gt_id=None, verbose=True):
+               occ_thresh=0.05, margin=0.02, use_freespace=True,
+               gt_mesh_path=None, gt_id=None, verbose=True):
     recon = load_mesh(recon_path)
     gen = load_mesh(gen_path)
     rv = np.asarray(recon.vertices)
@@ -184,8 +239,10 @@ def fuse_carve(recon_path, gen_path, out_path, colmap_dir, masks_dir,
 
     # 1. occluded candidate faces
     occ_mesh, n_occ = filter_gen_faces(gen, rv, occ_thresh)
-    # 2. silhouette / visual-hull veto
-    kept_mesh, n_in, n_kept = carve_faces(occ_mesh, cameras, masks)
+    # 2. evidence veto: silhouette (visual hull) + free-space (depth)
+    kept_mesh, n_in, n_kept, n_vsil, n_vfs = carve_faces(
+        occ_mesh, recon, cameras, masks, margin=margin,
+        use_freespace=use_freespace)
     n_carved = n_in - n_kept
 
     # 3. append surviving faces to recon
@@ -207,6 +264,8 @@ def fuse_carve(recon_path, gen_path, out_path, colmap_dir, masks_dir,
         "n_carved": n_carved,
         "n_kept": n_kept,
         "frac_carved": round(n_carved / n_occ, 3) if n_occ else 0.0,
+        "n_vert_silhouette": n_vsil,
+        "n_vert_freespace": n_vfs,
         "n_fused_verts": len(fv),
         "cd_vs_recon_mm": round(chamfer_l1(fv, rv) * 1000, 1),
     }
@@ -218,8 +277,8 @@ def fuse_carve(recon_path, gen_path, out_path, colmap_dir, masks_dir,
             res["cd_vs_gt_fused_mm"] = round(cd_f * 1000, 1)
             res["cd_improvement_mm"] = round((cd_r - cd_f) * 1000, 1)
     if verbose:
-        print(f"  occ={n_occ}  carved(evidence-violating)={n_carved} "
-              f"({res['frac_carved']*100:.0f}%)  kept(unverifiable fill)={n_kept}")
+        print(f"  occ={n_occ}  carved={n_carved} ({res['frac_carved']*100:.0f}%) "
+              f"[sil_v={n_vsil} fs_v={n_vfs}]  kept(unverifiable fill)={n_kept}")
         if "cd_vs_gt_fused_mm" in res:
             print(f"  CD vs GT: recon={res['cd_vs_gt_recon_mm']}mm "
                   f"fused={res['cd_vs_gt_fused_mm']}mm "
@@ -246,13 +305,19 @@ def main():
     ap.add_argument("--labels", nargs="+", default=["97", "98", "75"])
     ap.add_argument("--seeds", nargs="+", type=int, default=[1, 2, 3])
     ap.add_argument("--occ_thresh", type=float, default=0.05)
+    ap.add_argument("--margin", type=float, default=0.02,
+                    help="free-space veto margin (m): carve gen pts in front of "
+                         "recon surface by more than this")
+    ap.add_argument("--no_freespace", action="store_true",
+                    help="disable free-space(depth) veto, silhouette only")
     args = ap.parse_args()
 
     if not args.batch:
         r = fuse_carve(args.recon, args.gen,
                        args.out or args.gen.parent / "mesh_carved.ply",
                        args.colmap_dir, args.masks_dir,
-                       occ_thresh=args.occ_thresh,
+                       occ_thresh=args.occ_thresh, margin=args.margin,
+                       use_freespace=not args.no_freespace,
                        gt_mesh_path=args.gt_mesh, gt_id=args.gt_id)
         if r:
             import json; print(json.dumps(r, indent=2))
@@ -265,8 +330,9 @@ def main():
     has_gt = args.gt_mesh is not None
 
     print(f"\n{'label':>6} {'seed':>5} {'n_occ':>7} {'carved':>7} {'frac%':>6} "
-          f"{'kept':>7} {'CD_rcn':>7} {'CD_GTr':>7} {'CD_GTf':>7} {'Δmm':>7}")
-    print("-" * 80)
+          f"{'sil_v':>6} {'fs_v':>6} {'kept':>7} {'CD_rcn':>7} {'CD_GTr':>7} "
+          f"{'CD_GTf':>7} {'Δmm':>7}")
+    print("-" * 95)
     for label in args.labels:
         rg = list(recon_root.glob(f"{label}/train/ours_7000/fuse_post.ply")) or \
              list(recon_root.glob(f"{label}/train/ours_*/fuse_post.ply"))
@@ -282,20 +348,23 @@ def main():
             if not gen_path.exists():
                 print(f"  [SKIP] {label}/seed{seed}: no mesh_registered.ply"); continue
             r = fuse_carve(recon_path, gen_path, out_path, colmap_dir, masks_dir,
-                           occ_thresh=args.occ_thresh, gt_mesh_path=args.gt_mesh,
-                           gt_id=gt_id, verbose=False)
+                           occ_thresh=args.occ_thresh, margin=args.margin,
+                           use_freespace=not args.no_freespace,
+                           gt_mesh_path=args.gt_mesh, gt_id=gt_id, verbose=False)
             if not r:
                 continue
             row = (f"{label:>6} {seed:>5} {r['n_occ']:>7} {r['n_carved']:>7} "
-                   f"{r['frac_carved']*100:>5.0f}% {r['n_kept']:>7} "
+                   f"{r['frac_carved']*100:>5.0f}% {r['n_vert_silhouette']:>6} "
+                   f"{r['n_vert_freespace']:>6} {r['n_kept']:>7} "
                    f"{r['cd_vs_recon_mm']:>7.1f}")
             if has_gt and "cd_vs_gt_fused_mm" in r:
                 row += (f" {r['cd_vs_gt_recon_mm']:>7.1f} {r['cd_vs_gt_fused_mm']:>7.1f} "
                         f"{r['cd_improvement_mm']:>7.1f}")
             print(row)
-    print("-" * 80)
-    print("frac_carved 높음 = 생성/정렬이 증거를 많이 위반(위험). "
-          "kept = 검증 불가 occluded fill(평가에서 accuracy_unobs로 flag).")
+    print("-" * 95)
+    print("sil_v=실루엣 밖 위반 정점, fs_v=표면 앞(free-space) 위반 정점. "
+          "frac_carved 높음 = 증거 위반 많음(폭주 seed에서 fs_v가 커야 정상).")
+    print("kept = 검증 불가 occluded fill(평가에서 accuracy_unobs로 flag).")
     print("다음: eval_object_mesh.py eval 로 mesh_carved.ply visibility-split 평가.")
 
 
