@@ -146,7 +146,9 @@ def main():
             image=Image.open(ip).convert("RGB"); state=proc.set_image(image)
             out=proc.set_text_prompt(state=state,prompt=args.concept)
             masks=to_bool(out.get("masks")) if isinstance(out,dict) else []
-            scores=np.asarray(out.get("scores")).reshape(-1) if (isinstance(out,dict) and out.get("scores") is not None) else None
+            _sc=out.get("scores") if isinstance(out,dict) else None
+            if _sc is not None and hasattr(_sc,"detach"): _sc=_sc.detach().float().cpu().numpy()
+            scores=np.asarray(_sc).reshape(-1) if _sc is not None else None
             if not masks: continue
             vis,ui,vi=visible(xyz,cam)
             visset=np.zeros(len(xyz),bool); visset[vis]=True
