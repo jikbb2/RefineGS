@@ -10,7 +10,7 @@ GS 포인트 인덱스 집합으로 변환. 모든 뷰의 part가 동일 3D 포�
 규약: stage3(autocast bf16), predict_inst(multimask_output=True), COLMAP 투영은
 eval_object_mesh와 동일.
 
-의존: numpy, torch, PIL, plyfile (pip install plyfile), sam3.
+의존: numpy(<2, sam3 호환), torch, PIL, sam3. (PLY는 인라인 리더 — plyfile 불필요)
 
 실행 (sam3 env):
     conda activate sam3
@@ -116,10 +116,39 @@ def load_cameras(d):
     return out
 
 
-def load_gs_xyz(ply):
-    from plyfile import PlyData
-    v = PlyData.read(ply)["vertex"]
-    return np.stack([v["x"], v["y"], v["z"]], axis=1).astype(np.float64)
+def load_gs_xyz(path):
+    """외부 의존 없이 binary/ascii PLY의 vertex x,y,z만 읽음 (plyfile 불필요).
+    GS point_cloud.ply / mesh fuse_post.ply 모두 vertex에 x,y,z를 가짐."""
+    TYPE = {"float": "<f4", "float32": "<f4", "double": "<f8", "float64": "<f8",
+            "uchar": "u1", "uint8": "u1", "char": "i1", "int8": "i1",
+            "ushort": "<u2", "uint16": "<u2", "short": "<i2", "int16": "<i2",
+            "uint": "<u4", "uint32": "<u4", "int": "<i4", "int32": "<i4"}
+    with open(path, "rb") as f:
+        if f.readline().strip() != b"ply":
+            raise ValueError("not a PLY file")
+        fmt = f.readline().split()[1].decode()        # ascii / binary_little_endian
+        props, n_vert, in_v = [], 0, False
+        while True:
+            ln = f.readline()
+            if ln.strip() == b"end_header":
+                break
+            p = ln.split()
+            if p[0] == b"element":
+                in_v = (p[1] == b"vertex")
+                if in_v:
+                    n_vert = int(p[2])
+            elif p[0] == b"property" and in_v:
+                props.append((p[2].decode(), p[1].decode()))   # (name, type)
+        names = [n for n, _ in props]
+        ix, iy, iz = names.index("x"), names.index("y"), names.index("z")
+        if fmt.startswith("binary_little_endian"):
+            dt = np.dtype([(n, TYPE[t]) for n, t in props])
+            data = np.frombuffer(f.read(n_vert * dt.itemsize), dtype=dt, count=n_vert)
+            return np.stack([data["x"], data["y"], data["z"]], axis=1).astype(np.float64)
+        else:  # ascii
+            arr = np.array([f.readline().split()[:len(props)] for _ in range(n_vert)],
+                           dtype=np.float64)
+            return arr[:, [ix, iy, iz]]
 
 
 # ── SAM3 helpers ─────────────────────────────────────────────────────────────
