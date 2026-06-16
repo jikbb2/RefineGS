@@ -327,9 +327,16 @@ def main():
 
     consistent = [c for c in clusters if len(c["views"]) >= args.min_views]
     consistent.sort(key=lambda c: -c["rep"].sum())
+    # 객체-support = 어느 뷰에서든 part에 한 번이라도 할당된 GS 포인트(=테이블 영역)
+    obj_support = np.zeros(N, bool)
+    for o in observations:
+        obj_support |= o
+    nsup = max(int(obj_support.sum()), 1)
+    print(f"객체-support GS(테이블 영역): {nsup}/{N} ({nsup/N*100:.1f}%)")
     print(f"클러스터: {len(clusters)}, 일관 part(views>={args.min_views}): {len(consistent)}\n")
     for k, c in enumerate(consistent):
-        print(f"  part{k}: GS {c['rep'].sum()}/{N} ({c['rep'].sum()/N*100:4.1f}%) "
+        s = int(c["rep"].sum())
+        print(f"  part{k}: GS {s} = {s/nsup*100:4.1f}% of object ({s/N*100:.2f}% of all) "
               f"views={len(c['views'])}")
 
     # 저장: 일관 part의 GS 인덱스 + 메타
@@ -338,10 +345,34 @@ def main():
                         parts=np.stack([c["rep"] for c in consistent]) if consistent
                         else np.empty((0, N), bool))
     json.dump([{"id": k, "n_gs": int(c["rep"].sum()),
-                "frac": round(c["rep"].sum()/N, 3), "views": len(c["views"])}
+                "frac_obj": round(c["rep"].sum()/nsup, 3),
+                "frac_all": round(c["rep"].sum()/N, 3), "views": len(c["views"])}
                for k, c in enumerate(consistent)],
               open(os.path.join(args.out_dir, "parts3d.json"), "w"), indent=2)
-    print(f"\n저장: {args.out_dir} (parts3d.npz/json)")
+
+    # ── 색칠 PLY 저장 (SuperSplat에서 part 분해 확인) ──
+    PALETTE = np.array([[230,25,75],[60,180,75],[0,130,200],[245,130,48],
+                        [145,30,180],[70,240,240],[240,50,230],[210,245,60],
+                        [250,190,212],[0,128,128]], np.uint8)
+    rgb = np.full((N, 3), 110, np.uint8)              # 미할당=회색
+    rgb[obj_support] = np.array([60, 60, 60], np.uint8)   # 객체-support(미선택)=짙은 회색
+    for k, c in enumerate(consistent):
+        rgb[c["rep"]] = PALETTE[k % len(PALETTE)]
+    ply_path = os.path.join(args.out_dir, "parts_colored.ply")
+    with open(ply_path, "wb") as f:
+        f.write(b"ply\nformat binary_little_endian 1.0\n")
+        f.write(f"element vertex {N}\n".encode())
+        f.write(b"property float x\nproperty float y\nproperty float z\n")
+        f.write(b"property uchar red\nproperty uchar green\nproperty uchar blue\n")
+        f.write(b"end_header\n")
+        dt = np.dtype([("x","<f4"),("y","<f4"),("z","<f4"),
+                       ("r","u1"),("g","u1"),("b","u1")])
+        arr = np.empty(N, dt)
+        arr["x"], arr["y"], arr["z"] = xyz[:,0], xyz[:,1], xyz[:,2]
+        arr["r"], arr["g"], arr["b"] = rgb[:,0], rgb[:,1], rgb[:,2]
+        f.write(arr.tobytes())
+    print(f"\n저장: {args.out_dir} (parts3d.npz/json, parts_colored.ply)")
+    print(f"  parts_colored.ply 를 SuperSplat에서 열면 part 분해(색)·객체영역(회색) 확인")
     print("판정: 일관 part가 객체를 의미있게 분할(예 상판/다리)하고 views가 충분하면 Step 2 OK.")
     print("다음 Step 3: 각 part의 view-support(C1)+GS수/가시뷰(C2)+기하 distinctness(C3)로 granularity 선택.")
 
