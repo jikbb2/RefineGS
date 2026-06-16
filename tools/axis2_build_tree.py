@@ -1,24 +1,21 @@
 #!/usr/bin/env python3
 """
-축2 Step 1 — 단일 뷰·단일 객체 → part tree 빌더 (atomic unit).
+축2 Step 1 — 단일 뷰·단일 객체 → part 후보 (whole→parts, 1단계).
 
-객체 마스크 안에 point grid를 뿌려 SAM3 multimask(subpart/part/whole) 후보를 모으고,
-객체 밖으로 새는 마스크 제거 → NMS dedup → 포함관계 tree 구성.
-이 단위를 Step 2에서 뷰·객체로 반복하며 3D voting으로 합친다.
+객체 마스크 안에 point grid → SAM3 multimask 후보 수집 → 객체 대비 size-filter
+(너무 작은 노이즈·너무 큰 ≈whole 제거) → NMS dedup → 상위 K part.
+deep tree 대신 part-whole 결정에 필요한 whole→parts 평면 구조만 출력.
 
-객체 마스크 출처: 기존 per-view instance PNG (relabel 출력; 파이프라인 결합) 또는 --concept.
-
-규약: stage3 (autocast bf16, mask squeeze), predict_inst(multimask_output=True).
+규약: stage3(autocast bf16, mask squeeze), predict_inst(multimask_output=True).
+객체 마스크 출처: 기존 per-view instance PNG (relabel 출력) 또는 --concept.
 
 실행 (sam3 env):
     conda activate sam3
     LD_LIBRARY_PATH= python axis2_build_tree.py \
-        --image /home/elicer/RefineGS/data/replica_room0/images/frame000000.JPEG \
-        --obj_mask /home/elicer/RefineGS/data/replica_room0/masks/97/masks/frame000000.png \
+        --image .../images/frameXXXX.JPEG \
+        --obj_mask .../masks/98/masks/frameXXXX.png \
         --bpe /home/elicer/sam3/sam3/assets/bpe_simple_vocab_16e6.txt.gz \
-        --grid 8 --out_dir ~/axis2_tree_out
-    # 또는 객체를 concept로:
-    #   --concept couch   (--obj_mask 대신)
+        --grid 6 --min_part 0.05 --max_part 0.7 --topk 12 --out_dir ~/axis2_tree_98
 """
 import argparse
 import json
@@ -54,13 +51,10 @@ def concept_obj_mask(proc, state, concept):
     if m is None:
         return None
     bm = to_bool_masks(m)
-    if not bm:
-        return None
-    return bm[int(np.argmax([x.sum() for x in bm]))]
+    return bm[int(np.argmax([x.sum() for x in bm]))] if bm else None
 
 
 def grid_points_in_mask(mask, grid):
-    """grid x grid 균일 후보 중 마스크 내부 점만 (x,y)."""
     ys, xs = np.where(mask)
     if len(xs) == 0:
         return np.empty((0, 2), int)
@@ -75,9 +69,8 @@ def grid_points_in_mask(mask, grid):
 
 
 def iou(a, b):
-    inter = np.logical_and(a, b).sum()
-    union = np.logical_or(a, b).sum()
-    return inter / union if union else 0.0
+    u = np.logical_or(a, b).sum()
+    return np.logical_and(a, b).sum() / u if u else 0.0
 
 
 def coverage(small, big):
@@ -85,39 +78,28 @@ def coverage(small, big):
     return np.logical_and(small, big).sum() / s if s else 0.0
 
 
-def nms_dedup(cands, iou_th=0.85):
-    """cands: list of dict(mask,score,area). IoU>th 중복 병합(면적 큰 것 유지)."""
+def nms(cands, iou_th=0.7):
     order = sorted(range(len(cands)), key=lambda i: -cands[i]["area"])
     kept = []
     for i in order:
-        if all(iou(cands[i]["mask"], cands[j]["mask"]) < iou_th for j in kept):
+        if all(iou(cands[i]["mask"], cands[k]["mask"]) < iou_th for k in kept):
             kept.append(i)
     return [cands[i] for i in kept]
-
-
-def build_tree(nodes):
-    """parent = 자신을 가장 작게 포함(coverage>0.9)하는 더 큰 노드."""
-    order = sorted(range(len(nodes)), key=lambda i: nodes[i]["area"])  # 작은→큰
-    for a in order:
-        parent, parea = -1, None
-        for b in range(len(nodes)):
-            if b == a or nodes[b]["area"] <= nodes[a]["area"]:
-                continue
-            if coverage(nodes[a]["mask"], nodes[b]["mask"]) > 0.9:
-                if parea is None or nodes[b]["area"] < parea:
-                    parent, parea = b, nodes[b]["area"]
-        nodes[a]["parent"] = parent
-    return nodes
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--image", required=True)
-    ap.add_argument("--obj_mask", default=None, help="객체 instance mask PNG")
-    ap.add_argument("--concept", default=None, help="객체를 concept로 (obj_mask 대신)")
-    ap.add_argument("--grid", type=int, default=8, help="객체 bbox 내 grid 해상도")
-    ap.add_argument("--keep_cov", type=float, default=0.7,
-                    help="후보 마스크가 객체 안에 이만큼 들어와야 채택(밖으로 새는 것 제거)")
+    ap.add_argument("--obj_mask", default=None)
+    ap.add_argument("--concept", default=None)
+    ap.add_argument("--grid", type=int, default=6)
+    ap.add_argument("--keep_cov", type=float, default=0.8,
+                    help="후보가 객체 안에 이만큼 들어와야 part로 채택")
+    ap.add_argument("--min_part", type=float, default=0.05,
+                    help="객체 대비 최소 면적(노이즈 제거)")
+    ap.add_argument("--max_part", type=float, default=0.7,
+                    help="객체 대비 최대 면적(≈whole 제거)")
+    ap.add_argument("--topk", type=int, default=12)
     ap.add_argument("--bpe", default=None)
     ap.add_argument("--out_dir", default=os.path.expanduser("~/axis2_tree_out"))
     args = ap.parse_args()
@@ -133,7 +115,6 @@ def main():
 
     with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
         state = proc.set_image(image)
-
         if args.obj_mask:
             obj = load_obj_mask(args.obj_mask, (H, W))
         elif args.concept:
@@ -143,49 +124,48 @@ def main():
             obj = np.ones((H, W), bool)
         if obj is None or obj.sum() == 0:
             print("[ERROR] 객체 마스크 비어있음"); return
-        print(f"객체 마스크 area={obj.sum()/(H*W)*100:.2f}%")
+        obj_area = int(obj.sum())
+        obj_frac = obj_area / (H * W)
+        print(f"객체 마스크 area={obj_frac*100:.2f}% ({obj_area}px)")
+        if obj_frac > 0.9:
+            print("  [WARN] 객체가 프레임의 90%+ — 잘못된(전체) 마스크일 가능성. "
+                  "다른 프레임/마스크 확인 권장.")
 
         seeds = grid_points_in_mask(obj, args.grid)
         print(f"seed points: {len(seeds)}")
-
         cands = []
         for pt in seeds:
             masks, scores, _ = model.predict_inst(
                 state, point_coords=np.array([pt]),
                 point_labels=np.array([1]), multimask_output=True)
-            bm = to_bool_masks(masks)
-            sc = np.asarray(scores).reshape(-1).tolist()
-            for mm, s in zip(bm, sc):
-                if coverage(mm, obj) >= args.keep_cov and mm.sum() > 0:
-                    cands.append({"mask": mm, "score": float(s), "area": int(mm.sum())})
+            for mm, s in zip(to_bool_masks(masks), np.asarray(scores).reshape(-1)):
+                a = int(mm.sum())
+                if a == 0:
+                    continue
+                fo = a / obj_area              # 객체 대비 면적
+                if coverage(mm, obj) >= args.keep_cov and args.min_part <= fo <= args.max_part:
+                    cands.append({"mask": mm, "score": float(s), "area": a, "frac_obj": fo})
 
-    print(f"후보 마스크(객체 내부): {len(cands)}")
-    nodes = nms_dedup(cands, iou_th=0.85)
-    nodes = build_tree(nodes)
-    print(f"dedup 후 노드: {len(nodes)}")
+    print(f"size-filter 통과 후보: {len(cands)}")
+    parts = nms(cands, iou_th=0.7)
+    parts = sorted(parts, key=lambda p: -p["area"])[:args.topk]
+    print(f"NMS+topk 후 part: {len(parts)}\n")
 
-    # 저장 + 트리 요약
-    masks_arr = np.stack([n["mask"] for n in nodes]) if nodes else np.empty((0, H, W), bool)
-    np.savez_compressed(os.path.join(args.out_dir, "tree_masks.npz"),
-                        obj=obj, masks=masks_arr)
-    meta = [{"id": i, "area_frac": round(n["area"] / (H * W), 4),
-             "score": round(n["score"], 3), "parent": n["parent"]}
-            for i, n in enumerate(nodes)]
-    json.dump(meta, open(os.path.join(args.out_dir, "tree.json"), "w"), indent=2)
+    print(f"whole: obj ({obj_frac*100:.1f}% of frame)")
+    for i, p in enumerate(parts):
+        print(f"  part{i}: {p['frac_obj']*100:5.1f}% of obj  score={p['score']:.2f}")
 
-    roots = [m for m in meta if m["parent"] == -1]
-    print(f"\n트리: roots={len(roots)}  (parent=-1)")
-    for m in sorted(meta, key=lambda x: -x["area_frac"]):
-        depth = 0; p = m["parent"]
-        while p != -1:
-            depth += 1; p = meta[p]["parent"]
-        print(f"  {'  '*depth}node{m['id']}: area={m['area_frac']*100:5.2f}% "
-              f"score={m['score']:.2f} parent={m['parent']}")
-    for i, n in enumerate(nodes):
-        Image.fromarray((n["mask"] * 255).astype(np.uint8)).save(
-            os.path.join(args.out_dir, f"node{i}.png"))
-    print(f"\n저장: {args.out_dir} (tree.json, tree_masks.npz, node*.png)")
-    print("판정: 객체가 의미있는 part로 분해되고(노드 수 적당), 트리 depth가 객체→part로 잡히면 Step 1 OK.")
+    masks_arr = np.stack([p["mask"] for p in parts]) if parts else np.empty((0, H, W), bool)
+    np.savez_compressed(os.path.join(args.out_dir, "parts.npz"), obj=obj, parts=masks_arr)
+    json.dump([{"id": i, "frac_obj": round(p["frac_obj"], 3), "score": round(p["score"], 3)}
+               for i, p in enumerate(parts)],
+              open(os.path.join(args.out_dir, "parts.json"), "w"), indent=2)
+    Image.fromarray((obj * 255).astype(np.uint8)).save(os.path.join(args.out_dir, "whole.png"))
+    for i, p in enumerate(parts):
+        Image.fromarray((p["mask"] * 255).astype(np.uint8)).save(
+            os.path.join(args.out_dir, f"part{i}.png"))
+    print(f"\n저장: {args.out_dir} (whole.png, part*.png, parts.json/npz)")
+    print("판정: part 수가 적당(~3-10)하고 part*.png가 의미있는 부품이면 Step 1 OK → Step 2(multi-view voting).")
 
 
 if __name__ == "__main__":
