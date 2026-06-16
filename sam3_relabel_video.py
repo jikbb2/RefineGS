@@ -82,6 +82,20 @@ def load_cams(d):
         out[os.path.splitext(os.path.basename(im["name"]))[0]]=dict(R=im["R"],t=im["t"],fx=fx,fy=fy,cx=cx,cy=cy,W=w,H=h)
     return out
 
+def write_ply(path, xyz):
+    """per-object 초기 포인트(COLMAP subset)를 binary PLY로 저장 → prepare_folder가 points3d.ply로."""
+    xyz = np.asarray(xyz, np.float32); n = len(xyz)
+    with open(path, "wb") as f:
+        f.write(b"ply\nformat binary_little_endian 1.0\n")
+        f.write(f"element vertex {n}\n".encode())
+        f.write(b"property float x\nproperty float y\nproperty float z\n")
+        f.write(b"property uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n")
+        dt = np.dtype([("x","<f4"),("y","<f4"),("z","<f4"),("r","u1"),("g","u1"),("b","u1")])
+        a = np.empty(n, dt)
+        if n: a["x"],a["y"],a["z"]=xyz[:,0],xyz[:,1],xyz[:,2]; a["r"]=a["g"]=a["b"]=180
+        f.write(a.tobytes())
+
+
 def load_points3D(d):
     pb=os.path.join(d,"points3D.bin"); pt=os.path.join(d,"points3D.txt"); xyz=[]
     if os.path.isfile(pb):
@@ -210,7 +224,11 @@ def main():
         od=os.path.join(args.out_root,str(gid)); os.makedirs(od,exist_ok=True)
         for stem,msk in m["masks"].items():
             Image.fromarray((msk*255).astype(np.uint8)).save(os.path.join(od,f"{stem}.png"))
-        print(f"  obj{gid}: frames={len(m['masks'])} concept~{m['concepts'].most_common(1)[0][0]}")
+        # per-object 초기 포인트(이 객체의 COLMAP 3D 점) → prepare_folder가 points3d.ply로 변환
+        pts = P3[sorted(m["sig"])] if m["sig"] else np.zeros((0,3))
+        write_ply(os.path.join(od,"points.ply"), pts)
+        print(f"  obj{gid}: frames={len(m['masks'])} init_pts={len(pts)} "
+              f"concept~{m['concepts'].most_common(1)[0][0]}")
     print(f"\n저장: {args.out_root}/<gid>/<stem>.png")
     print("판정: native 추적이라 same-object over-fragmentation이 3D-voting 버전보다 줄고, "
           "유효 객체가 GT에 근접하면 video re-labeling 확정.")

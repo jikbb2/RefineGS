@@ -52,7 +52,9 @@ echo "=== [3] per-object 데이터 폴더 + prepare_folder ==="
 # amodal 마스크를 data/<scene>/masks/<gid>/ 에 배치 → prepare_folder가 images/sparse 복사+masks/ 정리
 for D in ${AMODAL}/*/; do
   gid=$(basename "$D"); dst=data/${SCENE}/masks/${gid}
-  mkdir -p "${dst}"; cp ${D}/*.png "${dst}/" 2>/dev/null
+  mkdir -p "${dst}"
+  cp ${D}/*.png "${dst}/" 2>/dev/null
+  cp ${RELABEL}/${gid}/*.ply "${dst}/" 2>/dev/null   # per-object 초기 포인트(→points3d.ply)
 done
 bash bash_dir_utils/prepare_folder.sh ${SCENE}
 
