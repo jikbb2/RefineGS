@@ -115,6 +115,8 @@ def main():
     ap.add_argument("--stride",type=int,default=2)
     ap.add_argument("--min_area",type=float,default=0.003,help="인스턴스 최소 면적(프레임 비율)")
     ap.add_argument("--jac_th",type=float,default=0.2,help="3D signature Jaccard 클러스터 임계")
+    ap.add_argument("--merge_th",type=float,default=0.5,
+                    help="병합 패스: containment(|A∩B|/min) 이 이상이면 같은 객체로 병합(over-fragmentation 해소)")
     ap.add_argument("--min_track",type=int,default=3,help="유효 객체로 인정할 최소 관측 뷰")
     ap.add_argument("--out_root",required=True)
     args=ap.parse_args(); os.makedirs(args.out_root,exist_ok=True)
@@ -167,9 +169,28 @@ def main():
         else:
             clusters.append(dict(sig=set(obs[i][3]),members=[i],views={obs[i][0]},
                                  concepts=Counter([obs[i][1]])))
+    # ── 병합 패스: over-fragmentation 해소 (containment 기반, concept 무관) ──
+    def cont(a, b):
+        if not a or not b: return 0.0
+        return len(a & b) / min(len(a), len(b))
+    n_before = len(clusters)
+    changed = True
+    while changed:
+        changed = False
+        for i in range(len(clusters)):
+            for j in range(i + 1, len(clusters)):
+                if cont(clusters[i]["sig"], clusters[j]["sig"]) > args.merge_th:
+                    clusters[i]["sig"] |= clusters[j]["sig"]
+                    clusters[i]["members"] += clusters[j]["members"]
+                    clusters[i]["views"] |= clusters[j]["views"]
+                    clusters[i]["concepts"] += clusters[j]["concepts"]
+                    del clusters[j]; changed = True; break
+            if changed: break
+    print(f"병합: {n_before} → {len(clusters)} 클러스터 (containment>{args.merge_th})")
+
     objs=[c for c in clusters if len(c["views"])>=args.min_track]
     objs.sort(key=lambda c:-len(c["views"]))
-    print(f"클러스터 {len(clusters)} → 유효 객체(views>={args.min_track}) {len(objs)}")
+    print(f"유효 객체(views>={args.min_track}) {len(objs)}")
 
     # 출력: 객체별 per-view 마스크 (그 프레임에 그 객체의 인스턴스가 있으면 저장)
     for gid,c in enumerate(objs):
