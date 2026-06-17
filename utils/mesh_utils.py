@@ -164,8 +164,8 @@ class GaussianExtractor(object):
             depth = self.depthmaps[i]
             
             # if we have mask provided, use it
-            if mask_backgrond and (self.viewpoint_stack[i].gt_alpha_mask is not None):
-                depth[(self.viewpoint_stack[i].gt_alpha_mask < 0.5)] = 0
+            if mask_backgrond and (self.viewpoint_stack[i].alpha_mask is not None):
+                depth[(self.viewpoint_stack[i].alpha_mask < 0.5)] = 0
 
             # make open3d rgbd
             rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
