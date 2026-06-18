@@ -26,6 +26,7 @@ VOCAB=${VOCAB:-/home/elicer/sam3/vocab.json}
 BPE=${BPE:-/home/elicer/sam3/sam3/assets/bpe_simple_vocab_16e6.txt.gz}
 GT_MESH=${GT_MESH:-/home/elicer/room_0/habitat/mesh_semantic.ply}
 STRIDE=${STRIDE:-2}; NPF=${NPF:-10}; DEDUP=${DEDUP:-0.3}
+MAX=${MAX:-0}                          # >0이면 관측 많은 상위 MAX개 객체만 학습
 EXCLUDE=${EXCLUDE:-"door,blind,vent,window,wall,floor,ceiling,light switch,thermostat"}
 ITERS=${ITERS:-7000}; LDIST=${LDIST:-300}; LNORM=${LNORM:-0.05}
 RELABEL=${RELABEL:-$HOME/relabel_${SCENE}}
@@ -65,9 +66,17 @@ if [ "${STAGE}" = "recon" ]; then
   [ "${built}" -gt 0 ] || { echo "[ERROR] 객체 0 — relabel 출력 확인"; exit 1; }
   bash bash_dir_utils/prepare_folder.sh ${SCENE}
 
+  echo "=== [3b] instance 폴더 보정 (images 트림 + scene ply 삭제 → filterPLY 객체 init) ==="
+  python setup_instance_folders.py ${SCENE}
+
   echo "=== [4]+[5] per-object 학습/메시/완성 ==="
   mkdir -p ${OUT}
-  for D in data/${SCENE}/masks/*/; do
+  # 관측(마스크 수) 내림차순 정렬 → MAX개로 제한 (가장 잘 관측된 객체 우선)
+  mapfile -t DIRS < <(for D in data/${SCENE}/masks/*/; do [ -d "${D}masks" ] || continue; \
+    n=$(find "${D}masks" -iname "*.png"|wc -l); echo "${n} ${D}"; done | sort -rn | awk '{print $2}')
+  [ "${MAX}" -gt 0 ] && DIRS=("${DIRS[@]:0:${MAX}}")
+  echo "training ${#DIRS[@]} objects (MAX=${MAX})"
+  for D in "${DIRS[@]}"; do
     gid=$(basename "$D"); [ -d "${D}masks" ] || continue
     NM=$(find "${D}masks" -iname "*.png" | wc -l); [ "${NM}" -ge 2 ] || continue
     IT=${ITERS}; [ "${NM}" -lt 20 ] && IT=$((ITERS+3000))      # ❻ adaptive
