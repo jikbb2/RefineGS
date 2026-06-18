@@ -36,11 +36,25 @@ def main():
             shutil.rmtree(imgdir)
         os.makedirs(imgdir)
         copied = 0
+        # 이미지 소스 디렉토리(=nice-slam results, depth도 여기 있음)
+        imgsrc_dir = os.path.dirname(next(iter(srcmap.values()))) if srcmap else None
         for st in stems:
             sf = srcmap.get(st)
             if sf and os.path.exists(sf):
                 shutil.copy(sf, os.path.join(imgdir, st + ".jpg"))
                 copied += 1
+
+        # (1b) GT depth 복사 (depth supervision): results/depthXXXXXX.png -> depths/<frame-stem>.png
+        depthdir = os.path.join(gd, "depths")
+        shutil.rmtree(depthdir, ignore_errors=True); os.makedirs(depthdir)
+        dcopied = 0
+        if imgsrc_dir:
+            for st in stems:
+                # nice-slam 명명: frameXXXXXX.jpg <-> depthXXXXXX.png
+                dsrc = os.path.join(imgsrc_dir, st.replace("frame", "depth") + ".png")
+                if os.path.exists(dsrc):
+                    shutil.copy(os.path.realpath(dsrc), os.path.join(depthdir, st + ".png"))
+                    dcopied += 1
 
         # (2) scene points3D.ply 삭제 → filterPLY가 객체 init 생성
         ply = os.path.join(gd, "sparse", "0", "points3D.ply")
@@ -52,7 +66,7 @@ def main():
             os.remove(old_obj)
 
         gid = os.path.basename(gd.rstrip("/"))
-        print(f"  obj {gid:>3}: masks={len(stems)} images_copied={copied}")
+        print(f"  obj {gid:>3}: masks={len(stems)} images={copied} depths={dcopied}")
         n_obj += 1
     print(f"setup done: {n_obj} objects ({scene})")
 
