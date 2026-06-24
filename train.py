@@ -41,6 +41,29 @@ except Exception:
 # [제거] SparseGaussianAdam (diff_gaussian_rasterization) — 2DGS 는 plain Adam
 
 
+
+# === [RefineGS depth supervision] ====================================
+_DEPTH_CACHE = {}
+def _load_gt_depth(cam, source_path, scale=6553.5):
+    """GT metric depth(meters) + (객체∩유효) 마스크. 캐시."""
+    import os, cv2, numpy as np, torch
+    key = getattr(cam, "image_name", None)
+    if key in _DEPTH_CACHE:
+        return _DEPTH_CACHE[key]
+    stem = os.path.splitext(key)[0] if key else None
+    p = os.path.join(source_path, "depths", stem + ".png") if stem else None
+    if not p or not os.path.exists(p):
+        _DEPTH_CACHE[key] = (None, None); return None, None
+    d = cv2.imread(p, cv2.IMREAD_UNCHANGED).astype(np.float32) / scale  # meters
+    d = cv2.resize(d, (cam.image_width, cam.image_height), interpolation=cv2.INTER_NEAREST)
+    gd = torch.from_numpy(d[None]).float().cuda()
+    am = getattr(cam, "alpha_mask", None)
+    am = am if am is not None else torch.ones_like(gd)
+    valid = ((gd > 1e-3) & (am > 0.5)).float()
+    _DEPTH_CACHE[key] = (gd, valid)
+    return gd, valid
+# =====================================================================
+
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
 
     first_iter = 0
@@ -74,21 +97,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     for iteration in range(first_iter, opt.iterations + 1):
         # ---- network gui (선택) ----
-        if network_gui.conn is None:
-            network_gui.try_connect()
-        while network_gui.conn is not None:
-            try:
-                net_image_bytes = None
-                custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifer = network_gui.receive()
-                if custom_cam is not None:
-                    # [변경] render 시그니처에서 use_trained_exp/separate_sh 제거
-                    net_image = render(custom_cam, gaussians, pipe, background, scaling_modifier=scaling_modifer)["render"]
-                    net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
-                network_gui.send(net_image_bytes, dataset.source_path)
-                if do_training and ((iteration < int(opt.iterations)) or not keep_alive):
-                    break
-            except Exception:
-                network_gui.conn = None
+        # network gui 비활성화 (headless + 2DGS network_gui 시그니처 상이 → 뷰어 미사용)
 
         iter_start.record()
         gaussians.update_learning_rate(iteration)
@@ -134,8 +143,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value) + Ll1_mask * 0.25
 
         # ---- [2DGS] regularization: depth distortion + normal consistency ----
-        lambda_normal = opt.lambda_normal if iteration > 7000 else 0.0
-        lambda_dist = opt.lambda_dist if iteration > 3000 else 0.0
+#         lambda_normal = opt.lambda_normal if iteration > 7000 else 0.0
+#         lambda_dist = opt.lambda_dist if iteration > 3000 else 0.0
+        lambda_normal = opt.lambda_normal if iteration > 1500 else 0.0
+        lambda_dist   = opt.lambda_dist   if iteration > 500  else 0.0
 
         rend_dist = render_pkg["rend_dist"]
         rend_normal = render_pkg["rend_normal"]
@@ -148,6 +159,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         #   normal_loss = lambda_normal * (normal_error * m).mean(); dist_loss = lambda_dist * (rend_dist * m).mean()
 
         total_loss = loss + dist_loss + normal_loss
+        # [RefineGS depth supervision] GT metric depth L1 (마스크 내부)
+        _ld = 0.5 if iteration > 500 else 0.0
+        if _ld > 0 and ('depth' in render_pkg):
+            _gd, _vm = _load_gt_depth(viewpoint_cam, dataset.source_path)
+            if _gd is not None and _vm.sum() > 0:
+                _rd = render_pkg['depth']
+                if _rd.dim() == 2: _rd = _rd[None]
+                _dl = (torch.abs(_rd - _gd) * _vm).sum() / _vm.sum().clamp_min(1.0)
+                total_loss = total_loss + _ld * _dl
         total_loss.backward()
 
         iter_end.record()
@@ -312,8 +332,6 @@ if __name__ == "__main__":
     print("Optimizing " + args.model_path)
     safe_state(args.quiet)
 
-    if not args.disable_viewer:
-        network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
 
     training(lp.extract(args), op.extract(args), pp.extract(args),

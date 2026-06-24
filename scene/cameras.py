@@ -71,6 +71,7 @@ class Camera(nn.Module):
             
 
         self.original_image = gt_image.clamp(0.0, 1.0).to(self.data_device)
+        self.original_image = self.original_image * self.alpha_mask  # [RefineGS] 배경 0
         
         #MASK
         resized_mask_rgb = PILtoTorch(image_mask, resolution)

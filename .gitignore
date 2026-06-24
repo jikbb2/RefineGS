@@ -1,14 +1,48 @@
+# ---- data & large artifacts (do NOT track) ----
 *.pyc
 .vscode
-output
-build
-data
+data/
+output/
 *.ply
+*.pth
+*.ckpt
+*.npz
+*.npy
+*.csv
+*.pt
+submodules/
+**/tmp
+build/
+*.png
+
+# relabel / amodal scratch outputs (if produced inside repo)
+relabel_*/
+amodal_*/
+
+# ---- python ----
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+.ipynb_checkpoints/
 **/PKG-INFO
 # submodules
-**__pycache__**
-*.png
-*.out
-eval
-*.npz
-**/tmp
+
+# ---- QA / generated docs (sources are tracked, renders are not) ----
+qa/
+*.pdf
+slide-*.jpg
+# NOTE: refinegs_deck.js is the source; the generated .pptx is ignored.
+#       Remove the next line if you want to commit the deck itself.
+*.pptx
+
+# ---- logs / OS ----
+*.log
+.DS_Store
+Thumbs.db
+
+# ---- external deps live OUTSIDE this repo; never vendor them here ----
+sam3/
+Amodal3R/
