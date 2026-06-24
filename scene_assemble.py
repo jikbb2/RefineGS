@@ -29,12 +29,13 @@ def latest_iter_ply(gid_dir):
     return max(cands, key=lambda p: int(re.search(r"iteration_(\d+)", p).group(1)))
 
 
-def best_mesh(gid_dir):
+def best_mesh(gid_dir, mesh_name=None):
     its = glob.glob(os.path.join(gid_dir, "train", "ours_*"))
     if not its:
         return None
     it = max(its, key=lambda p: int(re.search(r"ours_(\d+)", p).group(1)))
-    for name in ("fuse_completed.ply", "fuse_post.ply"):
+    names = ([mesh_name + ".ply"] if mesh_name else []) + ["fuse_completed.ply", "fuse_post.ply"]
+    for name in names:
         f = os.path.join(it, name)
         if os.path.exists(f):
             return f
@@ -60,11 +61,11 @@ def assemble_gaussians(gid_dirs, out):
     print(f"  [gaussians] {len(keep)} objects, {len(merged)} splats → {out}")
 
 
-def assemble_mesh(gid_dirs, out):
+def assemble_mesh(gid_dirs, out, mesh_name=None):
     import trimesh
     ms = []
     for d in gid_dirs:
-        f = best_mesh(d)
+        f = best_mesh(d, mesh_name)
         if not f:
             continue
         m = trimesh.load(f, process=False)
@@ -84,6 +85,8 @@ def main():
     ap.add_argument("--root", required=True, help="refinegs_full (per-object 출력 루트)")
     ap.add_argument("--out_gauss", default=None)
     ap.add_argument("--out_mesh", default=None)
+    ap.add_argument("--mesh_name", default=None,
+                    help="per-object mesh 파일명(확장자 제외), 예: fuse_genclean (없으면 completed/post)")
     args = ap.parse_args()
     gid_dirs = sorted([d for d in glob.glob(os.path.join(args.root, "*")) if os.path.isdir(d)])
     print(f"object dirs: {len(gid_dirs)}")
@@ -92,7 +95,7 @@ def main():
         print("== assemble gaussians =="); assemble_gaussians(gid_dirs, args.out_gauss)
     if args.out_mesh:
         os.makedirs(os.path.dirname(args.out_mesh) or ".", exist_ok=True)
-        print("== assemble mesh =="); assemble_mesh(gid_dirs, args.out_mesh)
+        print("== assemble mesh =="); assemble_mesh(gid_dirs, args.out_mesh, args.mesh_name)
     if not (args.out_gauss or args.out_mesh):
         print("--out_gauss / --out_mesh 중 하나 이상 지정")
     print("\nGaussian scene은 SuperSplat에서, mesh scene은 MeshLab/미리보기에서 확인.")
