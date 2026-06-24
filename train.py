@@ -41,6 +41,29 @@ except Exception:
 # [제거] SparseGaussianAdam (diff_gaussian_rasterization) — 2DGS 는 plain Adam
 
 
+
+# === [RefineGS depth supervision] ====================================
+_DEPTH_CACHE = {}
+def _load_gt_depth(cam, source_path, scale=6553.5):
+    """GT metric depth(meters) + (객체∩유효) 마스크. 캐시."""
+    import os, cv2, numpy as np, torch
+    key = getattr(cam, "image_name", None)
+    if key in _DEPTH_CACHE:
+        return _DEPTH_CACHE[key]
+    stem = os.path.splitext(key)[0] if key else None
+    p = os.path.join(source_path, "depths", stem + ".png") if stem else None
+    if not p or not os.path.exists(p):
+        _DEPTH_CACHE[key] = (None, None); return None, None
+    d = cv2.imread(p, cv2.IMREAD_UNCHANGED).astype(np.float32) / scale  # meters
+    d = cv2.resize(d, (cam.image_width, cam.image_height), interpolation=cv2.INTER_NEAREST)
+    gd = torch.from_numpy(d[None]).float().cuda()
+    am = getattr(cam, "alpha_mask", None)
+    am = am if am is not None else torch.ones_like(gd)
+    valid = ((gd > 1e-3) & (am > 0.5)).float()
+    _DEPTH_CACHE[key] = (gd, valid)
+    return gd, valid
+# =====================================================================
+
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
 
     first_iter = 0
@@ -136,6 +159,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         #   normal_loss = lambda_normal * (normal_error * m).mean(); dist_loss = lambda_dist * (rend_dist * m).mean()
 
         total_loss = loss + dist_loss + normal_loss
+        # [RefineGS depth supervision] GT metric depth L1 (마스크 내부)
+        _ld = 0.5 if iteration > 500 else 0.0
+        if _ld > 0 and ('depth' in render_pkg):
+            _gd, _vm = _load_gt_depth(viewpoint_cam, dataset.source_path)
+            if _gd is not None and _vm.sum() > 0:
+                _rd = render_pkg['depth']
+                if _rd.dim() == 2: _rd = _rd[None]
+                _dl = (torch.abs(_rd - _gd) * _vm).sum() / _vm.sum().clamp_min(1.0)
+                total_loss = total_loss + _ld * _dl
         total_loss.backward()
 
         iter_end.record()
