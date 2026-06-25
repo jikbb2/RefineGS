@@ -131,6 +131,8 @@ def main():
     ap.add_argument("--prompt_frame",type=int,default=0,help="concept를 프롬프트할 단일 프레임 인덱스")
     ap.add_argument("--min_area",type=float,default=0.003,help="프레임 마스크 최소 면적(노이즈 제거)")
     ap.add_argument("--min_track",type=int,default=3,help="유효 객체 최소 관측 프레임 수")
+    ap.add_argument("--sig_frac",type=float,default=0.3,
+                    help="3D 점을 객체로 인정할 최소 프레임 비율(ray 상 배경 점 제거, multi-view consistency)")
     ap.add_argument("--reid_th",type=float,default=0.3,
                     help="시간 배타적 track의 re-id 병합 3D Jaccard 임계")
     ap.add_argument("--iou_th",type=float,default=0.5,
@@ -200,10 +202,14 @@ def main():
             kept=0
             for oid,d in byid.items():
                 if len(d["masks"])<args.min_track: continue
-                sig=set()
+                # multi-view consistency: 마스크 안에 *여러 프레임 일관되게* 든 점만 (ray 상 배경 제거)
+                cnt=np.zeros(len(P3),dtype=np.int32)
                 for stem,m in d["masks"].items():
                     if stem not in proj: continue
-                    gi,ui,vi=proj[stem]; inm=m[vi[gi],ui[gi]]; sig|=set(gi[inm].tolist())
+                    gi,ui,vi=proj[stem]; inm=m[vi[gi],ui[gi]]
+                    np.add.at(cnt,gi[inm],1)
+                nf=max(len(d["masks"]),1); thr=max(2,int(args.sig_frac*nf))
+                sig=set(np.where(cnt>=thr)[0].tolist())
                 tracks.append(dict(concept=c,masks=d["masks"],frames=set(d["masks"].keys()),
                                    sig=sig,score=d["score"]))
                 kept+=1
