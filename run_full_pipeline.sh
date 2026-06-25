@@ -42,7 +42,7 @@ if [ "${STAGE}" = "relabel" ]; then
     --frames ${FRAMES} --img_ext ${IMG_EXT} --colmap_dir ${SCENE_COLMAP} \
     --vocab_json ${VOCAB} --bpe ${BPE} --stride ${STRIDE} \
     --prompt_frame ${PROMPT_FRAME:-0} --min_area 0.003 --min_track 3 \
-    --reid_th ${REID:-0.3} --cross_th ${CROSS:-0.3} \
+    --reid_th ${REID:-0.3} --iou_th ${IOU:-0.5} --cand_th ${CAND:-0.1} \
     --exclude_concepts "${EXCLUDE}" --out_root ${RELABEL}
   N=$(ls -d ${RELABEL}/*/ 2>/dev/null | wc -l)
   echo "=== relabel DONE: ${N} objects → ${RELABEL}.  다음: conda activate split_and_splat && bash $0 recon ==="

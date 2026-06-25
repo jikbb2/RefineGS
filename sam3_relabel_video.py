@@ -132,9 +132,11 @@ def main():
     ap.add_argument("--min_area",type=float,default=0.003,help="프레임 마스크 최소 면적(노이즈 제거)")
     ap.add_argument("--min_track",type=int,default=3,help="유효 객체 최소 관측 프레임 수")
     ap.add_argument("--reid_th",type=float,default=0.3,
-                    help="같은 concept: 시간 배타적 track의 re-id 병합 3D Jaccard 임계")
-    ap.add_argument("--cross_th",type=float,default=0.3,
-                    help="다른 concept: synonym 병합 3D Jaccard 임계")
+                    help="시간 배타적 track의 re-id 병합 3D Jaccard 임계")
+    ap.add_argument("--iou_th",type=float,default=0.5,
+                    help="공존 프레임 2D 마스크 IoU 임계(이상=같은 객체 synonym/중복 → 병합)")
+    ap.add_argument("--cand_th",type=float,default=0.1,
+                    help="3D Jaccard 후보 하한(이하면 병합 후보 아님 — 마스크 IoU 계산 절약)")
     ap.add_argument("--exclude_concepts",default="")
     ap.add_argument("--out_root",required=True)
     args=ap.parse_args(); os.makedirs(args.out_root,exist_ok=True)
@@ -218,22 +220,33 @@ def main():
         return x
     def union(x,y): parent[find(x)]=find(y)
 
-    n_reid=n_cross=0
+    def mask_iou_shared(A,B,maxf=8):
+        sh=sorted(A["frames"] & B["frames"])
+        if not sh: return 0.0
+        if len(sh)>maxf: sh=[sh[k] for k in np.linspace(0,len(sh)-1,maxf).astype(int)]
+        v=[]
+        for s in sh:
+            a=A["masks"][s]; b=B["masks"][s]
+            inter=int(np.logical_and(a,b).sum()); uni=int(np.logical_or(a,b).sum())
+            v.append(inter/uni if uni else 0.0)
+        return float(np.mean(v))
+
+    n_syn=n_reid=0
     for i in range(len(tracks)):
         for j in range(i+1,len(tracks)):
             A,B=tracks[i],tracks[j]
             j3=jac(A["sig"],B["sig"])
-            if A["concept"]==B["concept"]:
-                cooccur=bool(A["frames"] & B["frames"])
-                if (not cooccur) and j3>args.reid_th:      # 시간 배타 + 같은 위치 = re-id
+            if j3<args.cand_th: continue                    # 3D 거의 안 겹침 → 후보 아님
+            if A["frames"] & B["frames"]:                   # 공존: 마스크 IoU로 synonym vs 접촉 구분
+                if mask_iou_shared(A,B)>args.iou_th:        # 마스크 거의 동일 = 같은 객체
+                    union(i,j); n_syn+=1
+                # 낮으면 distinct(쿠션↔소파 같은 접촉/인접 — 보호)
+            else:                                           # 시간 배타: 같은 위치=같은 객체(re-id)
+                if j3>args.reid_th:
                     union(i,j); n_reid+=1
-                # cooccur → DISTINCT (병합 금지, 하드 제약)
-            else:
-                if j3>args.cross_th:                        # 다른 concept synonym
-                    union(i,j); n_cross+=1
     groups=defaultdict(list)
     for i in range(len(tracks)): groups[find(i)].append(i)
-    print(f"unification: re-id 병합={n_reid}, cross-concept 병합={n_cross} → 그룹 {len(groups)}")
+    print(f"unification: synonym/dup 병합={n_syn}, re-id 병합={n_reid} → 그룹 {len(groups)}")
 
     # ── 그룹 → 객체 (masks OR, sig union, concept 다수결) ──
     excl={c.strip() for c in args.exclude_concepts.split(",") if c.strip()}
