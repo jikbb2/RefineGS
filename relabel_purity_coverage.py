@@ -124,14 +124,28 @@ def main():
     dirs = sorted(glob.glob(os.path.join(args.relabel_root, "*/")),
                   key=lambda p: int(os.path.basename(p.rstrip("/")))
                   if os.path.basename(p.rstrip("/")).isdigit() else 1e9)
+    n_ply = n_nonempty = 0
     inst = []
     for d in dirs:
         gid = os.path.basename(d.rstrip("/"))
-        P = read_ply_xyz(os.path.join(d, "points3d.ply"))
-        if len(P): inst.append((gid, P))
+        pp = os.path.join(d, "points3d.ply")
+        if os.path.isfile(pp): n_ply += 1
+        P = read_ply_xyz(pp)
+        if len(P):
+            n_nonempty += 1
+            inst.append((gid, P))
+    print(f"relabel_root={args.relabel_root}: dirs={len(dirs)}  "
+          f"points3d.ply 존재={n_ply}  비어있지않음={n_nonempty}")
+    if not inst:
+        print("\n★ 인스턴스 0개 — 진단:")
+        print(f"  - dirs {len(dirs)}개 (0이면 --relabel_root 경로 오류)")
+        print(f"  - points3d.ply 존재 {n_ply}개 (0이면 relabel 출력이 다른 폴더에 있음)")
+        print(f"  - 비어있지않은 ply {n_nonempty}개 (0이면 sig 비어 점 0개 → "
+              "relabel 의 depth probe 가 ★없음★ 이었을 가능성 큼: --depth_dir/이름 확인)")
+        return
 
-    # (옵션) 전체 점 글로벌 ICP — 잔차 점검
-    allP = np.vstack([P for _, P in inst]) if inst else np.zeros((0, 3))
+    # 전체 점 → GT nearest (정렬 잔차) + 옵션 글로벌 ICP
+    allP = np.vstack([P for _, P in inst])
     d0, _ = gtree.query(allP, k=1)
     print(f"relabel→GT nearest: median {np.median(d0)*1000:.1f}mm  "
           f"mean {np.mean(d0)*1000:.1f}mm  (50mm 이하면 정렬 OK)")
