@@ -19,6 +19,7 @@ import os, argparse
 import numpy as np, torch
 from PIL import Image
 from argparse import Namespace
+from plyfile import PlyData, PlyElement
 
 from scene import GaussianModel
 from gaussian_renderer import render
@@ -58,15 +59,28 @@ def main():
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
 
-    g = GaussianModel(a.sh_degree); g.load_ply(a.gaussians); g.active_sh_degree = g.max_sh_degree
+    # floater 제거: percentile bbox 로 crop 후 임시 ply 로드 (bbox·렌더 둘 다 깨끗하게)
+    raw = PlyData.read(a.gaussians)["vertex"]
+    XYZ = np.column_stack([raw["x"], raw["y"], raw["z"]]).astype(np.float64)
+    med = np.median(XYZ, 0)
+    lo, hi = np.percentile(XYZ, 1, 0), np.percentile(XYZ, 99, 0)
+    c0 = (lo + hi) / 2; half = (hi - lo) / 2 * 1.3
+    lo, hi = c0 - half, c0 + half
+    keep = np.all((XYZ >= lo) & (XYZ <= hi), axis=1)
+    print(f"crop: {int(keep.sum())}/{len(XYZ)} gaussians (floater 제거)")
+    tmp = "/tmp/_orbit_src.ply"
+    PlyData([PlyElement.describe(raw.data[keep], "vertex")], text=False).write(tmp)
+
+    g = GaussianModel(a.sh_degree); g.load_ply(tmp); g.active_sh_degree = g.max_sh_degree
     xyz = g.get_xyz.detach().cpu().numpy()
     center = xyz.mean(0)
-    size = float(np.linalg.norm(xyz.max(0) - xyz.min(0)))     # bbox 대각
+    size = float(np.linalg.norm(xyz.max(0) - xyz.min(0)))     # bbox 대각(crop 후)
     radius = a.radius_mult * size / 2.0
     up = np.array(a.up, dtype=np.float64)
     print(f"center={center.round(3)} size(diag)={size:.3f} radius={radius:.3f} up={up}")
 
-    pipe = Namespace(compute_cov3D_python=False, convert_SHs_python=False, debug=False)
+    pipe = Namespace(compute_cov3D_python=False, convert_SHs_python=False, debug=False,
+                     depth_ratio=1.0)
     bg = torch.zeros(3, device="cuda")
     fov = np.deg2rad(a.fov)
 
