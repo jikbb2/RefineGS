@@ -122,6 +122,7 @@ if __name__ == "__main__":
         hi = np.percentile(q[seen], 95) + 1e-6
         qn[seen] = np.clip(q[seen] / hi, 0, 1)
     np.save(os.path.join(args.out_dir, "quality.npy"), qn)
+    np.save(os.path.join(args.out_dir, "seen.npy"), seen.astype(np.float32))  # 1=학습뷰에서 관측됨
     # QA ply
     from plyfile import PlyData, PlyElement
     dt = np.dtype([("x", "f4"), ("y", "f4"), ("z", "f4"), ("red", "u1"), ("green", "u1"), ("blue", "u1")])
