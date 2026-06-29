@@ -77,6 +77,30 @@ def freespace_filter(cams, center, radius, occluder_path, slack=1.5):
     return kept, np.array(mask)
 
 
+def obs_cone_filter(cams, train_cams, center, cone_deg):
+    """관측 hemisphere 제약: novel 카메라의 (center→cam) 방향이 학습카메라 방향들과
+    cone_deg 이내일 때만 유효. flush 벽 뒤처럼 '관측된 적 없는 방향' pose 를 제거.
+    (벽 뒤는 어떤 학습카메라도 간 적 없음 → reject.)"""
+    ctr = np.asarray(center, np.float64)
+    tdir = []
+    for c in train_cams:
+        p = c.camera_center.detach().cpu().numpy().astype(np.float64)
+        d = p - ctr; n = np.linalg.norm(d)
+        if n > 1e-6:
+            tdir.append(d / n)
+    tdir = np.stack(tdir)                       # (T,3)
+    cos_thr = np.cos(np.deg2rad(cone_deg))
+    kept = []
+    for c in cams:
+        p = c.camera_center.detach().cpu().numpy().astype(np.float64)
+        d = p - ctr; n = np.linalg.norm(d)
+        if n < 1e-6:
+            continue
+        if float((tdir @ (d / n)).max()) >= cos_thr:   # 가장 가까운 관측방향과의 각
+            kept.append(c)
+    return kept
+
+
 def set_label_color(gaussians, label):
     fdc, frest = gaussians._features_dc, gaussians._features_rest
     saved = (fdc.detach().clone(), frest.detach().clone(), int(gaussians.active_sh_degree))
@@ -160,6 +184,12 @@ if __name__ == "__main__":
     parser.add_argument("--thr", default=0.5, type=float)
     parser.add_argument("--dilate", default=0, type=int)
     parser.add_argument("--out_dir", required=True)
+    parser.add_argument("--see3d_out", default="",
+                        help="지정 시 valid novel pose마다 See3D 입력 저장: "
+                             "warp_<i>.jpg(RGB context) + mask_<i>.png(255=known/0=hole). "
+                             "render_scene_warps.py 대체. 이게 See3D inference 입력 디렉토리.")
+    parser.add_argument("--min_hole_frac", default=0.003, type=float,
+                        help="see3d_out: hole px 비율이 이보다 작은 pose는 저장 skip(쓸모없는 뷰 제거)")
     parser.add_argument("--quiet", action="store_true")
     # --- orbit 시점 제어 ---
     parser.add_argument("--elev_min", default=0.0, type=float, help="orbit 고도 시작(도). 음수=아래에서 위로(테이블 아랫면)")
@@ -172,6 +202,9 @@ if __name__ == "__main__":
     parser.add_argument("--occluder_mesh", default="",
                         help="free-space 필터용 base mesh(벽 포함, 예 .../fuse_cropped.ply). "
                              "지정 시 카메라→객체 사이를 벽이 막는 pose reject → prior-bound 뒷면 제거")
+    parser.add_argument("--obs_cone_deg", default=0.0, type=float,
+                        help=">0 이면 관측 hemisphere 제약: (center→cam) 방향이 학습카메라 방향과 "
+                             "이 각도(도) 이내인 pose 만 유효. flush 벽 뒤 pose 제거(예: 50)")
     args = get_combined_args(parser)
     safe_state(args.quiet)
 
@@ -205,22 +238,34 @@ if __name__ == "__main__":
                           azim_min=args.azim_min, azim_max=args.azim_max,
                           up_axis=args.up_axis)
 
-    # free-space 필터: 벽이 카메라→객체를 막는 pose reject (prior-bound 뒷면 제거)
+    # free-space 필터: 벽이 카메라→객체를 막는 pose reject (큰 occluder/타객체)
     if args.occluder_mesh.strip() and center is not None:
         before = len(cams)
         cams, _ = freespace_filter(cams, center, obj_radius, args.occluder_mesh)
-        print(f"free-space 필터: {len(cams)}/{before} pose 유효(벽 안 막힘). "
-              f"reject 된 pose = prior-bound(예: 벽-인접 뒷면) 카메라.")
+        print(f"free-space 필터: {len(cams)}/{before} pose 유효(벽 안 막힘).")
         if len(cams) == 0:
             raise SystemExit("유효 pose 0 — radius_scale 키우거나 elev 범위/occluder mesh 확인.")
+
+    # 관측 hemisphere 필터: flush 벽 뒤처럼 관측된 적 없는 방향 pose reject
+    if args.obs_cone_deg > 0 and center is not None:
+        before = len(cams)
+        cams = obs_cone_filter(cams, scene.getTrainCameras(), center, args.obs_cone_deg)
+        print(f"obs-cone 필터(±{args.obs_cone_deg}°): {len(cams)}/{before} pose 유효(관측방향 근처). "
+              f"reject = 관측된 적 없는 방향(예: 벽-인접 뒷면).")
+        if len(cams) == 0:
+            raise SystemExit("유효 pose 0 — obs_cone_deg 키우거나 객체가 prior-bound 인지 확인.")
 
     if args.max_views > 0 and len(cams) > args.max_views:
         idx = np.linspace(0, len(cams) - 1, args.max_views).astype(int)
         cams = [cams[i] for i in idx]
 
     os.makedirs(args.out_dir, exist_ok=True)
+    see3d_dir = args.see3d_out.strip()
+    if see3d_dir:
+        os.makedirs(see3d_dir, exist_ok=True)
     print(f"path={args.path} novel views={len(cams)}  per-Gaussian hole frac={label.mean().item():.3f}")
     fracs = []
+    n_saved = 0
     for i, cam in enumerate(cams):
         stem = getattr(cam, "image_name", f"nv{i:04d}"); stem = os.path.splitext(stem)[0]
         with torch.no_grad():
@@ -235,9 +280,18 @@ if __name__ == "__main__":
         fracs.append(float(hole.mean()))
 
         torchvision.utils.save_image(lab.unsqueeze(0), os.path.join(args.out_dir, f"{stem}_label.png"))
-        ov = rgb.clone(); hm = torch.from_numpy(hole.astype(np.float32)).cuda()
+        hm = torch.from_numpy(hole.astype(np.float32)).cuda()
+        ov = rgb.clone()
         ov[0] = torch.maximum(ov[0], hm); ov[1] = ov[1]*(1-0.5*hm); ov[2] = ov[2]*(1-0.5*hm)
         torchvision.utils.save_image(ov, os.path.join(args.out_dir, f"{stem}_overlay.png"))
+
+        # See3D 입력 저장(흡수된 render_scene_warps 기능): warp=RGB context, mask=255known/0hole
+        if see3d_dir and float(hole.mean()) >= args.min_hole_frac:
+            torchvision.utils.save_image(rgb, os.path.join(see3d_dir, f"warp_{n_saved:04d}.jpg"))
+            known = torch.from_numpy((~hole).astype(np.float32))[None]   # 1=known,0=hole
+            torchvision.utils.save_image(known, os.path.join(see3d_dir, f"mask_{n_saved:04d}.png"))
+            n_saved += 1
+
         if i < 3 or (i+1) % 10 == 0:
             print(f"[{i+1}/{len(cams)}] {stem}: hole px {hole.mean():.4f}")
 
@@ -245,5 +299,7 @@ if __name__ == "__main__":
     print(f"\nreachability 진단: hole px  mean {fracs.mean():.4f}  max {fracs.max():.4f}  "
           f"(>0.5% 뷰 {int((fracs>0.005).sum())}/{len(fracs)})")
     print(f"→ {args.out_dir}")
+    if see3d_dir:
+        print(f"→ See3D 입력 {n_saved}쌍(warp_*.jpg + mask_*.png) 저장: {see3d_dir}")
     print("해석: 어떤 novel pose 의 overlay 에서 *관측 안 됐던 옆/아랫면*에 빨강이 뜨면 = reachable(See3D 타깃). "
           "모든 pose 에서 거의 안 뜨면 = prior-bound(예: 벽-인접 뒷면).")
