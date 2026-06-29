@@ -81,13 +81,15 @@ if __name__ == "__main__":
         if gt.shape != img.shape:
             gt = torch.nn.functional.interpolate(gt[None], img.shape[-2:], mode="bilinear")[0]
         err = (img - gt).abs().mean(0)                                     # (H,W) 0..~1
-        m = None
+        sel = None
         if args.use_mask and getattr(cam, "original_mask", None) is not None:
-            m = cam.original_mask.cuda()
-            m = m[0] if m.dim() == 3 else m
-            vmean = float((err * (m > 0.5)).sum() / (m > 0.5).sum().clamp_min(1))
-        else:
-            vmean = float(err.mean())
+            m = cam.original_mask.cuda(); m = m[0] if m.dim() == 3 else m
+            cand = m > 0.5
+            if int(cand.sum()) > 0:
+                sel = cand
+            elif k == 0:
+                print("[warn] original_mask 가 비어있음(전부 0) → 전체 이미지로 평가(--use_mask 무시)")
+        vmean = float((err * sel).sum() / sel.sum()) if sel is not None else float(err.mean())
         view_means.append(vmean)
 
         # 저장: 히트맵 + 3분할(GT|render|err)
