@@ -41,7 +41,8 @@ if [ "${STAGE}" = "relabel" ]; then
   python ${SR} \
     --frames ${FRAMES} --img_ext ${IMG_EXT} --colmap_dir ${SCENE_COLMAP} \
     --vocab_json ${VOCAB} --bpe ${BPE} --stride ${STRIDE} \
-    --n_prompt_frames ${NPF} --min_area 0.003 --min_track 3 --dedup_th ${DEDUP} \
+    --prompt_frame ${PROMPT_FRAME:-0} --min_area 0.003 --min_track 3 \
+    --reid_th ${REID:-0.3} --iou_th ${IOU:-0.5} --cand_th ${CAND:-0.1} \
     --exclude_concepts "${EXCLUDE}" --out_root ${RELABEL}
   N=$(ls -d ${RELABEL}/*/ 2>/dev/null | wc -l)
   echo "=== relabel DONE: ${N} objects → ${RELABEL}.  다음: conda activate split_and_splat && bash $0 recon ==="
@@ -78,7 +79,7 @@ if [ "${STAGE}" = "recon" ]; then
   echo "training ${#DIRS[@]} objects (MAX=${MAX})"
   for D in "${DIRS[@]}"; do
     gid=$(basename "$D"); [ -d "${D}masks" ] || continue
-    NM=$(find "${D}masks" -iname "*.png" | wc -l); [ "${NM}" -ge 2 ] || continue
+    NM=$(find "${D}masks" -iname "*.png" | wc -l); [ "${NM}" -ge 5 ] || continue
     IT=${ITERS}; [ "${NM}" -lt 20 ] && IT=$((ITERS+3000))      # ❻ adaptive
     MDIR=${OUT}/${gid}
     if [ ! -f "${MDIR}/point_cloud/iteration_${IT}/point_cloud.ply" ]; then
