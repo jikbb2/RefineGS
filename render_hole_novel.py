@@ -184,12 +184,16 @@ if __name__ == "__main__":
     parser.add_argument("--thr", default=0.5, type=float)
     parser.add_argument("--dilate", default=0, type=int)
     parser.add_argument("--out_dir", required=True)
+    parser.add_argument("--soft_out", default="",
+                        help="[권장] soft-weight 파이프라인 출력 디렉토리. valid novel pose마다 "
+                             "view_<i>.jpg(조건용 RGB 렌더) + weight_<i>.png(연속 soft weight, 흰=미관측/refine) "
+                             "저장 + poses.npz(카메라). 이진 hole 안 씀. 생성→soft-weighted 학습 주입 입력.")
     parser.add_argument("--see3d_out", default="",
-                        help="지정 시 valid novel pose마다 See3D 입력 저장: "
-                             "warp_<i>.jpg(RGB context) + mask_<i>.png(255=known/0=hole). "
-                             "render_scene_warps.py 대체. 이게 See3D inference 입력 디렉토리.")
+                        help="[구식] 이진 hole 마스크 출력(warp+mask). soft_out 으로 대체됨.")
+    parser.add_argument("--min_weight", default=0.01, type=float,
+                        help="soft weight 평균이 이보다 작은 pose는 저장 skip(refine 거리 없는 뷰 제거)")
     parser.add_argument("--min_hole_frac", default=0.003, type=float,
-                        help="see3d_out: hole px 비율이 이보다 작은 pose는 저장 skip(쓸모없는 뷰 제거)")
+                        help="see3d_out(구식) 전용 threshold")
     parser.add_argument("--quiet", action="store_true")
     # --- orbit 시점 제어 ---
     parser.add_argument("--elev_min", default=0.0, type=float, help="orbit 고도 시작(도). 음수=아래에서 위로(테이블 아랫면)")
@@ -263,9 +267,13 @@ if __name__ == "__main__":
     see3d_dir = args.see3d_out.strip()
     if see3d_dir:
         os.makedirs(see3d_dir, exist_ok=True)
+    soft_dir = args.soft_out.strip()
+    if soft_dir:
+        os.makedirs(soft_dir, exist_ok=True)
     print(f"path={args.path} novel views={len(cams)}  per-Gaussian hole frac={label.mean().item():.3f}")
     fracs = []
     n_saved = 0
+    pose_records = []   # soft_out poses.npz 용
     for i, cam in enumerate(cams):
         stem = getattr(cam, "image_name", f"nv{i:04d}"); stem = os.path.splitext(stem)[0]
         with torch.no_grad():
@@ -275,31 +283,49 @@ if __name__ == "__main__":
             lab = render(cam, gaussians, pipe, background)["render"][0].clamp(0, 1)
         restore_color(gaussians, saved)
 
-        lab_np = lab.detach().cpu().numpy()
-        hole = dilate_mask(lab_np >= args.thr, args.dilate)
-        fracs.append(float(hole.mean()))
+        lab_np = lab.detach().cpu().numpy()          # 연속 soft weight (0~1)
+        soft = lab.clamp(0, 1)                        # GPU tensor
+        wmean = float(lab_np.mean())
+        fracs.append(wmean)
 
-        torchvision.utils.save_image(lab.unsqueeze(0), os.path.join(args.out_dir, f"{stem}_label.png"))
-        hm = torch.from_numpy(hole.astype(np.float32)).cuda()
+        # QA: soft weight 자체 + 그 weight 강도로 red 오버레이(연속)
+        torchvision.utils.save_image(soft.unsqueeze(0), os.path.join(args.out_dir, f"{stem}_weight.png"))
         ov = rgb.clone()
-        ov[0] = torch.maximum(ov[0], hm); ov[1] = ov[1]*(1-0.5*hm); ov[2] = ov[2]*(1-0.5*hm)
+        ov[0] = torch.maximum(ov[0], soft); ov[1] = ov[1]*(1-0.5*soft); ov[2] = ov[2]*(1-0.5*soft)
         torchvision.utils.save_image(ov, os.path.join(args.out_dir, f"{stem}_overlay.png"))
 
-        # See3D 입력 저장(흡수된 render_scene_warps 기능): warp=RGB context, mask=255known/0hole
-        if see3d_dir and float(hole.mean()) >= args.min_hole_frac:
-            torchvision.utils.save_image(rgb, os.path.join(see3d_dir, f"warp_{n_saved:04d}.jpg"))
-            known = torch.from_numpy((~hole).astype(np.float32))[None]   # 1=known,0=hole
-            torchvision.utils.save_image(known, os.path.join(see3d_dir, f"mask_{n_saved:04d}.png"))
+        # [권장] soft-weight 출력: 조건용 view + 연속 weight + pose 기록
+        if soft_dir and wmean >= args.min_weight:
+            torchvision.utils.save_image(rgb, os.path.join(soft_dir, f"view_{n_saved:04d}.jpg"))
+            torchvision.utils.save_image(soft.unsqueeze(0), os.path.join(soft_dir, f"weight_{n_saved:04d}.png"))
+            pose_records.append(dict(
+                idx=n_saved, stem=stem,
+                world_view_transform=cam.world_view_transform.detach().cpu().numpy(),
+                full_proj_transform=cam.full_proj_transform.detach().cpu().numpy(),
+                FoVx=float(cam.FoVx), FoVy=float(cam.FoVy),
+                width=int(cam.image_width), height=int(cam.image_height)))
             n_saved += 1
 
-        if i < 3 or (i+1) % 10 == 0:
-            print(f"[{i+1}/{len(cams)}] {stem}: hole px {hole.mean():.4f}")
+        # [구식] 이진 See3D 입력(backward-compat)
+        if see3d_dir:
+            hole = dilate_mask(lab_np >= args.thr, args.dilate)
+            if float(hole.mean()) >= args.min_hole_frac:
+                torchvision.utils.save_image(rgb, os.path.join(see3d_dir, f"warp_{n_saved:04d}.jpg"))
+                known = torch.from_numpy((~hole).astype(np.float32))[None]
+                torchvision.utils.save_image(known, os.path.join(see3d_dir, f"mask_{n_saved:04d}.png"))
 
-    fracs = np.array(fracs)
-    print(f"\nreachability 진단: hole px  mean {fracs.mean():.4f}  max {fracs.max():.4f}  "
-          f"(>0.5% 뷰 {int((fracs>0.005).sum())}/{len(fracs)})")
-    print(f"→ {args.out_dir}")
-    if see3d_dir:
-        print(f"→ See3D 입력 {n_saved}쌍(warp_*.jpg + mask_*.png) 저장: {see3d_dir}")
-    print("해석: 어떤 novel pose 의 overlay 에서 *관측 안 됐던 옆/아랫면*에 빨강이 뜨면 = reachable(See3D 타깃). "
-          "모든 pose 에서 거의 안 뜨면 = prior-bound(예: 벽-인접 뒷면).")
+        if i < 3 or (i+1) % 10 == 0:
+            print(f"[{i+1}/{len(cams)}] {stem}: soft weight mean {wmean:.4f}")
+
+    # soft_out poses.npz 저장 (학습 주입이 카메라 복원에 사용)
+    if soft_dir and pose_records:
+        np.savez(os.path.join(soft_dir, "poses.npz"),
+                 records=np.array(pose_records, dtype=object))
+        print(f"→ soft-weight 출력 {n_saved}뷰(view_*.jpg + weight_*.png) + poses.npz: {soft_dir}")
+
+    fracs = np.array(fracs) if fracs else np.array([0.0])
+    print(f"\nreachability 진단: soft weight mean {fracs.mean():.4f}  max {fracs.max():.4f}  "
+          f"(weight>{args.min_weight} 뷰 {int((fracs>args.min_weight).sum())}/{len(fracs)})")
+    print(f"→ QA: {args.out_dir} (*_weight / *_overlay)")
+    print("해석: overlay 빨강 강도 = soft weight(미관측·gen↑). 옆/아랫면에 연속 weight가 실리면 refine 대상. "
+          "weight 거의 0이면 그 방향엔 refine 거리 없음(관측 완전 or 도달불가).")

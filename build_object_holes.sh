@@ -27,7 +27,7 @@ MASKS="$HOME/relabel_$SCENE/$GID"
 COLMAP="data/$SCENE/sparse/0"
 SBDIR="output/$SCENE/scene_b1_obj$GID"
 SB="$SBDIR/point_cloud/iteration_1/point_cloud.ply"
-SEE3D_OUT="$HOME/See3D/dataset/refinegs_obj$GID/warp_images"
+SOFT_OUT="$HOME/See3D/dataset/refinegs_obj$GID/soft_in"
 
 echo "=== gid $GID ==="
 [ -f "$GEN" ] || { echo "[skip] gen 없음: $GEN (register/clean 먼저)"; exit 0; }
@@ -64,14 +64,14 @@ python confidence_map.py --gaussians "$SB" \
 python make_hole_labels.py --gaussians "$SB" --gen_tags "$GEN_TAG" \
   --conf_npy "${TMP}/sb_${GID}_conf.npy" --out "$TMP/hole_$GID.npy" || exit 1
 
-# 5) reachable novel pose 렌더 + See3D 입력
+# 5) reachable novel pose 렌더 + soft-weight 출력(view+weight+poses)
 python render_hole_novel.py -m "$SBDIR" -s "data/$SCENE" \
   --iteration 1 --hole_npy "$TMP/hole_$GID.npy" \
   --path orbit --n_frames 90 --max_views 40 \
-  --elev_min -20 --elev_max 70 --up_axis "${UP_AXIS:-1}" \
-  --occluder_mesh "$BASE_MESH" --obs_cone_deg "${OBS_CONE:-50}" \
-  --thr 0.5 --dilate 3 \
+  --elev_min -20 --elev_max 70 --up_axis "${UP_AXIS:-1}" --radius_scale "${RADIUS_SCALE:-0.7}" \
+  --occluder_mesh "$BASE_MESH" --obs_cone_deg "${OBS_CONE:-85}" \
+  --min_weight "${MIN_WEIGHT:-0.01}" \
   --out_dir "$SBDIR/holes_novel" \
-  --see3d_out "$SEE3D_OUT" || exit 1
+  --soft_out "$SOFT_OUT" || exit 1
 
-echo "=== gid $GID 완료 → See3D 입력: $SEE3D_OUT ==="
+echo "=== gid $GID 완료 → soft-weight 입력: $SOFT_OUT ==="
