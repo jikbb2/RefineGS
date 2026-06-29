@@ -36,13 +36,14 @@ echo "=== gid $GID ==="
 python mesh_to_surfels.py --mesh "$GEN" --out "$TMP/gen_surfels_$GID.ply" \
   --n_samples 200000 --scale_mult 1.0 --opacity 0.99 || exit 1
 
-# 2) 조립 (recon 있으면 base⊕recon⊕gen → gen=2, 없으면 base⊕gen → gen=1)
+# 2) 조립.  NO_RECON=1 이면 base⊕gen (gen 실루엣이 recon에 안 가려져 weight가 실림 — 권장)
+#    기본(NO_RECON=0)은 base⊕recon⊕gen.  ⚠️ recon이 gen을 occlude하면 weight≈0 됨(obj24 사례).
 mkdir -p "$(dirname "$SB")"
-if [ -n "$RECON" ] && [ -f "$RECON" ]; then
+if [ "${NO_RECON:-1}" != "1" ] && [ -n "$RECON" ] && [ -f "$RECON" ]; then
   python assemble_gaussians.py --base "$BASE" --gen "$RECON" "$TMP/gen_surfels_$GID.ply" --tag --out "$SB" || exit 1
   GEN_TAG=2
 else
-  echo "[info] recon 없음(base 흡수 객체) → base⊕gen"
+  echo "[info] base⊕gen (recon 제외: gen 실루엣 노출). recon은 joint 학습 때 실측 앵커로 사용."
   python assemble_gaussians.py --base "$BASE" --gen "$TMP/gen_surfels_$GID.ply" --tag --out "$SB" || exit 1
   GEN_TAG=1
 fi
