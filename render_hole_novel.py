@@ -68,37 +68,49 @@ def restore_color(gaussians, saved):
     gaussians.active_sh_degree = sh
 
 
-def get_novel_cams(scene, mode, n_frames):
+def get_novel_cams(scene, mode, n_frames, center=None, radius_scale=1.0,
+                   elev_min=0.0, elev_max=60.0, azim_min=0.0, azim_max=360.0, up_axis=1):
+    """novel 카메라 목록.
+    generate : 학습카메라 보간(관측 manifold 근처 — 새 각도 못 봄).
+    orbit    : 객체 중심(center)을 바라보는 합성 pose. elev/azim/radius 로 시점 제어.
+               center=객체 중심(보통 hole 점 centroid). up_axis: 월드 up 축(0=x,1=y,2=z).
+    """
     train = scene.getTrainCameras()
     if mode == "generate":
         from utils.render_utils import generate_path
         return list(generate_path(train, n_frames=n_frames))
     elif mode == "orbit":
-        # 실험적: 객체 중심(=장면 중심 근사) orbit. generate 가 부족할 때만.
-        # train 카메라 평균 위치/거리를 반경으로, 고도 0~60° 스파이럴.
         import copy
         from utils.graphics_utils import getWorld2View2, getProjectionMatrix
-        centers = np.stack([c.camera_center.detach().cpu().numpy() for c in train])
-        ctr = centers.mean(0)
-        rad = float(np.linalg.norm(centers - ctr, axis=1).mean())
+        cam_centers = np.stack([c.camera_center.detach().cpu().numpy() for c in train])
+        ctr = np.asarray(center, np.float64) if center is not None else cam_centers.mean(0)
+        # 반경 = 학습카메라들의 객체중심까지 평균 거리 × scale (현실적 관측거리)
+        rad = float(np.linalg.norm(cam_centers - ctr, axis=1).mean()) * radius_scale
+        up = np.zeros(3); up[up_axis] = 1.0
         base = train[0]
+        proj = getProjectionMatrix(base.znear, base.zfar, base.FoVx, base.FoVy).transpose(0, 1).cuda()
         out = []
         for i in range(n_frames):
-            az = 2 * np.pi * i / n_frames
-            el = np.deg2rad(60.0 * i / n_frames)        # 점진적 top-down
-            cam_pos = ctr + rad * np.array([np.cos(az)*np.cos(el),
-                                            np.sin(el),
-                                            np.sin(az)*np.cos(el)])
+            f = i / max(n_frames - 1, 1)
+            az = np.deg2rad(azim_min + (azim_max - azim_min) * f)
+            el = np.deg2rad(elev_min + (elev_max - elev_min) * f)
+            # 객체 중심 기준 카메라 위치 (up_axis 를 고도축으로)
+            horiz = np.cos(el)
+            offs = np.zeros(3)
+            a = [j for j in range(3) if j != up_axis]      # 수평면 두 축
+            offs[a[0]] = horiz * np.cos(az)
+            offs[a[1]] = horiz * np.sin(az)
+            offs[up_axis] = np.sin(el)
+            cam_pos = ctr + rad * offs
+            # look-at: 카메라가 ctr 를 바라보게 (Rc2w 의 열 = 카메라 축의 월드표현)
             fwd = ctr - cam_pos; fwd /= (np.linalg.norm(fwd) + 1e-9)
-            up = np.array([0., 1., 0.])
             right = np.cross(fwd, up); right /= (np.linalg.norm(right) + 1e-9)
-            up2 = np.cross(right, fwd)
-            R = np.stack([right, -up2, fwd], 1)         # cam→world (col)
-            Rw2c = R.T
-            t = -Rw2c @ cam_pos
+            down = np.cross(fwd, right)                      # y_cam = down (이미지 y 아래)
+            Rc2w = np.stack([right, down, fwd], axis=1)      # 열: x_cam,y_cam,z_cam(월드)
+            t = -Rc2w.T @ cam_pos                            # W2C translation
+            # getWorld2View2 는 인자 R 을 전치해 W2C 회전으로 씀 → R=Rc2w 전달
+            w2v = torch.tensor(getWorld2View2(Rc2w, t)).transpose(0, 1).float().cuda()
             cam = copy.copy(base)
-            w2v = torch.tensor(getWorld2View2(Rw2c, t)).transpose(0, 1).float().cuda()
-            proj = getProjectionMatrix(base.znear, base.zfar, base.FoVx, base.FoVy).transpose(0, 1).cuda()
             cam.world_view_transform = w2v
             cam.full_proj_transform = (w2v.unsqueeze(0).bmm(proj.unsqueeze(0))).squeeze(0)
             cam.camera_center = w2v.inverse()[3, :3]
@@ -121,6 +133,14 @@ if __name__ == "__main__":
     parser.add_argument("--dilate", default=0, type=int)
     parser.add_argument("--out_dir", required=True)
     parser.add_argument("--quiet", action="store_true")
+    # --- orbit 시점 제어 ---
+    parser.add_argument("--elev_min", default=0.0, type=float, help="orbit 고도 시작(도). 음수=아래에서 위로(테이블 아랫면)")
+    parser.add_argument("--elev_max", default=60.0, type=float, help="orbit 고도 끝(도). 양수=위에서 내려보기(윗면)")
+    parser.add_argument("--azim_min", default=0.0, type=float)
+    parser.add_argument("--azim_max", default=360.0, type=float)
+    parser.add_argument("--radius_scale", default=1.0, type=float, help="관측거리 배율(작게=가까이)")
+    parser.add_argument("--up_axis", default=1, type=int, help="월드 up 축 0=x/1=y/2=z (고도축)")
+    parser.add_argument("--center", default="", help="orbit 중심 'x,y,z'. 비우면 hole 점 centroid 자동")
     args = get_combined_args(parser)
     safe_state(args.quiet)
 
@@ -135,7 +155,22 @@ if __name__ == "__main__":
         raise SystemExit(f"hole_npy {len(label_np)} != gaussians {n}")
     label = torch.from_numpy(label_np).cuda()
 
-    cams = get_novel_cams(scene, args.path, args.n_frames)
+    # orbit 중심: 수동 지정 없으면 hole(=미관측 gen) 점들의 월드 centroid → 그 영역을 바라봄
+    center = None
+    if args.center.strip():
+        center = [float(x) for x in args.center.split(",")]
+    elif args.path == "orbit":
+        xyz = gaussians.get_xyz.detach().cpu().numpy()
+        hole_pts = xyz[label_np > 0.5]
+        if len(hole_pts) > 0:
+            center = hole_pts.mean(0)
+            print(f"orbit center (hole centroid): {np.round(center,3).tolist()}  ({len(hole_pts)} pts)")
+
+    cams = get_novel_cams(scene, args.path, args.n_frames, center=center,
+                          radius_scale=args.radius_scale,
+                          elev_min=args.elev_min, elev_max=args.elev_max,
+                          azim_min=args.azim_min, azim_max=args.azim_max,
+                          up_axis=args.up_axis)
     if args.max_views > 0 and len(cams) > args.max_views:
         idx = np.linspace(0, len(cams) - 1, args.max_views).astype(int)
         cams = [cams[i] for i in idx]
