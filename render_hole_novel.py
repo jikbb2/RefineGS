@@ -49,6 +49,34 @@ def dilate_mask(m, k):
         return (t[0, 0].numpy() > 0.5)
 
 
+def freespace_filter(cams, center, radius, occluder_path, slack=1.5):
+    """카메라→객체중심 사이를 occluder(벽)가 가로막으면 reject → free-space pose 만 남김.
+    occluder_path: holistic base mesh(벽 포함, 예 fuse_cropped.ply).
+    valid 조건: 첫 hit 가 객체 bounding-sphere 안(t_hit > dist - radius*slack).
+               벽이 앞을 막으면 t_hit 가 작아 reject(=prior-bound 뒷면 카메라 제거)."""
+    import open3d as o3d
+    mesh = o3d.io.read_triangle_mesh(occluder_path)
+    if len(mesh.triangles) == 0:
+        print(f"[warn] occluder mesh 비어있음 {occluder_path} → 필터 skip"); return cams, None
+    rc = o3d.t.geometry.RaycastingScene()
+    rc.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(mesh))
+    ctr = np.asarray(center, np.float32)
+    kept, mask = [], []
+    for c in cams:
+        pos = c.camera_center.detach().cpu().numpy().astype(np.float32)
+        d = ctr - pos; dist = float(np.linalg.norm(d))
+        if dist < 1e-6:
+            mask.append(False); continue
+        dir = d / dist
+        ray = o3d.core.Tensor([[*pos, *dir]], dtype=o3d.core.Dtype.Float32)
+        t_hit = float(rc.cast_rays(ray)["t_hit"].numpy()[0])
+        ok = (not np.isfinite(t_hit)) or (t_hit > dist - radius * slack)
+        mask.append(ok)
+        if ok:
+            kept.append(c)
+    return kept, np.array(mask)
+
+
 def set_label_color(gaussians, label):
     fdc, frest = gaussians._features_dc, gaussians._features_rest
     saved = (fdc.detach().clone(), frest.detach().clone(), int(gaussians.active_sh_degree))
@@ -141,6 +169,9 @@ if __name__ == "__main__":
     parser.add_argument("--radius_scale", default=1.0, type=float, help="관측거리 배율(작게=가까이)")
     parser.add_argument("--up_axis", default=1, type=int, help="월드 up 축 0=x/1=y/2=z (고도축)")
     parser.add_argument("--center", default="", help="orbit 중심 'x,y,z'. 비우면 hole 점 centroid 자동")
+    parser.add_argument("--occluder_mesh", default="",
+                        help="free-space 필터용 base mesh(벽 포함, 예 .../fuse_cropped.ply). "
+                             "지정 시 카메라→객체 사이를 벽이 막는 pose reject → prior-bound 뒷면 제거")
     args = get_combined_args(parser)
     safe_state(args.quiet)
 
@@ -155,22 +186,34 @@ if __name__ == "__main__":
         raise SystemExit(f"hole_npy {len(label_np)} != gaussians {n}")
     label = torch.from_numpy(label_np).cuda()
 
-    # orbit 중심: 수동 지정 없으면 hole(=미관측 gen) 점들의 월드 centroid → 그 영역을 바라봄
-    center = None
+    # orbit 중심/반경: hole(=미관측 gen) 점들의 월드 centroid + bounding 반경
+    center, obj_radius = None, 0.3
+    xyz = gaussians.get_xyz.detach().cpu().numpy()
+    hole_pts = xyz[label_np > 0.5]
     if args.center.strip():
-        center = [float(x) for x in args.center.split(",")]
-    elif args.path == "orbit":
-        xyz = gaussians.get_xyz.detach().cpu().numpy()
-        hole_pts = xyz[label_np > 0.5]
-        if len(hole_pts) > 0:
-            center = hole_pts.mean(0)
-            print(f"orbit center (hole centroid): {np.round(center,3).tolist()}  ({len(hole_pts)} pts)")
+        center = np.array([float(x) for x in args.center.split(",")])
+    elif len(hole_pts) > 0:
+        center = hole_pts.mean(0)
+    if len(hole_pts) > 0 and center is not None:
+        obj_radius = float(np.percentile(np.linalg.norm(hole_pts - center, axis=1), 95))
+        print(f"orbit center: {np.round(center,3).tolist()}  obj_radius(95%): {obj_radius:.3f}  "
+              f"({len(hole_pts)} hole pts)")
 
     cams = get_novel_cams(scene, args.path, args.n_frames, center=center,
                           radius_scale=args.radius_scale,
                           elev_min=args.elev_min, elev_max=args.elev_max,
                           azim_min=args.azim_min, azim_max=args.azim_max,
                           up_axis=args.up_axis)
+
+    # free-space 필터: 벽이 카메라→객체를 막는 pose reject (prior-bound 뒷면 제거)
+    if args.occluder_mesh.strip() and center is not None:
+        before = len(cams)
+        cams, _ = freespace_filter(cams, center, obj_radius, args.occluder_mesh)
+        print(f"free-space 필터: {len(cams)}/{before} pose 유효(벽 안 막힘). "
+              f"reject 된 pose = prior-bound(예: 벽-인접 뒷면) 카메라.")
+        if len(cams) == 0:
+            raise SystemExit("유효 pose 0 — radius_scale 키우거나 elev 범위/occluder mesh 확인.")
+
     if args.max_views > 0 and len(cams) > args.max_views:
         idx = np.linspace(0, len(cams) - 1, args.max_views).astype(int)
         cams = [cams[i] for i in idx]
