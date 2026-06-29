@@ -79,7 +79,7 @@ if [ "${STAGE}" = "recon" ]; then
   echo "training ${#DIRS[@]} objects (MAX=${MAX})"
   for D in "${DIRS[@]}"; do
     gid=$(basename "$D"); [ -d "${D}masks" ] || continue
-    NM=$(find "${D}masks" -iname "*.png" | wc -l); [ "${NM}" -ge 2 ] || continue
+    NM=$(find "${D}masks" -iname "*.png" | wc -l); [ "${NM}" -ge 5 ] || continue
     IT=${ITERS}; [ "${NM}" -lt 20 ] && IT=$((ITERS+3000))      # ❻ adaptive
     MDIR=${OUT}/${gid}
     if [ ! -f "${MDIR}/point_cloud/iteration_${IT}/point_cloud.ply" ]; then

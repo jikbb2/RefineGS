@@ -73,6 +73,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     active_sh_degree = 3 if args.composition else 0
     gaussians = GaussianModel(dataset.sh_degree, active_sh_degree, opt.optimizer_type)
     scene = Scene(dataset, gaussians)
+    if getattr(args, 'init_ply', None):  # [B4a] 조립 ply 로 init 덮어쓰기
+        gaussians.load_ply(args.init_ply)
+        gaussians.active_sh_degree = gaussians.max_sh_degree
+        print('[B4a] init from ' + args.init_ply + ': ' + str(gaussians.get_xyz.shape[0]) + ' gaussians')
     gaussians.training_setup(opt)
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
@@ -325,6 +329,7 @@ if __name__ == "__main__":
     parser.add_argument('--disable_viewer', action='store_true', default=False)
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default=None)
+    parser.add_argument("--init_ply", type=str, default=None)  # [B4a]
 
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
