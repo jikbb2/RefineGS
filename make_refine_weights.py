@@ -40,7 +40,9 @@ def main():
     ap.add_argument("--gaussians", required=True)
     ap.add_argument("--quality", required=True)
     ap.add_argument("--seen", required=True)
-    ap.add_argument("--gen_tags", default="1")
+    ap.add_argument("--gen_tags", default="2", help="gen surfel 의 id_0 태그(base⊕recon⊕gen이면 2)")
+    ap.add_argument("--base_tags", default="0",
+                    help="context(보존) 태그 — prune/retrain/generate 제외, 강제 GOOD. base=0")
     ap.add_argument("--q_thr", type=float, default=0.3, help="broken 판정 품질 임계")
     ap.add_argument("--op_low", type=float, default=0.1, help="이하 opacity = junk prune")
     ap.add_argument("--scale_thr", type=float, default=0.1, help="이상 scale = floater prune")
@@ -53,6 +55,7 @@ def main():
     sc = np.exp(np.column_stack([ply["scale_0"], ply["scale_1"]]).astype(np.float64)).max(1)
     tag = np.asarray(ply["id_0"]).astype(np.int64) if "id_0" in nm else np.zeros(n, np.int64)
     gen = np.isin(tag, [int(t) for t in a.gen_tags.split(",")])
+    base = np.isin(tag, [int(t) for t in a.base_tags.split(",")]) if a.base_tags.strip() else np.zeros(n, bool)
 
     q = np.load(a.quality).astype(np.float32)
     seen = np.load(a.seen).astype(bool)
@@ -60,9 +63,11 @@ def main():
         if len(arr) != n:
             raise SystemExit(f"{nmn} 길이 {len(arr)} != gaussians {n} (동일 ply인지 확인)")
 
-    prune = (sc > a.scale_thr) | (op < a.op_low)
-    retrain = seen & (q > a.q_thr) & (~prune)
-    generate = (~seen) & gen & (~prune)
+    # base(context)는 prune/retrain/generate 제외 — 큰 벽·바닥 surfel 오프루닝 방지
+    obj = ~base
+    prune = ((sc > a.scale_thr) | (op < a.op_low)) & obj
+    retrain = seen & (q > a.q_thr) & (~prune) & obj
+    generate = (~seen) & gen & (~prune) & obj
 
     routes = np.zeros(n, np.int8)         # 0 GOOD
     routes[retrain] = 1
