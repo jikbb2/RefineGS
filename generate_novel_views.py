@@ -91,8 +91,11 @@ def main():
         img = fn(vp, wp, rec, args)
         op = os.path.join(args.out, f"gen_{i:04d}.jpg")
         img.save(op, quality=95)
+        # gen_out 을 자기완결적으로 — weight 도 함께 복사(patch_train_novelview 가 같은 dir 에서 읽음)
+        if os.path.exists(wp):
+            shutil.copy(wp, os.path.join(args.out, f"weight_{i:04d}.png"))
         meta.append(dict(idx=i, gen=os.path.basename(op),
-                         weight=os.path.basename(wp), stem=str(rec.get("stem", ""))))
+                         weight=f"weight_{i:04d}.png", stem=str(rec.get("stem", ""))))
         print(f"[{args.backend}] gen_{i:04d}  ← view_{i:04d}")
 
     # poses.npz 그대로 복사(주입이 카메라 복원에 사용) + meta
