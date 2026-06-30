@@ -1,31 +1,33 @@
 #!/usr/bin/env python3
 """RefineGS — 조건부 novel-view 생성 어댑터 (task 5, model-agnostic).
 
-입력  : soft_in/  (render_hole_novel.py --soft_out 출력)
-          view_<i>.jpg    조건용 RGB 렌더(현재 base⊕gen 형상을 그 pose에서 본 것)
+입력  : soft_in/  (render_hole_novel.py --soft_out)
+          view_<i>.jpg    조건용 RGB 렌더(현재 형상을 그 pose에서)
           weight_<i>.png  연속 soft weight(미관측·gen↑ = refine 대상)
-          poses.npz       카메라(world_view/full_proj/FoVx/FoVy/W/H)
-출력  : gen_out/  gen_<i>.jpg  (그 pose에서 *refine된* RGB) + poses.npz 복사 + meta.json
+          poses.npz       카메라
+출력  : gen_out/  gen_<i>.jpg + weight_<i>.png(soft, 학습 loss용) + poses.npz
 
 백엔드(--backend):
-  copy        : view 를 그대로 복사(identity). ★See3D 없이 주입 파이프라인(task6) 먼저 검증용.
-  see3d       : See3D inference 호출(조건=view+weight, 주변 관측뷰). ⚠️ CLI 미확정 → fill 필요.
-  viewcrafter : ViewCrafter 호출(render-conditioned). ⚠️ 미확정.
+  copy   : view 를 그대로 복사(identity). 주입 배관(task6) 검증용.
+  see3d  : See3D inference.py 호출(디렉토리 배치, multi-view diffusion).
+           warp=view, mask=binary(weight 임계: 흰=known/검=hole) → predict → gen.
+           ★조건뷰는 *실측 재학습된* 모델에서 렌더하는 게 좋음(조건 품질↑).
 
-설계 원칙(할루시네이션 억제): 생성기는 *백지*가 아니라 view(현재 형상 렌더)를 조건으로 받아 다듬는다.
-weight 가 큰 곳(미관측)은 자유도↑, weight≈0(관측)은 view 를 거의 보존하도록 백엔드에 전달.
+See3D 실행(see3d 백엔드 내부, See3D env 에서):
+  python inference.py --base_model_path <ckpt> --source_imgs_dir <ref>/ \
+      --warp_root_dir <tmp_warps> --output_dir <tmp_out>
 
 실행:
-  # 1) 먼저 copy 로 주입 파이프라인 검증
-  python generate_novel_views.py --soft_in ~/See3D/dataset/refinegs_obj24/soft_in \
-      --out ~/See3D/dataset/refinegs_obj24/gen_out --backend copy
-  # 2) 실제 생성(See3D CLI 확정 후)
-  python generate_novel_views.py --soft_in ... --out ... --backend see3d \
-      --see3d_root /home/elicer/See3D --ref_views <관측뷰dir>
+  # 배관검증
+  python generate_novel_views.py --soft_in .../soft_in --out .../gen_out --backend copy
+  # 실제 생성(See3D env, See3D 디렉토리에서)
+  python generate_novel_views.py --soft_in .../soft_in --out .../gen_out --backend see3d \
+      --see3d_root /home/elicer/See3D --base_model_path <See3D ckpt> \
+      --ref_views /home/elicer/See3D/dataset/refinegs_obj24/ref --hole_thr 0.3
 
-Deps: numpy, PIL.  (see3d/viewcrafter 백엔드는 해당 레포 의존)
+Deps: numpy, PIL. (see3d 백엔드는 See3D 레포/환경)
 """
-import argparse, os, json, shutil
+import argparse, os, json, shutil, glob, re, subprocess, sys, tempfile
 import numpy as np
 from PIL import Image
 
@@ -34,77 +36,104 @@ def load_poses(soft_in):
     p = os.path.join(soft_in, "poses.npz")
     if not os.path.exists(p):
         raise SystemExit(f"poses.npz 없음: {p} (render_hole_novel --soft_out 먼저)")
-    recs = np.load(p, allow_pickle=True)["records"]
-    return list(recs)
+    return list(np.load(p, allow_pickle=True)["records"])
 
 
-# ---------- 백엔드 ----------
-def backend_copy(view_path, weight_path, rec, args):
-    """identity: 현재 렌더를 그대로 '생성물'로. 주입 파이프라인 플러밍 검증용."""
-    return Image.open(view_path).convert("RGB")
+def finalize(out, soft_in, meta):
+    shutil.copy(os.path.join(soft_in, "poses.npz"), os.path.join(out, "poses.npz"))
+    with open(os.path.join(out, "meta.json"), "w") as f:
+        json.dump(meta, f, indent=2)
 
 
-def backend_see3d(view_path, weight_path, rec, args):
-    """See3D inference 호출.
-    ⚠️ 채울 부분: See3D inference.py 의 실제 CLI/함수 시그니처.
-    일반 형태:
-      conditioning = view(현재 형상 렌더) + mask(=weight 임계 또는 weight 자체) + 주변 관측뷰(ref_views)
-      output       = 그 pose 의 inpaint/refine 된 RGB
-    예시(자리표시 — 실제 인자명으로 교체):
-      cmd = [sys.executable, f"{args.see3d_root}/inference.py",
-             "--input", view_path, "--mask", weight_path,
-             "--ref_dir", args.ref_views, "--out", tmp_out, ...]
-      subprocess.run(cmd, check=True); return Image.open(tmp_out)
-    """
-    raise NotImplementedError(
-        "see3d 백엔드 미구현 — See3D inference CLI(인자명) 공유 시 채움. "
-        "우선 --backend copy 로 task6 주입을 검증하세요.")
-
-
-def backend_viewcrafter(view_path, weight_path, rec, args):
-    raise NotImplementedError("viewcrafter 백엔드 미구현 — 필요 시 ViewCrafter CLI 공유.")
-
-
-BACKENDS = {"copy": backend_copy, "see3d": backend_see3d, "viewcrafter": backend_viewcrafter}
-
-
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--soft_in", required=True, help="render_hole_novel --soft_out 디렉토리")
-    ap.add_argument("--out", required=True, help="생성물 출력 디렉토리 gen_out")
-    ap.add_argument("--backend", default="copy", choices=list(BACKENDS))
-    ap.add_argument("--see3d_root", default="/home/elicer/See3D")
-    ap.add_argument("--ref_views", default="", help="조건용 주변 관측뷰 디렉토리(see3d)")
-    args = ap.parse_args()
-
+# ---------- copy (identity) ----------
+def run_copy(args):
     recs = load_poses(args.soft_in)
     os.makedirs(args.out, exist_ok=True)
-    fn = BACKENDS[args.backend]
-
     meta = []
     for rec in recs:
         i = int(rec["idx"])
         vp = os.path.join(args.soft_in, f"view_{i:04d}.jpg")
         wp = os.path.join(args.soft_in, f"weight_{i:04d}.png")
         if not os.path.exists(vp):
-            print(f"[skip] {vp} 없음"); continue
-        img = fn(vp, wp, rec, args)
-        op = os.path.join(args.out, f"gen_{i:04d}.jpg")
-        img.save(op, quality=95)
-        # gen_out 을 자기완결적으로 — weight 도 함께 복사(patch_train_novelview 가 같은 dir 에서 읽음)
+            continue
+        Image.open(vp).convert("RGB").save(os.path.join(args.out, f"gen_{i:04d}.jpg"), quality=95)
         if os.path.exists(wp):
             shutil.copy(wp, os.path.join(args.out, f"weight_{i:04d}.png"))
-        meta.append(dict(idx=i, gen=os.path.basename(op),
-                         weight=f"weight_{i:04d}.png", stem=str(rec.get("stem", ""))))
-        print(f"[{args.backend}] gen_{i:04d}  ← view_{i:04d}")
+        meta.append(dict(idx=i, gen=f"gen_{i:04d}.jpg", weight=f"weight_{i:04d}.png"))
+        print(f"[copy] gen_{i:04d} ← view_{i:04d}")
+    finalize(args.out, args.soft_in, meta)
+    print(f"\n→ {len(meta)} (copy=identity) → {args.out}. patch_train_novelview 로 주입 배관 검증 가능.")
 
-    # poses.npz 그대로 복사(주입이 카메라 복원에 사용) + meta
-    shutil.copy(os.path.join(args.soft_in, "poses.npz"), os.path.join(args.out, "poses.npz"))
-    with open(os.path.join(args.out, "meta.json"), "w") as f:
-        json.dump(meta, f, indent=2)
-    print(f"\n→ {len(meta)}개 생성 → {args.out}  (gen_*.jpg + weight 참조 + poses.npz)")
-    if args.backend == "copy":
-        print("copy 백엔드 = identity. 이제 patch_train_novelview 로 주입 파이프라인(task6) 검증 가능.")
+
+# ---------- see3d (directory batch) ----------
+def run_see3d(args):
+    if not args.base_model_path or not args.ref_views:
+        raise SystemExit("see3d 백엔드는 --base_model_path 와 --ref_views(관측 앵커 dir) 필요")
+    recs = load_poses(args.soft_in)
+    os.makedirs(args.out, exist_ok=True)
+    warp_dir = tempfile.mkdtemp(prefix="see3d_warps_", dir=os.path.expanduser("~/tmp")
+                                if os.path.isdir(os.path.expanduser("~/tmp")) else None)
+    out_tmp = tempfile.mkdtemp(prefix="see3d_out_", dir=os.path.dirname(warp_dir))
+
+    # 1) warp_*.jpg(=view) + mask_*.png(See3D: 흰=known/검=hole) 준비
+    idxs = []
+    for rec in recs:
+        i = int(rec["idx"])
+        vp = os.path.join(args.soft_in, f"view_{i:04d}.jpg")
+        wp = os.path.join(args.soft_in, f"weight_{i:04d}.png")
+        if not (os.path.exists(vp) and os.path.exists(wp)):
+            continue
+        Image.open(vp).convert("RGB").save(os.path.join(warp_dir, f"warp_{i:04d}.jpg"), quality=95)
+        w = np.asarray(Image.open(wp).convert("L")).astype(np.float32) / 255.0
+        known = (w < args.hole_thr).astype(np.uint8) * 255          # 흰=known(weight 낮음), 검=hole(미관측)
+        Image.fromarray(known).save(os.path.join(warp_dir, f"mask_{i:04d}.png"))
+        idxs.append(i)
+    if not idxs:
+        raise SystemExit("see3d 입력 0개 — soft_in 비었거나 weight 전부 0. MIN_WEIGHT/hole_thr 확인.")
+
+    ref = args.ref_views if args.ref_views.endswith("/") else args.ref_views + "/"   # inference.py 가 문자열 concat
+    cmd = [sys.executable, os.path.join(args.see3d_root, "inference.py"),
+           "--base_model_path", args.base_model_path,
+           "--source_imgs_dir", ref,
+           "--warp_root_dir", warp_dir,
+           "--output_dir", out_tmp]
+    if args.single_view:
+        cmd.append("--single_view")
+    print("See3D inference:", " ".join(cmd))
+    subprocess.run(cmd, check=True, cwd=args.see3d_root)
+
+    # 2) predict_warp_<i>*.jpg → gen_<i>.jpg
+    meta = []
+    preds = glob.glob(os.path.join(out_tmp, "predict_*warp_*"))
+    for p in preds:
+        m = re.search(r"warp_(\d+)", os.path.basename(p))
+        if not m:
+            continue
+        i = int(m.group(1))
+        Image.open(p).convert("RGB").save(os.path.join(args.out, f"gen_{i:04d}.jpg"), quality=95)
+        wp = os.path.join(args.soft_in, f"weight_{i:04d}.png")
+        if os.path.exists(wp):
+            shutil.copy(wp, os.path.join(args.out, f"weight_{i:04d}.png"))
+        meta.append(dict(idx=i, gen=f"gen_{i:04d}.jpg", weight=f"weight_{i:04d}.png"))
+        print(f"[see3d] gen_{i:04d} ← predict {os.path.basename(p)}")
+    if not meta:
+        raise SystemExit(f"See3D 출력 0개 — {out_tmp} 확인(predict_*warp_* 없음).")
+    finalize(args.out, args.soft_in, meta)
+    print(f"\n→ {len(meta)} (see3d) → {args.out}")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--soft_in", required=True)
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--backend", default="copy", choices=["copy", "see3d"])
+    ap.add_argument("--see3d_root", default="/home/elicer/See3D")
+    ap.add_argument("--base_model_path", default="", help="See3D diffusion 체크포인트 dir")
+    ap.add_argument("--ref_views", default="", help="관측 앵커 이미지 dir (source_imgs_dir)")
+    ap.add_argument("--hole_thr", type=float, default=0.3, help="weight>thr = hole(See3D 생성), 이하=known")
+    ap.add_argument("--single_view", action="store_true")
+    args = ap.parse_args()
+    (run_copy if args.backend == "copy" else run_see3d)(args)
 
 
 if __name__ == "__main__":
