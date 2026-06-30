@@ -39,7 +39,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--gaussians", required=True)
     ap.add_argument("--quality", required=True)
-    ap.add_argument("--seen", required=True)
+    ap.add_argument("--conf", required=True,
+                    help="confidence_map _conf.npy (strict observed: 정면+마스크+≥2뷰). "
+                         "⚠️ quality_map의 seen.npy 아님(그건 frustum 투영이라 너무 관대).")
     ap.add_argument("--gen_tags", default="2", help="gen surfel 의 id_0 태그(base⊕recon⊕gen이면 2)")
     ap.add_argument("--base_tags", default="0",
                     help="context(보존) 태그 — prune/retrain/generate 제외, 강제 GOOD. base=0")
@@ -58,16 +60,16 @@ def main():
     base = np.isin(tag, [int(t) for t in a.base_tags.split(",")]) if a.base_tags.strip() else np.zeros(n, bool)
 
     q = np.load(a.quality).astype(np.float32)
-    seen = np.load(a.seen).astype(bool)
-    for arr, nmn in [(q, "quality"), (seen, "seen")]:
+    observed = np.load(a.conf).astype(np.float32) > 0.5     # strict observed (confidence_map good)
+    for arr, nmn in [(q, "quality"), (observed, "conf")]:
         if len(arr) != n:
             raise SystemExit(f"{nmn} 길이 {len(arr)} != gaussians {n} (동일 ply인지 확인)")
 
     # base(context)는 prune/retrain/generate 제외 — 큰 벽·바닥 surfel 오프루닝 방지
     obj = ~base
     prune = ((sc > a.scale_thr) | (op < a.op_low)) & obj
-    retrain = seen & (q > a.q_thr) & (~prune) & obj
-    generate = (~seen) & gen & (~prune) & obj
+    retrain = observed & (q > a.q_thr) & (~prune) & obj      # 관측됐지만 깨짐
+    generate = (~observed) & gen & (~prune) & obj            # 미관측 gen (strict)
 
     routes = np.zeros(n, np.int8)         # 0 GOOD
     routes[retrain] = 1
