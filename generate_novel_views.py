@@ -99,9 +99,11 @@ def run_see3d(args):
            "--output_dir", out_tmp]
     if args.single_view:
         cmd.append("--single_view")
-    # env 오염 방지: PYTHONPATH(=split_and_splat site-packages) 제거 → see3d 자체 torch 사용
+    # env 오염 방지: PYTHONPATH/LD_LIBRARY_PATH(=split_and_splat) 제거 → see3d 자체 torch/lib 사용
+    # (핸드오프의 split_and_splat 오염 이슈와 동일 — undefined symbol libtorch_python 방지)
     env = os.environ.copy()
     env.pop("PYTHONPATH", None)
+    env["LD_LIBRARY_PATH"] = ""
     print("See3D inference:", " ".join(cmd))
     subprocess.run(cmd, check=True, cwd=args.see3d_root, env=env)
 
