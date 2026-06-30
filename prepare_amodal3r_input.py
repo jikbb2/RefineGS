@@ -16,6 +16,11 @@ mask: 배경=255(흰), 가시=188(회), 가림=0(검정).
 """
 import argparse, glob, os
 import numpy as np
+from scipy.ndimage import binary_closing, binary_fill_holes
+try:
+    import cv2
+except Exception:
+    cv2 = None
 from PIL import Image
 
 
@@ -35,6 +40,9 @@ def main():
     ap.add_argument("--amodal", default=os.path.expanduser("~/amodal_replica_room0_v2"))
     ap.add_argument("--scene_img", default=None, help="default: data/<scene>/images")
     ap.add_argument("--out", default="/home/elicer/Amodal3R/input")
+    ap.add_argument("--fill", choices=["amodal", "hull", "close"], default="amodal",
+                    help="객체 footprint 정의: amodal(기존)/hull(convex)/close(morph)")
+    ap.add_argument("--close_k", type=int, default=25)
     a = ap.parse_args()
     scene_img = a.scene_img or f"data/{a.scene}/images"
     scene_img = os.path.realpath(scene_img)
@@ -57,7 +65,13 @@ def main():
     for rank, (area, stem, vf) in enumerate(ranked):
         vis = to_bool(vf)
         af = os.path.join(a.amodal, a.gid, stem + ".png")
-        filled = to_bool(af) if os.path.exists(af) else vis
+        if a.fill == "hull" and cv2 is not None and vis.any():
+            ys, xs = np.where(vis); hull = cv2.convexHull(np.column_stack([xs, ys]).astype(np.int32))
+            f8 = np.zeros(vis.shape, np.uint8); cv2.fillConvexPoly(f8, hull, 1); filled = f8.astype(bool)
+        elif a.fill == "close":
+            filled = binary_fill_holes(binary_closing(vis, np.ones((a.close_k, a.close_k))))
+        else:
+            filled = to_bool(af) if os.path.exists(af) else vis
         occ = filled & (~vis)
         # 3-값 마스크
         m = np.full(vis.shape, 255, np.uint8)   # bg

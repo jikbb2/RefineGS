@@ -78,6 +78,31 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         gaussians.active_sh_degree = gaussians.max_sh_degree
         print('[B4a] init from ' + args.init_ply + ': ' + str(gaussians.get_xyz.shape[0]) + ' gaussians')
     gaussians.training_setup(opt)
+    # [NV] novel-view soft-weighted supervision 로드
+    _NV_CAMS, _NV_LAMBDA, _NV_EVERY = [], float(getattr(args, "nv_lambda", 0.5)), int(getattr(args, "nv_every", 2))
+    if getattr(args, "novelview_dir", None):
+        import os as _os, numpy as _np, torch as _t
+        from PIL import Image as _Img
+        from scene.cameras import MiniCam as _MiniCam
+        _nvd = args.novelview_dir
+        _recs = _np.load(_os.path.join(_nvd, "poses.npz"), allow_pickle=True)["records"]
+        for _r in _recs:
+            _r = _r.item() if hasattr(_r, "item") and not isinstance(_r, dict) else _r
+            _i = int(_r["idx"])
+            _gp = _os.path.join(_nvd, "gen_%04d.jpg" % _i)
+            _wp = _os.path.join(_nvd, "weight_%04d.png" % _i)
+            if not _os.path.exists(_gp) or not _os.path.exists(_wp):
+                continue
+            _wvt = _t.tensor(_np.asarray(_r["world_view_transform"]), dtype=_t.float32).cuda()
+            _fpt = _t.tensor(_np.asarray(_r["full_proj_transform"]), dtype=_t.float32).cuda()
+            _cam = _MiniCam(int(_r["width"]), int(_r["height"]), float(_r["FoVy"]), float(_r["FoVx"]),
+                            0.01, 100.0, _wvt, _fpt)
+            _g = _t.from_numpy(_np.asarray(_Img.open(_gp).convert("RGB"))).float().permute(2, 0, 1).cuda() / 255.0
+            _w = _t.from_numpy(_np.asarray(_Img.open(_wp).convert("L"))).float().cuda() / 255.0
+            _cam.gt_image = _g
+            _cam.weight = _w[None]
+            _NV_CAMS.append(_cam)
+        print("[NV] %d novel-view cams (lambda=%.3f every=%d) from %s" % (len(_NV_CAMS), _NV_LAMBDA, _NV_EVERY, _nvd))
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
@@ -172,6 +197,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if _rd.dim() == 2: _rd = _rd[None]
                 _dl = (torch.abs(_rd - _gd) * _vm).sum() / _vm.sum().clamp_min(1.0)
                 total_loss = total_loss + _ld * _dl
+        # [NV] novel-view weighted supervision (weight~0 관측 보존 / weight~1 미관측 refine)
+        if _NV_CAMS and (iteration % _NV_EVERY == 0):
+            from random import randint as _ri
+            _nv = _NV_CAMS[_ri(0, len(_NV_CAMS) - 1)]
+            _nvr = render(_nv, gaussians, pipe, bg)["render"]
+            _w = _nv.weight
+            if _w.shape[-2:] != _nvr.shape[-2:]:
+                _w = torch.nn.functional.interpolate(_w[None], _nvr.shape[-2:], mode="bilinear")[0]
+            _gt = _nv.gt_image
+            if _gt.shape[-2:] != _nvr.shape[-2:]:
+                _gt = torch.nn.functional.interpolate(_gt[None], _nvr.shape[-2:], mode="bilinear")[0]
+            _nv_l1 = (torch.abs(_nvr - _gt) * _w).sum() / _w.sum().clamp_min(1.0)
+            total_loss = total_loss + _NV_LAMBDA * _nv_l1
         total_loss.backward()
 
         iter_end.record()
@@ -329,6 +367,9 @@ if __name__ == "__main__":
     parser.add_argument('--disable_viewer', action='store_true', default=False)
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default=None)
+    parser.add_argument("--novelview_dir", type=str, default=None)  # [NV]
+    parser.add_argument("--nv_lambda", type=float, default=0.5)      # [NV]
+    parser.add_argument("--nv_every", type=int, default=2)           # [NV]
     parser.add_argument("--init_ply", type=str, default=None)  # [B4a]
 
     args = parser.parse_args(sys.argv[1:])

@@ -11,21 +11,24 @@
   weight_<i>.png hole map (255=hole/미관측, 0=known/실색) ← generate_novel_views see3d 가 mask 로 사용
   poses.npz      복사
 
+※ valid/hole 은 *GT 투영 여부(zbuf)* 로 판정 — 색이 검정이어도 GT 가 투영된 진짜 객체는 hole 아님(보존).
+※ '검은 영역을 학습에서 제외' 하려면 학습 weight = (1 - hole) = filled(실색). (주입 단계에서 반전 처리.)
+
 forward-warp:
   src 픽셀 (u,v,d) → Xc = d·K^-1[u,v,1] → Xw = R_s^T(Xc - t_s)
   → target: Xc_t = R_t·Xw + t_t,  uv_t = K_t·Xc_t/z   (z-buffer 로 최근접 색 채택)
   k_nearest GT 프레임을 합쳐 채움. 빈 픽셀 = hole.
 
-실행:
+실행(권장 stride=1):
   python warp_gt_to_pose.py \
     --poses ~/See3D/dataset/refinegs_obj24/soft_in_carved/poses.npz \
     --gt_images data/replica_room0_v2/images \
     --gt_depth /home/elicer/nice-slam/Datasets/Replica/room0/results \
     --colmap data/replica_room0_v2/sparse/0 \
-    --depth_scale 6553.5 --k_nearest 6 \
+    --depth_scale 6553.5 --k_nearest 6 --src_stride 1 \
     --out ~/See3D/dataset/refinegs_obj24/soft_in_gtwarp
 
-Deps: numpy, PIL, (cv2 선택).
+Deps: numpy, PIL.
 """
 import argparse, os, struct, glob, shutil
 import numpy as np
@@ -91,29 +94,6 @@ def load_depth(path, scale, W, H):
     return d
 
 
-def fill_speckle(view, filled, fill_k=5, dens_thr=0.4):
-    """작은 speckle(주변이 채워진 1~2px 틈)만 메우고, 큰 진짜 hole(미관측)은 보존.
-    speckle = unfilled ∧ (주변 filled 밀도 높음). 큰 hole은 밀도 낮아 제외 → See3D 몫.
-    반환: (메운 view, 갱신 filled, genuine_hole)"""
-    try:
-        import scipy.ndimage as ndi
-    except Exception:
-        return view, filled, ~filled
-    dens = ndi.uniform_filter(filled.astype(np.float32), size=fill_k)
-    speckle = (~filled) & (dens > dens_thr)
-    if speckle.any():
-        try:
-            import cv2
-            view = cv2.inpaint(view, (speckle*255).astype(np.uint8), 3, cv2.INPAINT_TELEA)
-        except Exception:
-            # cv2 없으면 nearest-filled 로 채움(distance transform 인덱스)
-            idx = ndi.distance_transform_edt(~filled, return_distances=False, return_indices=True)
-            vfill = view[tuple(idx)]
-            view = np.where(speckle[..., None], vfill, view)
-    new_filled = filled | speckle
-    return view, new_filled, ~new_filled
-
-
 def target_from_pose(rec):
     wvt = np.asarray(rec["world_view_transform"], float)   # stored = getWorld2View2(R,T).T
     M = wvt.T                                              # W2C 4x4
@@ -134,9 +114,8 @@ def main():
     ap.add_argument("--gt_depth", required=True)
     ap.add_argument("--colmap", required=True)
     ap.add_argument("--depth_scale", type=float, default=6553.5)
-    ap.add_argument("--k_nearest", type=int, default=10, help="합칠 인접 GT 프레임 수(↑=커버리지↑)")
+    ap.add_argument("--k_nearest", type=int, default=6)
     ap.add_argument("--src_stride", type=int, default=1, help="src 픽셀 stride(속도). 1=full(권장)")
-    ap.add_argument("--fill_k", type=int, default=5, help="speckle 메움 커널(↑=더 큰 틈도 speckle 취급)")
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
 
@@ -198,15 +177,15 @@ def main():
             color[flat] = cc
             zbuf[flat] = np.minimum(zbuf[flat], zz)
 
-        filled = (zbuf < np.inf).reshape(H, W)
+        filled = zbuf < np.inf
         view = color.reshape(H, W, 3).astype(np.uint8)
-        view, filled2, hole = fill_speckle(view, filled, fill_k=a.fill_k)
+        hole = (~filled).reshape(H, W)
         Image.fromarray(view).save(os.path.join(a.out, f"view_{i:04d}.jpg"), quality=95)
         Image.fromarray((hole*255).astype(np.uint8)).save(os.path.join(a.out, f"weight_{i:04d}.png"))
-        print(f"[{i:04d}] filled {filled.mean():.3f} → speckle메움후 {filled2.mean():.3f}  genuine hole {hole.mean():.3f}")
+        print(f"[{i:04d}] filled {filled.mean():.3f}  hole {hole.mean():.3f}")
 
     shutil.copy(a.poses, os.path.join(a.out, "poses.npz"))
-    print(f"\n→ {a.out} (view=GT-warp, weight=hole, poses.npz). generate_novel_views see3d 입력으로 사용.")
+    print(f"\n→ {a.out} (view=GT-warp, weight=hole, poses.npz).")
 
 
 if __name__ == "__main__":
