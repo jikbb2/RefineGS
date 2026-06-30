@@ -68,13 +68,22 @@ def main():
 
     for gid in gids:
         recon_g = sorted(glob.glob(os.path.join(a.recon_root, gid, "point_cloud/iteration_*/point_cloud.ply")))
+        mesh_g = sorted(glob.glob(os.path.join(a.recon_root, gid, "train/ours_*/fuse_post.ply")))
         gen_mesh = os.path.join(a.gen_root, gid, "seed_1", "mesh_registered_clean.ply")
-        if not recon_g or not os.path.exists(gen_mesh):
-            print(f"[skip] gid {gid}: recon={bool(recon_g)} gen={os.path.exists(gen_mesh)}")
+        if not recon_g or not mesh_g or not os.path.exists(gen_mesh):
+            print(f"[skip] gid {gid}: recon={bool(recon_g)} mesh={bool(mesh_g)} gen={os.path.exists(gen_mesh)}")
             continue
         recon, rprops = load(recon_g[-1])
         if set(rprops) != set(bprops):
             print(f"[skip] gid {gid}: recon 스키마 불일치"); continue
+        # 메쉬(fuse_post) bbox 로 broken 판정 + recon 점군 crop(floater 제거)
+        mdata, _ = load(mesh_g[-1]); mxyz = xyz(mdata)
+        mext = mxyz.max(0) - mxyz.min(0)
+        if mext.max() > a.max_extent:
+            print(f"[skip] gid {gid}: mesh extent {mext.round(2)} > {a.max_extent} (broken)"); continue
+        lo_c, hi_c = mxyz.min(0) - a.pad, mxyz.max(0) + a.pad
+        rkeep = np.all((xyz(recon) >= lo_c) & (xyz(recon) <= hi_c), axis=1)
+        recon = recon[rkeep]      # 메쉬 bbox 밖 floater 제거
         # gen mesh → surfel
         surfel = os.path.join(a.tmp, f"gensurf_{gid}.ply")
         r = subprocess.run([sys.executable, a.mesh_to_surfels, "--mesh", gen_mesh,
@@ -85,14 +94,11 @@ def main():
         gen, gprops = load(surfel)
         if set(gprops) != set(bprops):
             print(f"[skip] gid {gid}: gen 스키마 불일치"); continue
-        # broken recon(whole-scene) 제외
-        rxyz = xyz(recon); ext = rxyz.max(0) - rxyz.min(0)
-        if ext.max() > a.max_extent:
-            print(f"[skip] gid {gid}: recon extent {ext.round(2)} > {a.max_extent} (broken/whole-scene)"); continue
-        recon_xyz_all.append(rxyz)
+        recon_xyz_all.append(xyz(recon))         # crop된 recon
         recon_chunks.append(recon.astype(base.dtype, copy=True))
         gen_chunks.append(gen.astype(base.dtype, copy=True))
         used.append(gid)
+        print(f"[ok] gid {gid}: recon {len(recon)} (mesh ext {mext.round(2)}) + gen {len(gen)}")
 
     if not used:
         raise SystemExit("조립할 객체 0 — recon/gen 경로 확인")
