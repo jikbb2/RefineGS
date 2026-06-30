@@ -83,7 +83,8 @@ def run_see3d(args):
         wp = os.path.join(args.soft_in, f"weight_{i:04d}.png")
         if not (os.path.exists(vp) and os.path.exists(wp)):
             continue
-        Image.open(vp).convert("RGB").save(os.path.join(warp_dir, f"warp_{i:04d}.jpg"), quality=95)
+        # ⚠️ inference.py 가 mask 를 warp 와 *같은 확장자*로 찾음(ins.replace('warp','mask')) → 둘 다 .png
+        Image.open(vp).convert("RGB").save(os.path.join(warp_dir, f"warp_{i:04d}.png"))
         w = np.asarray(Image.open(wp).convert("L")).astype(np.float32) / 255.0
         known = (w < args.hole_thr).astype(np.uint8) * 255          # 흰=known(weight 낮음), 검=hole(미관측)
         Image.fromarray(known).save(os.path.join(warp_dir, f"mask_{i:04d}.png"))
