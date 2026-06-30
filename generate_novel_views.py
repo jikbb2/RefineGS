@@ -99,8 +99,11 @@ def run_see3d(args):
            "--output_dir", out_tmp]
     if args.single_view:
         cmd.append("--single_view")
+    # env 오염 방지: PYTHONPATH(=split_and_splat site-packages) 제거 → see3d 자체 torch 사용
+    env = os.environ.copy()
+    env.pop("PYTHONPATH", None)
     print("See3D inference:", " ".join(cmd))
-    subprocess.run(cmd, check=True, cwd=args.see3d_root)
+    subprocess.run(cmd, check=True, cwd=args.see3d_root, env=env)
 
     # 2) predict_warp_<i>*.jpg → gen_<i>.jpg
     meta = []
