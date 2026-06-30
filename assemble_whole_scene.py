@@ -44,7 +44,11 @@ def main():
     ap.add_argument("--gids", default="", help="콤마구분. 비우면 recon+gen 둘 다 있는 gid 자동")
     ap.add_argument("--mesh_to_surfels", default="mesh_to_surfels.py")
     ap.add_argument("--n_samples", type=int, default=200000)
-    ap.add_argument("--pad", type=float, default=0.05)
+    ap.add_argument("--pad", type=float, default=0.05, help="(미사용 — proximity carve로 대체)")
+    ap.add_argument("--carve_dist", type=float, default=0.04,
+                    help="base 점이 recon 표면에서 이 거리(m) 이내면 제거(중복 객체 표면만). bbox carve 대체")
+    ap.add_argument("--max_extent", type=float, default=3.0,
+                    help="recon 최대 extent가 이보다 크면 broken(whole-scene)으로 보고 제외")
     ap.add_argument("--tmp", default=os.path.expanduser("~/tmp"))
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
@@ -59,7 +63,7 @@ def main():
 
     base, bprops = load(a.base)
     base_xyz = xyz(base)
-    inside_any = np.zeros(len(base), bool)
+    recon_xyz_all = []                       # proximity carve용
     recon_chunks, gen_chunks, used = [], [], []
 
     for gid in gids:
@@ -81,9 +85,11 @@ def main():
         gen, gprops = load(surfel)
         if set(gprops) != set(bprops):
             print(f"[skip] gid {gid}: gen 스키마 불일치"); continue
-        # base carve: recon bbox
-        rxyz = xyz(recon); lo, hi = rxyz.min(0)-a.pad, rxyz.max(0)+a.pad
-        inside_any |= np.all((base_xyz >= lo) & (base_xyz <= hi), axis=1)
+        # broken recon(whole-scene) 제외
+        rxyz = xyz(recon); ext = rxyz.max(0) - rxyz.min(0)
+        if ext.max() > a.max_extent:
+            print(f"[skip] gid {gid}: recon extent {ext.round(2)} > {a.max_extent} (broken/whole-scene)"); continue
+        recon_xyz_all.append(rxyz)
         recon_chunks.append(recon.astype(base.dtype, copy=True))
         gen_chunks.append(gen.astype(base.dtype, copy=True))
         used.append(gid)
@@ -91,7 +97,14 @@ def main():
     if not used:
         raise SystemExit("조립할 객체 0 — recon/gen 경로 확인")
 
-    base_keep = base[~inside_any].copy()
+    # proximity carve: base 점이 recon 표면 가까이(<carve_dist)면 제거(중복 객체 표면만, 바닥/벽 보존)
+    from scipy.spatial import cKDTree
+    rall = np.concatenate(recon_xyz_all)
+    print(f"proximity carve: recon {len(rall)} 점 KDTree, base {len(base_xyz)} 질의...")
+    tree = cKDTree(rall)
+    d, _ = tree.query(base_xyz, k=1, distance_upper_bound=a.carve_dist*4, workers=-1)
+    carve = d < a.carve_dist
+    base_keep = base[~carve].copy()
     if "id_0" in bprops:
         base_keep["id_0"] = 0
         for c in recon_chunks: c["id_0"] = 1
@@ -101,7 +114,7 @@ def main():
     os.makedirs(os.path.dirname(a.out), exist_ok=True)
     PlyData([PlyElement.describe(merged, "vertex")], text=False).write(a.out)
     print(f"\n조립: 객체 {len(used)}개 {used}")
-    print(f"  base carve: {inside_any.sum()} 제거 → base {len(base_keep)}")
+    print(f"  proximity carve: {int(carve.sum())} 제거 → base {len(base_keep)} (바닥/벽 보존)")
     print(f"  + recon {sum(len(c) for c in recon_chunks)} (tag1) + gen {sum(len(c) for c in gen_chunks)} (tag2)")
     print(f"  = {len(merged)} → {a.out}")
     print("검수: 렌더에서 각 객체가 *하나씩*만(중복 없이) 보이면 carve 성공.")
