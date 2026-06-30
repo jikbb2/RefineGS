@@ -11,21 +11,24 @@
   weight_<i>.png hole map (255=hole/미관측, 0=known/실색) ← generate_novel_views see3d 가 mask 로 사용
   poses.npz      복사
 
+※ valid/hole 은 *GT 투영 여부(zbuf)* 로 판정 — 색이 검정이어도 GT 가 투영된 진짜 객체는 hole 아님(보존).
+※ '검은 영역을 학습에서 제외' 하려면 학습 weight = (1 - hole) = filled(실색). (주입 단계에서 반전 처리.)
+
 forward-warp:
   src 픽셀 (u,v,d) → Xc = d·K^-1[u,v,1] → Xw = R_s^T(Xc - t_s)
   → target: Xc_t = R_t·Xw + t_t,  uv_t = K_t·Xc_t/z   (z-buffer 로 최근접 색 채택)
   k_nearest GT 프레임을 합쳐 채움. 빈 픽셀 = hole.
 
-실행:
+실행(권장 stride=1):
   python warp_gt_to_pose.py \
     --poses ~/See3D/dataset/refinegs_obj24/soft_in_carved/poses.npz \
     --gt_images data/replica_room0_v2/images \
     --gt_depth /home/elicer/nice-slam/Datasets/Replica/room0/results \
     --colmap data/replica_room0_v2/sparse/0 \
-    --depth_scale 6553.5 --k_nearest 6 \
+    --depth_scale 6553.5 --k_nearest 6 --src_stride 1 \
     --out ~/See3D/dataset/refinegs_obj24/soft_in_gtwarp
 
-Deps: numpy, PIL, (cv2 선택).
+Deps: numpy, PIL.
 """
 import argparse, os, struct, glob, shutil
 import numpy as np
@@ -112,7 +115,7 @@ def main():
     ap.add_argument("--colmap", required=True)
     ap.add_argument("--depth_scale", type=float, default=6553.5)
     ap.add_argument("--k_nearest", type=int, default=6)
-    ap.add_argument("--src_stride", type=int, default=2, help="src 픽셀 stride(속도). 1=full")
+    ap.add_argument("--src_stride", type=int, default=1, help="src 픽셀 stride(속도). 1=full(권장)")
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
 
@@ -182,7 +185,7 @@ def main():
         print(f"[{i:04d}] filled {filled.mean():.3f}  hole {hole.mean():.3f}")
 
     shutil.copy(a.poses, os.path.join(a.out, "poses.npz"))
-    print(f"\n→ {a.out} (view=GT-warp, weight=hole, poses.npz). generate_novel_views see3d 입력으로 사용.")
+    print(f"\n→ {a.out} (view=GT-warp, weight=hole, poses.npz).")
 
 
 if __name__ == "__main__":

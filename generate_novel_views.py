@@ -58,11 +58,16 @@ def run_copy(args):
             continue
         Image.open(vp).convert("RGB").save(os.path.join(args.out, f"gen_{i:04d}.jpg"), quality=95)
         if os.path.exists(wp):
-            shutil.copy(wp, os.path.join(args.out, f"weight_{i:04d}.png"))
+            if args.invert_weight:
+                # warp_gt_to_pose 의 weight=hole → 학습 weight=validity(1-hole). 검은 영역 학습 제외.
+                w = np.asarray(Image.open(wp).convert("L"))
+                Image.fromarray(255 - w).save(os.path.join(args.out, f"weight_{i:04d}.png"))
+            else:
+                shutil.copy(wp, os.path.join(args.out, f"weight_{i:04d}.png"))
         meta.append(dict(idx=i, gen=f"gen_{i:04d}.jpg", weight=f"weight_{i:04d}.png"))
         print(f"[copy] gen_{i:04d} ← view_{i:04d}")
     finalize(args.out, args.soft_in, meta)
-    print(f"\n→ {len(meta)} (copy=identity) → {args.out}. patch_train_novelview 로 주입 배관 검증 가능.")
+    print(f"\n→ {len(meta)} (copy=identity{'/invert_weight' if args.invert_weight else ''}) → {args.out}")
 
 
 # ---------- see3d (directory batch) ----------
@@ -138,6 +143,9 @@ def main():
     ap.add_argument("--ref_views", default="", help="관측 앵커 이미지 dir (source_imgs_dir)")
     ap.add_argument("--hole_thr", type=float, default=0.3, help="weight>thr = hole(See3D 생성), 이하=known")
     ap.add_argument("--single_view", action="store_true")
+    ap.add_argument("--invert_weight", action="store_true",
+                    help="weight=hole(warp_gt_to_pose) → 학습 weight=validity(1-hole)로 반전. "
+                         "GT-warp 를 학습에 쓸 때(검은 영역 제외) 사용.")
     args = ap.parse_args()
     (run_copy if args.backend == "copy" else run_see3d)(args)
 
