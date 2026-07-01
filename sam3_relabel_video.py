@@ -16,6 +16,16 @@
      - 다른 concept(cushion/pillow 등): 3D 겹침이 크면 같은 객체로 병합(synonym).
   4) 구조물 concept 제외 + min_track 필터. (작은 객체 coverage: --min_area/--min_track 완화)
 
+★ v2.1 메모리 패치: --window N ★
+  SAM3 propagate 는 한 concept당 비디오 *전체* 프레임을 스트리밍하며 프레임별 버퍼를 GPU에 누적한다.
+  stride 를 낮춰(dense) 프레임 수가 늘면 CUDACachingAllocator/NVML assert(=OOM)로 죽는다.
+  --window N 을 주면 프레임을 N개 단위 window로 잘라 window마다 세션을 새로 열고 닫아
+  (start_session → 모든 concept propagate → close_session → empty_cache) GPU 메모리 상한을 고정한다.
+  window 경계로 쪼개진 동일 객체는 프레임이 겹치지 않으므로 아래 3D voxel unification 이
+  '시간 배타 → re-id 병합'으로 자동으로 다시 이어붙인다(다운스트림 무변경).
+  --window 0(기본)이면 기존과 동일(전체 한 번).
+  window로 쪼갤 때 per-track min_track 필터는 완화(1)하고, 최종 min_track 은 병합된 객체 단위(아래)로 적용.
+
 출력: <out_root>/<gid>/<stem>.png (마스크) + points3d.ply (depth voxel 센터, init) → prepare_folder 입력.
 
 실행 (sam3 env):
@@ -26,12 +36,12 @@
         --depth_dir data/replica_room0/images --depth_scale 6553.5 \
         --vocab_json /home/elicer/sam3/vocab.json \
         --bpe /home/elicer/sam3/sam3/assets/bpe_simple_vocab_16e6.txt.gz \
-        --stride 10 --min_area 0.0008 --min_track 2 \
+        --stride 2 --window 200 --min_area 0.0008 --min_track 2 \
         --vox 0.03 --sig_frac 0.25 --reid_th 0.3 \
         --exclude_concepts "door,blind,vent,window,wall,floor,ceiling,light switch,thermostat" \
         --out_root ~/relabel_video_room0
 """
-import argparse, glob, json, os
+import argparse, glob, json, os, gc, tempfile
 from collections import Counter, defaultdict
 import numpy as np, torch
 from PIL import Image
@@ -162,7 +172,15 @@ def main():
     ap.add_argument("--vocab_json",default=None); ap.add_argument("--vocab",default=None)
     ap.add_argument("--bpe",default=None)
     ap.add_argument("--stride",type=int,default=10,help="SAM3 propagate 프레임 subsample(메모리/속도)")
-    ap.add_argument("--prompt_frame",type=int,default=0,help="concept를 프롬프트할 단일 프레임 인덱스")
+    ap.add_argument("--window",type=int,default=0,
+                    help="★프레임을 이 개수 단위 window로 나눠 세션별 처리(0=전체 한 번). GPU 메모리 상한 고정.")
+    ap.add_argument("--offload_state",action="store_true",default=True,
+                    help="★프레임별 state를 CPU로 offload(GPU 메모리 프레임수 무관 평평). 기본 ON.")
+    ap.add_argument("--no_offload_state",dest="offload_state",action="store_false")
+    ap.add_argument("--offload_video",action="store_true",default=True,
+                    help="★비디오 프레임 텐서를 CPU로 offload. 기본 ON.")
+    ap.add_argument("--no_offload_video",dest="offload_video",action="store_false")
+    ap.add_argument("--prompt_frame",type=int,default=0,help="concept를 프롬프트할 window-로컬 프레임 인덱스")
     ap.add_argument("--min_area",type=float,default=0.0008,
                     help="프레임 마스크 최소 면적(작은 객체 coverage 위해 v1 0.003 → 완화)")
     ap.add_argument("--min_track",type=int,default=2,help="유효 객체 최소 관측 프레임 수(완화)")
@@ -192,19 +210,21 @@ def main():
     dcache={}
     print(f"vocab={len(VOCAB)} cams={len(cams)} depth_dir={ddir} vox={args.vox}m")
 
-    # 정수명 심링크 + idx→stem
-    import tempfile
+    # 전역 프레임 리스트 (stride 적용) — window 로 나눠 세션별 처리
     src=sorted(glob.glob(os.path.join(args.frames,f"*{args.img_ext}")))[::args.stride]
-    tmp=tempfile.mkdtemp(prefix="sam3relabel_"); idx2stem=[]
-    for i,f in enumerate(src):
-        os.symlink(os.path.abspath(f),os.path.join(tmp,f"{i}.jpg"))
-        idx2stem.append(os.path.splitext(os.path.basename(f))[0])
-    N=len(src); print(f"frames={N} → {tmp}  (single-prompt @frame {args.prompt_frame}, streaming)")
+    N=len(src)
+    stems_all=[os.path.splitext(os.path.basename(f))[0] for f in src]
+    win = args.window if args.window>0 else N
+    win = max(1, min(win, N)) if N else 1
+    windows=[range(s, min(s+win, N)) for s in range(0, N, win)] if N else []
+    # per-track min_track: window로 쪼갤 땐 완화(1). 최종 필터는 병합 객체 단위(아래 line ~min_track).
+    mt_track = 1 if args.window>0 else args.min_track
+    print(f"frames={N}  window={win}  n_windows={len(windows)}  (single-prompt @local frame {args.prompt_frame}, streaming)")
 
     # depth 접근성 sanity check (첫 프레임)
     if N:
-        _D=load_depth(idx2stem[0],dcfg,dcache)
-        print(f"depth probe [{idx2stem[0]}]: "
+        _D=load_depth(stems_all[0],dcfg,dcache)
+        print(f"depth probe [{stems_all[0]}]: "
               + (f"OK shape={_D.shape} range=[{_D[_D>0].min():.2f},{_D.max():.2f}]m" if _D is not None
                  else "★없음★ — --depth_dir/--depth_from/--depth_to 확인 필요"))
 
@@ -221,40 +241,52 @@ def main():
             out[r["frame_index"]]=r["outputs"]
         return out
 
-    # ── concept별 single-prompt streaming → track 수집 ──
+    # ── window별 세션 → concept별 single-prompt streaming → track 수집 ──
     tracks=[]
-    pf=int(np.clip(args.prompt_frame,0,N-1))
     with torch.inference_mode(), torch.autocast("cuda",dtype=torch.bfloat16):
-        sid=predictor.handle_request(dict(type="start_session",resource_path=tmp))["session_id"]
-        for c in VOCAB:
-            predictor.handle_request(dict(type="reset_session",session_id=sid))
-            predictor.handle_request(dict(type="add_prompt",session_id=sid,frame_index=pf,text=c))
-            opf=propagate(sid)
-            byid={}
-            for fidx,o in opf.items():
-                stem=idx2stem[fidx]; ids=np.asarray(o["out_obj_ids"]).reshape(-1)
-                masks=np.asarray(o["out_binary_masks"]); probs=np.asarray(o["out_probs"]).reshape(-1)
-                for k,oid in enumerate(ids):
-                    m=masks[k]
-                    if m.mean()<args.min_area: continue
-                    dd=byid.setdefault(int(oid),{"masks":{},"score":0.0})
-                    dd["masks"][stem]=m>0; dd["score"]=max(dd["score"],float(probs[k]))
-            kept=0
-            for oid,dd in byid.items():
-                if len(dd["masks"])<args.min_track: continue
-                # ★ depth-dense sig (배경 제거) ★
-                sig=compute_sig(dd["masks"],cams,dcfg,dcache,args.vox,args.max_px,args.sig_frac)
-                if len(sig)<args.min_sig: continue    # 안정 표면 voxel 부족 → 폐기
-                tracks.append(dict(concept=c,masks=dd["masks"],frames=set(dd["masks"].keys()),
-                                   sig=sig,score=dd["score"]))
-                kept+=1
-            print(f"  [{c}] SAM3 ids={len(byid)} → valid tracks={kept}")
-        predictor.handle_request(dict(type="close_session",session_id=sid))
+        for wi,wr in enumerate(windows):
+            # window 프레임을 정수명으로 심링크 (로컬 idx→전역 stem)
+            wdir=tempfile.mkdtemp(prefix=f"sam3relabel_w{wi}_"); local2stem=[]
+            for li,gi in enumerate(wr):
+                os.symlink(os.path.abspath(src[gi]),os.path.join(wdir,f"{li}.jpg"))
+                local2stem.append(stems_all[gi])
+            Nw=len(local2stem); pf=int(np.clip(args.prompt_frame,0,max(Nw-1,0)))
+            sid=predictor.handle_request(dict(type="start_session",resource_path=wdir,
+                    offload_video_to_cpu=args.offload_video,
+                    offload_state_to_cpu=args.offload_state))["session_id"]
+            wtracks=0
+            for c in VOCAB:
+                predictor.handle_request(dict(type="reset_session",session_id=sid))
+                predictor.handle_request(dict(type="add_prompt",session_id=sid,frame_index=pf,text=c))
+                opf=propagate(sid)
+                byid={}
+                for fidx,o in opf.items():
+                    stem=local2stem[fidx]; ids=np.asarray(o["out_obj_ids"]).reshape(-1)
+                    masks=np.asarray(o["out_binary_masks"]); probs=np.asarray(o["out_probs"]).reshape(-1)
+                    for k,oid in enumerate(ids):
+                        m=masks[k]
+                        if m.mean()<args.min_area: continue
+                        dd=byid.setdefault(int(oid),{"masks":{},"score":0.0})
+                        dd["masks"][stem]=m>0; dd["score"]=max(dd["score"],float(probs[k]))
+                for oid,dd in byid.items():
+                    if len(dd["masks"])<mt_track: continue        # window: 완화(1)
+                    # ★ depth-dense sig (배경 제거) ★
+                    sig=compute_sig(dd["masks"],cams,dcfg,dcache,args.vox,args.max_px,args.sig_frac)
+                    if len(sig)<args.min_sig: continue    # 안정 표면 voxel 부족 → 폐기
+                    tracks.append(dict(concept=c,masks=dd["masks"],frames=set(dd["masks"].keys()),
+                                       sig=sig,score=dd["score"]))
+                    wtracks+=1
+            # window 세션 해제 → GPU 메모리 반환 (프레임 축 누적 차단)
+            predictor.handle_request(dict(type="close_session",session_id=sid))
+            gc.collect(); torch.cuda.empty_cache()
+            print(f"  [window {wi+1}/{len(windows)}] frames {wr.start}..{wr.stop-1}  "
+                  f"new tracks={wtracks}  total={len(tracks)}")
     try: predictor.shutdown()
     except Exception: pass
-    print(f"\nnative tracks(전 concept): {len(tracks)}")
+    print(f"\nnative tracks(전 concept·전 window): {len(tracks)}")
 
     # ── co-occurrence 기반 instance unification (union-find) ──
+    #     window 경계로 쪼개진 동일 객체 = 프레임 배타 → voxel-Jaccard re-id 로 자동 재결합.
     parent=list(range(len(tracks)))
     def find(x):
         while parent[x]!=x: parent[x]=parent[parent[x]]; x=parent[x]
@@ -281,7 +313,7 @@ def main():
             if A["frames"] & B["frames"]:           # 공존: 마스크 IoU로 synonym vs 접촉 구분
                 if mask_iou_shared(A,B)>args.iou_th:
                     union(i,j); n_syn+=1
-            else:                                   # 시간 배타: 같은 위치=같은 객체(re-id)
+            else:                                   # 시간 배타(다른 window 포함): 같은 위치=같은 객체(re-id)
                 if j3>args.reid_th:
                     union(i,j); n_reid+=1
     groups=defaultdict(list)
@@ -298,7 +330,7 @@ def main():
             for stem,msk in t["masks"].items():
                 masks[stem]=(masks[stem]|msk) if stem in masks else msk
         if concepts.most_common(1)[0][0] in excl: continue
-        if len(masks)<args.min_track: continue
+        if len(masks)<args.min_track: continue      # ★최종 필터: 병합된 객체의 전체 관측 프레임 수
         objs.append(dict(masks=masks,sig=sig,concepts=concepts))
     objs.sort(key=lambda o:-len(o["masks"]))
     print(f"구조물 제외+min_track 후 유효 객체: {len(objs)}")
@@ -316,8 +348,8 @@ def main():
         print(f"  obj{gid}: frames={len(o['masks'])} init_pts={len(pts)} "
               f"concept~{o['concepts'].most_common(1)[0][0]}")
     print(f"저장: {args.out_root}/<gid>/<stem>.png + points3d.ply")
-    print("판정(v2): depth-dense sig — 배경(벽/바닥) 제거 → purity↑, re-id 정밀↑. "
-          "공존 제약으로 인접 distinct 보호.")
+    print("판정(v2.1): window 세션 분할로 프레임 축 메모리 상한 고정. "
+          "3D voxel unification 이 window 경계 동일 객체를 re-id로 재결합.")
 
 
 if __name__=="__main__":
