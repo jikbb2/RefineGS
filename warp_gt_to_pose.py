@@ -116,8 +116,21 @@ def main():
     ap.add_argument("--depth_scale", type=float, default=6553.5)
     ap.add_argument("--k_nearest", type=int, default=6)
     ap.add_argument("--src_stride", type=int, default=1, help="src 픽셀 stride(속도). 1=full(권장)")
+    ap.add_argument("--scene_mesh", default="",
+                    help="장면(방) 메쉬(예 base fuse_cropped.ply). 지정 시 weight=3단계 학습weight: "
+                         "255=관측(실색), 128=미관측 실제표면(See3D 대상, 0.5), 0=frustum-밖(void, 제외). "
+                         "미지정 시 weight=hole(구식).")
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
+
+    # scene raycast (frustum-밖 vs 미관측표면 구분)
+    rc_scene = None
+    if a.scene_mesh and os.path.exists(a.scene_mesh):
+        import open3d as o3d
+        _m = o3d.io.read_triangle_mesh(a.scene_mesh)
+        rc_scene = o3d.t.geometry.RaycastingScene()
+        rc_scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(_m))
+        print(f"scene raycast on {a.scene_mesh} → 3단계 weight")
 
     cams = read_colmap(a.colmap)
     # GT 이미지/depth 있는 프레임만
@@ -177,12 +190,31 @@ def main():
             color[flat] = cc
             zbuf[flat] = np.minimum(zbuf[flat], zz)
 
-        filled = zbuf < np.inf
+        filled = (zbuf < np.inf).reshape(H, W)
         view = color.reshape(H, W, 3).astype(np.uint8)
-        hole = (~filled).reshape(H, W)
         Image.fromarray(view).save(os.path.join(a.out, f"view_{i:04d}.jpg"), quality=95)
-        Image.fromarray((hole*255).astype(np.uint8)).save(os.path.join(a.out, f"weight_{i:04d}.png"))
-        print(f"[{i:04d}] filled {filled.mean():.3f}  hole {hole.mean():.3f}")
+
+        if rc_scene is not None:
+            # per-pixel ray → 장면 메쉬에 닿나? (닿음=실제표면, 놓침=frustum-밖 void)
+            import open3d as o3d
+            uu, vv = np.meshgrid(np.arange(W), np.arange(H))
+            dc = np.stack([(uu-cxt)/fxt, (vv-cyt)/fyt, np.ones_like(uu, float)], -1).reshape(-1, 3)
+            Rc2w = Rt.T; cc = (-Rt.T @ tt).astype(np.float32)
+            dw = dc @ Rc2w.T
+            dw /= (np.linalg.norm(dw, axis=1, keepdims=True) + 1e-9)
+            rays = np.concatenate([np.broadcast_to(cc, dw.shape), dw], 1).astype(np.float32)
+            thit = rc_scene.cast_rays(o3d.core.Tensor(rays))["t_hit"].numpy()
+            scene_hit = np.isfinite(thit).reshape(H, W)
+            w = np.zeros((H, W), np.uint8)
+            w[filled] = 255                                    # 관측 실색 → 1.0
+            w[(~filled) & scene_hit] = 128                     # 미관측 실제표면 → See3D, 0.5
+            # (~filled & ~scene_hit) = frustum-밖 void → 0 (학습 제외)
+            Image.fromarray(w).save(os.path.join(a.out, f"weight_{i:04d}.png"))
+            print(f"[{i:04d}] known {filled.mean():.3f}  미관측표면 {((~filled)&scene_hit).mean():.3f}  frustum밖 {((~filled)&~scene_hit).mean():.3f}")
+        else:
+            hole = ~filled
+            Image.fromarray((hole*255).astype(np.uint8)).save(os.path.join(a.out, f"weight_{i:04d}.png"))
+            print(f"[{i:04d}] filled {filled.mean():.3f}  hole {hole.mean():.3f}")
 
     shutil.copy(a.poses, os.path.join(a.out, "poses.npz"))
     print(f"\n→ {a.out} (view=GT-warp, weight=hole, poses.npz).")
