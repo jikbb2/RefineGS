@@ -268,6 +268,7 @@ def main():
                         if m.mean()<args.min_area: continue
                         dd=byid.setdefault(int(oid),{"masks":{},"score":0.0})
                         dd["masks"][stem]=m>0; dd["score"]=max(dd["score"],float(probs[k]))
+                kept=0
                 for oid,dd in byid.items():
                     if len(dd["masks"])<mt_track: continue        # window: 완화(1)
                     # ★ depth-dense sig (배경 제거) ★
@@ -275,7 +276,9 @@ def main():
                     if len(sig)<args.min_sig: continue    # 안정 표면 voxel 부족 → 폐기
                     tracks.append(dict(concept=c,masks=dd["masks"],frames=set(dd["masks"].keys()),
                                        sig=sig,score=dd["score"]))
-                    wtracks+=1
+                    kept+=1; wtracks+=1
+                print(f"  [{c}] SAM3 ids={len(byid)} → valid tracks={kept}"
+                      + (f"  (window {wi+1}/{len(windows)})" if len(windows)>1 else ""))
             # window 세션 해제 → GPU 메모리 반환 (프레임 축 누적 차단)
             predictor.handle_request(dict(type="close_session",session_id=sid))
             gc.collect(); torch.cuda.empty_cache()
