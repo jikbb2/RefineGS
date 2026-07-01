@@ -26,6 +26,7 @@ VOCAB=${VOCAB:-/home/elicer/sam3/vocab.json}
 BPE=${BPE:-/home/elicer/sam3/sam3/assets/bpe_simple_vocab_16e6.txt.gz}
 GT_MESH=${GT_MESH:-/home/elicer/room_0/habitat/mesh_semantic.ply}
 STRIDE=${STRIDE:-2}; NPF=${NPF:-10}; DEDUP=${DEDUP:-0.3}
+WINDOW=${WINDOW:-200} 
 MAX=${MAX:-0}                          # >0이면 관측 많은 상위 MAX개 객체만 학습
 EXCLUDE=${EXCLUDE:-"door,blind,vent,window,wall,floor,ceiling,light switch,thermostat"}
 ITERS=${ITERS:-7000}; LDIST=${LDIST:-300}; LNORM=${LNORM:-0.05}
@@ -40,7 +41,7 @@ if [ "${STAGE}" = "relabel" ]; then
   echo "=== [1] SAM3 video re-labeling (sam3 env) ==="
   python ${SR} \
     --frames ${FRAMES} --img_ext ${IMG_EXT} --colmap_dir ${SCENE_COLMAP} \
-    --vocab_json ${VOCAB} --bpe ${BPE} --stride ${STRIDE} \
+    --vocab_json ${VOCAB} --bpe ${BPE} --stride ${STRIDE} --window ${WINDOW}\
     --prompt_frame ${PROMPT_FRAME:-0} --min_area 0.003 --min_track 3 \
     --reid_th ${REID:-0.3} --iou_th ${IOU:-0.5} --cand_th ${CAND:-0.1} \
     --exclude_concepts "${EXCLUDE}" --out_root ${RELABEL}
