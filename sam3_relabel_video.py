@@ -8,32 +8,38 @@
   2) 3D signature(sig) = ★GT-depth dense back-projection★ (v2 변경):
      - 마스크 픽셀을 GT depth로 역투영 → 객체 *앞면 실제 표면점*만 → 배경(벽/바닥) 원천 제거.
      - voxel 해시 + multi-view consistency(여러 프레임에서 일관되게 찍힌 voxel만) → 노이즈 제거.
-     - 이전 v1은 sparse COLMAP points3D를 마스크에 투영해서 ray 상 배경(벽/바닥)이 새어들어와
-       purity를 떨어뜨리고 re-id 병합을 거칠게 만들었음 → dense depth로 교체.
   3) instance unification = '비디오 고유 신호' 기반(임계 의존 최소):
-     - 같은 concept: 두 track이 *같은 프레임에 공존(co-occur)*하면 DISTINCT (하드 제약, 임계 없음).
+     - 같은 concept: 두 track이 *같은 프레임에 공존(co-occur)*하면 mask IoU로 synonym/distinct 판별.
        *시간적으로 배타적*이고 3D footprint(voxel)가 겹치면 → re-identification 병합.
-     - 다른 concept(cushion/pillow 등): 3D 겹침이 크면 같은 객체로 병합(synonym).
-  4) 구조물 concept 제외 + min_track 필터. (작은 객체 coverage: --min_area/--min_track 완화)
+  4) 구조물 concept 제외 + min_track 필터.
 
 ★ v2.1 메모리 패치: --window N ★
-  SAM3 propagate 는 한 concept당 비디오 *전체* 프레임을 스트리밍하며 프레임별 버퍼를 GPU에 누적한다.
-  stride 를 낮춰(dense) 프레임 수가 늘면 CUDACachingAllocator/NVML assert(=OOM)로 죽는다.
-  --window N 을 주면 프레임을 N개 단위 window로 잘라 window마다 세션을 새로 열고 닫아
-  (start_session → 모든 concept propagate → close_session → empty_cache) GPU 메모리 상한을 고정한다.
-  window 경계로 쪼개진 동일 객체는 프레임이 겹치지 않으므로 아래 3D voxel unification 이
-  '시간 배타 → re-id 병합'으로 자동으로 다시 이어붙인다(다운스트림 무변경).
-  --window 0(기본)이면 기존과 동일(전체 한 번).
-  window로 쪼갤 때 per-track min_track 필터는 완화(1)하고, 최종 min_track 은 병합된 객체 단위(아래)로 적용.
+  프레임을 N개 단위 window로 잘라 window마다 세션 start/close + empty_cache.
+  --win_overlap 로 경계 객체 온전 포착.
+
+★ v2.2 패치 (pose-coverage + crash 완화) ★
+  [진단 확정] colmap(sparse/0)이 stride-10 서브셋(예: 2000중 200프레임)만 커버 → dense
+  stride 시 대부분 프레임이 pose 없음. 문제 두 가지:
+    (a) compute_sig 임계 thr=sig_frac×nf 에서 nf가 '전체 마스크 프레임 수'라서, unposed
+        프레임이 증거 없이 임계만 올림 → sig 기아 → min_sig 대량 폐기 (48→11 붕괴의 주인).
+    (b) unposed 프레임 마스크는 downstream train.py도 못 씀 → 밀도 이득이 애초에 없음.
+  수정:
+    1. compute_sig: 분모 nf = cam+depth 유효 프레임 수만 (unposed는 중립).
+    2. 시작 시 cam coverage 출력, --posed_only(기본 ON)로 pose 없는 프레임을 앞단에서 제외.
+       coverage<90%면 경고 — dense pose 확보(make_dense_colmap.py) 전에는 stride를 낮춰도
+       유효 뷰가 늘지 않음을 명시.
+    3. concept 루프마다 empty_cache (window 내 concept 축 누적 완화).
+    4. 실행 예시에서 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True 제거 —
+       NVML_SUCCESS assert(CUDACachingAllocator.cpp) 유발 혐의. 기본 allocator 로 실행 권장.
 
 출력: <out_root>/<gid>/<stem>.png (마스크) + points3d.ply (depth voxel 센터, init) → prepare_folder 입력.
 
 실행 (sam3 env):
-    LD_LIBRARY_PATH= PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    LD_LIBRARY_PATH= \
     python sam3_relabel_video.py \
-        --frames data/replica_room0/images --img_ext .jpg \
-        --colmap_dir data/replica_room0/sparse/0 \
-        --depth_dir data/replica_room0/images --depth_scale 6553.5 \
+        --frames data/replica_room0_v2/images --img_ext .jpg \
+        --colmap_dir data/replica_room0_v2/sparse_dense/0 \
+        --depth_dir data/replica_room0_v2/images --depth_scale 6553.5 \
         --vocab_json /home/elicer/sam3/vocab.json \
         --bpe /home/elicer/sam3/sam3/assets/bpe_simple_vocab_16e6.txt.gz \
         --stride 2 --window 200 --min_area 0.0008 --min_track 2 \
@@ -87,7 +93,7 @@ def _read_txt(d):
         else: fx=fy=pr[0]; cx,cy=pr[1],pr[2]
         cams[cid]=(fx,fy,cx,cy,w,h)
     imgs=[]; L=[l for l in open(os.path.join(d,"images.txt")) if not l.startswith("#")]
-    for i in range(0,len(L),2):
+    for i in range(0,len(L)):
         t=L[i].split()
         if len(t)<10: continue
         q=list(map(float,t[1:5])); tv=np.array(list(map(float,t[5:8])))
@@ -155,13 +161,16 @@ def backproject_voxels(mask, cam, D, vox, max_px, zmin=0.05, zmax=20.0):
     return set(map(tuple, keys.tolist()))
 
 def compute_sig(masks, cams, dcfg, dcache, vox, max_px, sig_frac):
-    """track 의 모든 프레임 마스크 → depth voxel 집계 → multi-view 일관 voxel만 sig."""
-    vcount=Counter()
+    """track 의 모든 프레임 마스크 → depth voxel 집계 → multi-view 일관 voxel만 sig.
+    ★v2.2: 임계 분모 = cam+depth 유효 프레임 수만. unposed 프레임은 증거도 페널티도 아님."""
+    vcount=Counter(); nvalid=0
     for stem,m in masks.items():
-        D=load_depth(stem, dcfg, dcache)
-        for k in backproject_voxels(m, cams.get(stem), D, vox, max_px):
+        cam=cams.get(stem); D=load_depth(stem, dcfg, dcache)
+        if cam is None or D is None: continue
+        nvalid+=1
+        for k in backproject_voxels(m, cam, D, vox, max_px):
             vcount[k]+=1
-    nf=max(len(masks),1); thr=max(2,int(sig_frac*nf))
+    thr=max(2,int(sig_frac*max(nvalid,1)))
     return set(k for k,cnt in vcount.items() if cnt>=thr)
 
 
@@ -176,6 +185,10 @@ def main():
                     help="★프레임을 이 개수 단위 window로 나눠 세션별 처리(0=전체 한 번). GPU 메모리 상한 고정.")
     ap.add_argument("--win_overlap",type=float,default=0.5,
                     help="★window 겹침 비율(0~0.9). 경계/짧은 관측 객체를 한 window에 온전히 담아 누락 방지.")
+    ap.add_argument("--posed_only",action="store_true",default=True,
+                    help="★v2.2: colmap pose 있는 프레임만 사용(기본 ON). unposed 마스크는 sig에도 "
+                         "downstream 학습에도 못 쓰이므로 GPU 낭비.")
+    ap.add_argument("--no_posed_only",dest="posed_only",action="store_false")
     ap.add_argument("--offload_state",action="store_true",default=True,
                     help="★프레임별 state를 CPU로 offload(GPU 메모리 프레임수 무관 평평). 기본 ON.")
     ap.add_argument("--no_offload_state",dest="offload_state",action="store_false")
@@ -196,7 +209,7 @@ def main():
     ap.add_argument("--max_px",type=int,default=3000,help="프레임당 역투영 픽셀 상한(속도)")
     ap.add_argument("--min_sig",type=int,default=8,help="안정 voxel 이보다 적으면 노이즈 track 폐기")
     ap.add_argument("--sig_frac",type=float,default=0.25,
-                    help="voxel 을 객체로 인정할 최소 프레임 비율(multi-view consistency)")
+                    help="voxel 을 객체로 인정할 최소 프레임 비율(multi-view consistency; v2.2: 유효 프레임 기준)")
     ap.add_argument("--reid_th",type=float,default=0.3,help="시간 배타 track re-id 병합 voxel-Jaccard 임계")
     ap.add_argument("--iou_th",type=float,default=0.5,help="공존 프레임 2D 마스크 IoU 임계(이상=synonym/중복 병합)")
     ap.add_argument("--cand_th",type=float,default=0.05,help="voxel-Jaccard 후보 하한")
@@ -214,8 +227,22 @@ def main():
 
     # 전역 프레임 리스트 (stride 적용) — window 로 나눠 세션별 처리
     src=sorted(glob.glob(os.path.join(args.frames,f"*{args.img_ext}")))[::args.stride]
-    N=len(src)
     stems_all=[os.path.splitext(os.path.basename(f))[0] for f in src]
+
+    # ── ★v2.2: cam coverage 진단 + posed-only 필터 ──
+    n_posed=sum(1 for s in stems_all if s in cams)
+    cover=n_posed/max(len(stems_all),1)
+    print(f"★cam coverage: {n_posed}/{len(stems_all)} = {cover:.1%} (colmap={args.colmap_dir})")
+    if cover<0.9:
+        print("★★경고: pose coverage <90% — colmap 이 프레임 서브셋만 커버. dense stride 를 줘도 "
+              "유효 감독 뷰는 posed 프레임 수를 넘지 못함. make_dense_colmap.py 로 dense pose 생성 권장.")
+    if args.posed_only:
+        keep=[i for i,s in enumerate(stems_all) if s in cams]
+        if len(keep)<len(stems_all):
+            print(f"★posed_only: {len(stems_all)} → {len(keep)} 프레임 (unposed 제외)")
+        src=[src[i] for i in keep]; stems_all=[stems_all[i] for i in keep]
+    N=len(src)
+
     win = args.window if args.window>0 else N
     win = max(1, min(win, N)) if N else 1
     if N and args.window>0:
@@ -289,6 +316,7 @@ def main():
                     kept+=1; wtracks+=1
                 print(f"  [{c}] SAM3 ids={len(byid)} → valid tracks={kept}"
                       + (f"  (window {wi+1}/{len(windows)})" if len(windows)>1 else ""))
+                torch.cuda.empty_cache()                  # ★v2.2: concept 축 누적 완화
             # window 세션 해제 → GPU 메모리 반환 (프레임 축 누적 차단)
             predictor.handle_request(dict(type="close_session",session_id=sid))
             gc.collect(); torch.cuda.empty_cache()
@@ -299,7 +327,8 @@ def main():
     print(f"\nnative tracks(전 concept·전 window): {len(tracks)}")
 
     # ── co-occurrence 기반 instance unification (union-find) ──
-    #     window 경계로 쪼개진 동일 객체 = 프레임 배타 → voxel-Jaccard re-id 로 자동 재결합.
+    #     overlap window: 같은 객체의 인접-window track 은 프레임을 공유 → mask-IoU(synonym) 경로로 병합.
+    #     non-overlap 경계/재등장: 프레임 배타 → voxel-Jaccard re-id 로 병합.
     parent=list(range(len(tracks)))
     def find(x):
         while parent[x]!=x: parent[x]=parent[parent[x]]; x=parent[x]
@@ -361,8 +390,8 @@ def main():
         print(f"  obj{gid}: frames={len(o['masks'])} init_pts={len(pts)} "
               f"concept~{o['concepts'].most_common(1)[0][0]}")
     print(f"저장: {args.out_root}/<gid>/<stem>.png + points3d.ply")
-    print("판정(v2.1): window 세션 분할로 프레임 축 메모리 상한 고정. "
-          "3D voxel unification 이 window 경계 동일 객체를 re-id로 재결합.")
+    print("판정(v2.2): posed-only + sig 분모 수정 — unposed 프레임의 임계 페널티 제거. "
+          "coverage 경고로 pose 병목 가시화.")
 
 
 if __name__=="__main__":
