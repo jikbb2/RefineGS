@@ -5,7 +5,7 @@
 설계 원리 (probe로 검증: SAM3 concept-video는 streaming detection):
   1) concept당 single-prompt(frame 0) + propagate → SAM3가 비디오 전체에서 인스턴스를
      자동 검출·추적(out_obj_ids). multi-keyframe 재프롬프트 제거(중복 생성 원인 제거).
-  2) 3D signature(sig) = ★GT-depth dense back-projection★ (v2 변경):
+  2) 3D signature(sig) = ★GT-depth dense back-projection★:
      - 마스크 픽셀을 GT depth로 역투영 → 객체 *앞면 실제 표면점*만 → 배경(벽/바닥) 원천 제거.
      - voxel 해시 + multi-view consistency(여러 프레임에서 일관되게 찍힌 voxel만) → 노이즈 제거.
   3) instance unification = '비디오 고유 신호' 기반(임계 의존 최소):
@@ -14,23 +14,25 @@
   4) 구조물 concept 제외 + min_track 필터.
 
 ★ v2.1 메모리 패치: --window N ★
-  프레임을 N개 단위 window로 잘라 window마다 세션 start/close + empty_cache.
+  프레임을 N개 단위 window로 잘라 window마다 세션 start/close + empty_cache (GPU 상한 고정).
   --win_overlap 로 경계 객체 온전 포착.
 
-★ v2.2 패치 (pose-coverage + crash 완화) ★
-  [진단 확정] colmap(sparse/0)이 stride-10 서브셋(예: 2000중 200프레임)만 커버 → dense
-  stride 시 대부분 프레임이 pose 없음. 문제 두 가지:
-    (a) compute_sig 임계 thr=sig_frac×nf 에서 nf가 '전체 마스크 프레임 수'라서, unposed
-        프레임이 증거 없이 임계만 올림 → sig 기아 → min_sig 대량 폐기 (48→11 붕괴의 주인).
-    (b) unposed 프레임 마스크는 downstream train.py도 못 씀 → 밀도 이득이 애초에 없음.
+★ v2.2 패치 (pose-coverage) ★
+  colmap 이 stride-10 서브셋만 커버하던 문제:
+    1. compute_sig: 임계 분모 nf = cam+depth 유효 프레임 수만 (unposed 프레임 중립화).
+    2. cam coverage 출력 + --posed_only(기본 ON).
+    3. concept 루프마다 empty_cache.
+    4. expandable_segments 제거 권장 (NVML assert 혐의).
+
+★ v2.3 패치 (CPU RAM — OOM killer 'Killed' 대응) ★
+  dense pose + v2.2 수정 후 native tracks 가 23 → 500+ 로 정상 회복되자, track 마다
+  full-res bool 마스크를 RAM에 쌓는 구조가 host 메모리를 고갈시킴 (0.8MB/장 × 수만 장).
   수정:
-    1. compute_sig: 분모 nf = cam+depth 유효 프레임 수만 (unposed는 중립).
-    2. 시작 시 cam coverage 출력, --posed_only(기본 ON)로 pose 없는 프레임을 앞단에서 제외.
-       coverage<90%면 경고 — dense pose 확보(make_dense_colmap.py) 전에는 stride를 낮춰도
-       유효 뷰가 늘지 않음을 명시.
-    3. concept 루프마다 empty_cache (window 내 concept 축 누적 완화).
-    4. 실행 예시에서 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True 제거 —
-       NVML_SUCCESS assert(CUDACachingAllocator.cpp) 유발 혐의. 기본 allocator 로 실행 권장.
+    1. 마스크를 np.packbits 압축(bit-pack, 8×↓)으로 저장; 필요 시점에만 unpack.
+       (compute_sig / mask_iou / 그룹 OR / 최종 저장 모두 on-demand unpack)
+    2. propagate 출력을 dict 로 모아두지 않고 스트리밍 즉시 필터+압축 (transient 피크 제거).
+    3. depth 캐시(dcache)를 window 마다 해제 (~3GB 상한 제거).
+    4. window 마다 RSS(GB) 로그 — 다음 병목 조기 발견용.
 
 출력: <out_root>/<gid>/<stem>.png (마스크) + points3d.ply (depth voxel 센터, init) → prepare_folder 입력.
 
@@ -92,9 +94,10 @@ def _read_txt(d):
         if model=="PINHOLE": fx,fy,cx,cy=pr[:4]
         else: fx=fy=pr[0]; cx,cy=pr[1],pr[2]
         cams[cid]=(fx,fy,cx,cy,w,h)
-    imgs=[]; L=[l for l in open(os.path.join(d,"images.txt")) if not l.startswith("#")]
-    for i in range(0,len(L)):
-        t=L[i].split()
+    imgs=[]
+    for ln in open(os.path.join(d,"images.txt")):
+        if ln.startswith("#") or not ln.strip(): continue
+        t=ln.split()
         if len(t)<10: continue
         q=list(map(float,t[1:5])); tv=np.array(list(map(float,t[5:8])))
         imgs.append({"R":_q2r(q),"t":tv,"camera_id":int(t[8]),"name":t[9]})
@@ -127,7 +130,31 @@ def jac(a, b):
     i = len(a & b); return i / (len(a) + len(b) - i)
 
 
-# ── ★ depth-dense 3D signature (v2) ★ ──
+# ── ★ v2.3: bit-packed 마스크 (CPU RAM 8×↓) ★ ──
+def pack_mask(m):
+    """bool HxW → (packed bytes, shape). np.packbits: 0.8MB → ~0.1MB."""
+    m = np.asarray(m, bool)
+    return (np.packbits(m), m.shape)
+
+def unpack_mask(p):
+    b, shape = p
+    return np.unpackbits(b, count=shape[0]*shape[1]).reshape(shape).astype(bool)
+
+def or_masks(p1, p2):
+    """packed OR packed → packed (같은 shape 가정; 다르면 unpack 경로)."""
+    if p1[1] == p2[1] and len(p1[0]) == len(p2[0]):
+        return (np.bitwise_or(p1[0], p2[0]), p1[1])
+    return pack_mask(unpack_mask(p1) | unpack_mask(p2))
+
+def rss_gb():
+    try:
+        for ln in open("/proc/self/status"):
+            if ln.startswith("VmRSS"): return int(ln.split()[1]) / 1048576.0
+    except Exception: pass
+    return float("nan")
+
+
+# ── ★ depth-dense 3D signature ★ ──
 def load_depth(stem, dcfg, cache):
     """stem(frameNNNNNN) → 대응 depth 맵(meters). dcfg=(dir,pfrom,pto,ext,scale). 캐시."""
     if stem in cache: return cache[stem]
@@ -161,14 +188,14 @@ def backproject_voxels(mask, cam, D, vox, max_px, zmin=0.05, zmax=20.0):
     return set(map(tuple, keys.tolist()))
 
 def compute_sig(masks, cams, dcfg, dcache, vox, max_px, sig_frac):
-    """track 의 모든 프레임 마스크 → depth voxel 집계 → multi-view 일관 voxel만 sig.
-    ★v2.2: 임계 분모 = cam+depth 유효 프레임 수만. unposed 프레임은 증거도 페널티도 아님."""
+    """track 의 모든 프레임 마스크(packed) → depth voxel 집계 → multi-view 일관 voxel만 sig.
+    ★v2.2: 임계 분모 = cam+depth 유효 프레임 수만. ★v2.3: on-demand unpack."""
     vcount=Counter(); nvalid=0
-    for stem,m in masks.items():
+    for stem,mp_ in masks.items():
         cam=cams.get(stem); D=load_depth(stem, dcfg, dcache)
         if cam is None or D is None: continue
         nvalid+=1
-        for k in backproject_voxels(m, cam, D, vox, max_px):
+        for k in backproject_voxels(unpack_mask(mp_), cam, D, vox, max_px):
             vcount[k]+=1
     thr=max(2,int(sig_frac*max(nvalid,1)))
     return set(k for k,cnt in vcount.items() if cnt>=thr)
@@ -186,19 +213,18 @@ def main():
     ap.add_argument("--win_overlap",type=float,default=0.5,
                     help="★window 겹침 비율(0~0.9). 경계/짧은 관측 객체를 한 window에 온전히 담아 누락 방지.")
     ap.add_argument("--posed_only",action="store_true",default=True,
-                    help="★v2.2: colmap pose 있는 프레임만 사용(기본 ON). unposed 마스크는 sig에도 "
-                         "downstream 학습에도 못 쓰이므로 GPU 낭비.")
+                    help="★v2.2: colmap pose 있는 프레임만 사용(기본 ON).")
     ap.add_argument("--no_posed_only",dest="posed_only",action="store_false")
     ap.add_argument("--offload_state",action="store_true",default=True,
-                    help="★프레임별 state를 CPU로 offload(GPU 메모리 프레임수 무관 평평). 기본 ON.")
+                    help="★프레임별 state를 CPU로 offload. 기본 ON.")
     ap.add_argument("--no_offload_state",dest="offload_state",action="store_false")
     ap.add_argument("--offload_video",action="store_true",default=True,
                     help="★비디오 프레임 텐서를 CPU로 offload. 기본 ON.")
     ap.add_argument("--no_offload_video",dest="offload_video",action="store_false")
     ap.add_argument("--prompt_frame",type=int,default=0,help="concept를 프롬프트할 window-로컬 프레임 인덱스")
     ap.add_argument("--min_area",type=float,default=0.0008,
-                    help="프레임 마스크 최소 면적(작은 객체 coverage 위해 v1 0.003 → 완화)")
-    ap.add_argument("--min_track",type=int,default=2,help="유효 객체 최소 관측 프레임 수(완화)")
+                    help="프레임 마스크 최소 면적")
+    ap.add_argument("--min_track",type=int,default=2,help="유효 객체 최소 관측 프레임 수")
     # ── depth-dense sig 파라미터 ──
     ap.add_argument("--depth_dir",default=None,help="GT depth 폴더(기본: --frames 와 동일)")
     ap.add_argument("--depth_from",default="frame",help="stem 의 이 접두어를")
@@ -209,7 +235,7 @@ def main():
     ap.add_argument("--max_px",type=int,default=3000,help="프레임당 역투영 픽셀 상한(속도)")
     ap.add_argument("--min_sig",type=int,default=8,help="안정 voxel 이보다 적으면 노이즈 track 폐기")
     ap.add_argument("--sig_frac",type=float,default=0.25,
-                    help="voxel 을 객체로 인정할 최소 프레임 비율(multi-view consistency; v2.2: 유효 프레임 기준)")
+                    help="voxel 을 객체로 인정할 최소 프레임 비율(유효 프레임 기준)")
     ap.add_argument("--reid_th",type=float,default=0.3,help="시간 배타 track re-id 병합 voxel-Jaccard 임계")
     ap.add_argument("--iou_th",type=float,default=0.5,help="공존 프레임 2D 마스크 IoU 임계(이상=synonym/중복 병합)")
     ap.add_argument("--cand_th",type=float,default=0.05,help="voxel-Jaccard 후보 하한")
@@ -254,7 +280,7 @@ def main():
             windows.append(w)
     else:
         windows=[range(0, N)] if N else []
-    # per-track min_track: window로 쪼갤 땐 완화(1). 최종 필터는 병합 객체 단위(아래 line ~min_track).
+    # per-track min_track: window로 쪼갤 땐 완화(1). 최종 필터는 병합 객체 단위(아래).
     mt_track = 1 if args.window>0 else args.min_track
     print(f"frames={N}  window={win}  n_windows={len(windows)}  (single-prompt @local frame {args.prompt_frame}, streaming)")
 
@@ -271,12 +297,6 @@ def main():
                   if args.bpe else build_sam3_video_predictor(gpus_to_use=range(torch.cuda.device_count()))
     except TypeError:
         predictor=build_sam3_video_predictor(gpus_to_use=range(torch.cuda.device_count()))
-
-    def propagate(sid):
-        out={}
-        for r in predictor.handle_stream_request(dict(type="propagate_in_video",session_id=sid)):
-            out[r["frame_index"]]=r["outputs"]
-        return out
 
     # ── window별 세션 → concept별 single-prompt streaming → track 수집 ──
     tracks=[]
@@ -295,20 +315,20 @@ def main():
             for c in VOCAB:
                 predictor.handle_request(dict(type="reset_session",session_id=sid))
                 predictor.handle_request(dict(type="add_prompt",session_id=sid,frame_index=pf,text=c))
-                opf=propagate(sid)
+                # ★v2.3: propagate 스트림을 모아두지 않고 즉시 필터 + bit-pack
                 byid={}
-                for fidx,o in opf.items():
-                    stem=local2stem[fidx]; ids=np.asarray(o["out_obj_ids"]).reshape(-1)
+                for r in predictor.handle_stream_request(dict(type="propagate_in_video",session_id=sid)):
+                    o=r["outputs"]; stem=local2stem[r["frame_index"]]
+                    ids=np.asarray(o["out_obj_ids"]).reshape(-1)
                     masks=np.asarray(o["out_binary_masks"]); probs=np.asarray(o["out_probs"]).reshape(-1)
                     for k,oid in enumerate(ids):
                         m=masks[k]
                         if m.mean()<args.min_area: continue
                         dd=byid.setdefault(int(oid),{"masks":{},"score":0.0})
-                        dd["masks"][stem]=m>0; dd["score"]=max(dd["score"],float(probs[k]))
+                        dd["masks"][stem]=pack_mask(m>0); dd["score"]=max(dd["score"],float(probs[k]))
                 kept=0
                 for oid,dd in byid.items():
                     if len(dd["masks"])<mt_track: continue        # window: 완화(1)
-                    # ★ depth-dense sig (배경 제거) ★
                     sig=compute_sig(dd["masks"],cams,dcfg,dcache,args.vox,args.max_px,args.sig_frac)
                     if len(sig)<args.min_sig: continue    # 안정 표면 voxel 부족 → 폐기
                     tracks.append(dict(concept=c,masks=dd["masks"],frames=set(dd["masks"].keys()),
@@ -316,19 +336,20 @@ def main():
                     kept+=1; wtracks+=1
                 print(f"  [{c}] SAM3 ids={len(byid)} → valid tracks={kept}"
                       + (f"  (window {wi+1}/{len(windows)})" if len(windows)>1 else ""))
+                del byid
                 torch.cuda.empty_cache()                  # ★v2.2: concept 축 누적 완화
-            # window 세션 해제 → GPU 메모리 반환 (프레임 축 누적 차단)
+            # window 세션 해제 → GPU 메모리 반환 + ★v2.3: depth 캐시/RSS 관리
             predictor.handle_request(dict(type="close_session",session_id=sid))
-            gc.collect(); torch.cuda.empty_cache()
+            dcache.clear(); gc.collect(); torch.cuda.empty_cache()
             print(f"  [window {wi+1}/{len(windows)}] frames {wr.start}..{wr.stop-1}  "
-                  f"new tracks={wtracks}  total={len(tracks)}")
+                  f"new tracks={wtracks}  total={len(tracks)}  RSS={rss_gb():.1f}GB")
     try: predictor.shutdown()
     except Exception: pass
-    print(f"\nnative tracks(전 concept·전 window): {len(tracks)}")
+    print(f"\nnative tracks(전 concept·전 window): {len(tracks)}  RSS={rss_gb():.1f}GB")
 
     # ── co-occurrence 기반 instance unification (union-find) ──
-    #     overlap window: 같은 객체의 인접-window track 은 프레임을 공유 → mask-IoU(synonym) 경로로 병합.
-    #     non-overlap 경계/재등장: 프레임 배타 → voxel-Jaccard re-id 로 병합.
+    #     overlap window: 같은 객체의 인접-window track 은 프레임 공유 → mask-IoU(synonym) 경로.
+    #     non-overlap 경계/재등장: 프레임 배타 → voxel-Jaccard re-id 경로.
     parent=list(range(len(tracks)))
     def find(x):
         while parent[x]!=x: parent[x]=parent[parent[x]]; x=parent[x]
@@ -341,7 +362,7 @@ def main():
         if len(sh)>maxf: sh=[sh[k] for k in np.linspace(0,len(sh)-1,maxf).astype(int)]
         v=[]
         for s in sh:
-            a=A["masks"][s]; b=B["masks"][s]
+            a=unpack_mask(A["masks"][s]); b=unpack_mask(B["masks"][s])
             inter=int(np.logical_and(a,b).sum()); uni=int(np.logical_or(a,b).sum())
             v.append(inter/uni if uni else 0.0)
         return float(np.mean(v))
@@ -362,15 +383,15 @@ def main():
     for i in range(len(tracks)): groups[find(i)].append(i)
     print(f"unification: synonym/dup 병합={n_syn}, re-id 병합={n_reid} → 그룹 {len(groups)}")
 
-    # ── 그룹 → 객체 (masks OR, sig union, concept 다수결) ──
+    # ── 그룹 → 객체 (masks OR — packed 상태 유지, sig union, concept 다수결) ──
     excl={c.strip() for c in args.exclude_concepts.split(",") if c.strip()}
     objs=[]
     for members in groups.values():
         masks={}; sig=set(); concepts=Counter()
         for mi in members:
             t=tracks[mi]; sig|=t["sig"]; concepts[t["concept"]]+=1
-            for stem,msk in t["masks"].items():
-                masks[stem]=(masks[stem]|msk) if stem in masks else msk
+            for stem,mp_ in t["masks"].items():
+                masks[stem]=or_masks(masks[stem],mp_) if stem in masks else mp_
         if concepts.most_common(1)[0][0] in excl: continue
         if len(masks)<args.min_track: continue      # ★최종 필터: 병합된 객체의 전체 관측 프레임 수
         objs.append(dict(masks=masks,sig=sig,concepts=concepts))
@@ -380,7 +401,8 @@ def main():
     # ── 저장 (sig voxel-key → 센터 점) ──
     for gid,o in enumerate(objs):
         od=os.path.join(args.out_root,str(gid)); os.makedirs(od,exist_ok=True)
-        for stem,m in o["masks"].items():
+        for stem,mp_ in o["masks"].items():
+            m=unpack_mask(mp_)
             Image.fromarray((m*255).astype(np.uint8)).save(os.path.join(od,f"{stem}.png"))
         if o["sig"]:
             pts=(np.array(sorted(o["sig"]),dtype=np.float64)+0.5)*args.vox
@@ -390,8 +412,8 @@ def main():
         print(f"  obj{gid}: frames={len(o['masks'])} init_pts={len(pts)} "
               f"concept~{o['concepts'].most_common(1)[0][0]}")
     print(f"저장: {args.out_root}/<gid>/<stem>.png + points3d.ply")
-    print("판정(v2.2): posed-only + sig 분모 수정 — unposed 프레임의 임계 페널티 제거. "
-          "coverage 경고로 pose 병목 가시화.")
+    print("판정(v2.3): bit-packed 마스크 + 스트리밍 수집 + dcache 해제 — host RAM 상한 8×↓. "
+          "RSS 로그로 잔여 병목 감시.")
 
 
 if __name__=="__main__":
