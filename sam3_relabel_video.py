@@ -174,6 +174,8 @@ def main():
     ap.add_argument("--stride",type=int,default=10,help="SAM3 propagate 프레임 subsample(메모리/속도)")
     ap.add_argument("--window",type=int,default=0,
                     help="★프레임을 이 개수 단위 window로 나눠 세션별 처리(0=전체 한 번). GPU 메모리 상한 고정.")
+    ap.add_argument("--win_overlap",type=float,default=0.5,
+                    help="★window 겹침 비율(0~0.9). 경계/짧은 관측 객체를 한 window에 온전히 담아 누락 방지.")
     ap.add_argument("--offload_state",action="store_true",default=True,
                     help="★프레임별 state를 CPU로 offload(GPU 메모리 프레임수 무관 평평). 기본 ON.")
     ap.add_argument("--no_offload_state",dest="offload_state",action="store_false")
@@ -216,7 +218,15 @@ def main():
     stems_all=[os.path.splitext(os.path.basename(f))[0] for f in src]
     win = args.window if args.window>0 else N
     win = max(1, min(win, N)) if N else 1
-    windows=[range(s, min(s+win, N)) for s in range(0, N, win)] if N else []
+    if N and args.window>0:
+        step=max(1,int(round(win*(1.0-max(0.0,min(0.9,args.win_overlap))))))   # overlap → 경계 객체 온전 포착
+        windows=[]
+        for s in range(0, N, step):
+            w=range(s, min(s+win, N))
+            if windows and w.stop<=windows[-1].stop: break                     # 끝 도달 → 중복 window 방지
+            windows.append(w)
+    else:
+        windows=[range(0, N)] if N else []
     # per-track min_track: window로 쪼갤 땐 완화(1). 최종 필터는 병합 객체 단위(아래 line ~min_track).
     mt_track = 1 if args.window>0 else args.min_track
     print(f"frames={N}  window={win}  n_windows={len(windows)}  (single-prompt @local frame {args.prompt_frame}, streaming)")
