@@ -10,7 +10,7 @@ watertight 메쉬를 뽑는다. 파이프라인:
   3) 정렬된 oriented point cloud에 IGR SDF(MLP) 피팅 (manifold+normal+eikonal+signed off-surface)
   4) 그리드 SDF 평가 → '관측된 복셀만' 마스킹(미관측 빈 공간의 박스 제거, 작은 구멍은 보간 채움)
      → marching cubes(zero level set)
-  5) utils.mesh_utils.post_process_mesh 로 num_cluster 후처리(기존 TSDF 경로와 동일)
+  5) safe_post_process_mesh 로 num_cluster 후처리(기존 TSDF 경로와 동일 로직 + 클램프)
 
 RefineGS repo 루트(render.py 옆)에 두고 실행:
 
@@ -23,9 +23,10 @@ RefineGS repo 루트(render.py 옆)에 두고 실행:
   #   --depth_ratio, --depth_trunc  : render()/back-project에 그대로 사용
   #   --voxel_size                  : marching cubes 그리드 해상도 산출(2*scale/voxel_size)
   #   --sdf_trunc                   : (참고) — SDF 경로에선 미사용. 마스킹은 --mask_dist로 제어
-  #   --num_cluster                 : post_process_mesh 그대로 재사용
+  #   --num_cluster                 : safe_post_process_mesh 로 재사용(클러스터 수 클램프)
 """
 import os
+import copy
 import numpy as np
 import torch
 import torch.nn as nn
@@ -34,7 +35,6 @@ from argparse import ArgumentParser
 from scene import Scene
 from gaussian_renderer import render, GaussianModel
 from arguments import ModelParams, PipelineParams, get_combined_args
-from utils.mesh_utils import post_process_mesh
 import open3d as o3d
 
 
@@ -51,6 +51,30 @@ def cam_intrinsics(cam):
     cx, cy = intrins[0, 2].item(), intrins[1, 2].item()
     extrinsic = cam.world_view_transform.T  # world->camera (w2c), CV 규약(+Z forward)
     return fx, fy, cx, cy, W, H, extrinsic
+
+
+# ---------------------------------------------------------------------------
+# utils.mesh_utils.post_process_mesh 의 안전 버전.
+# 원본은 sorted[-cluster_to_keep] 인덱싱이라 연결성분 수 < num_cluster 이면
+# IndexError 발생(깨끗한 SDF 메쉬에서 실제로 터짐). 클러스터 수로 클램프한다.
+# ---------------------------------------------------------------------------
+def safe_post_process_mesh(mesh, cluster_to_keep=1000):
+    print(f"post processing the mesh to have {cluster_to_keep} clusters (clamped)")
+    mesh_0 = copy.deepcopy(mesh)
+    with o3d.utility.VerbosityContextManager(o3d.utility.VerbosityLevel.Debug) as cm:
+        triangle_clusters, cluster_n_triangles, cluster_area = mesh_0.cluster_connected_triangles()
+    triangle_clusters = np.asarray(triangle_clusters)
+    cluster_n_triangles = np.asarray(cluster_n_triangles)
+    keep = min(cluster_to_keep, len(cluster_n_triangles))  # ← 클램프 (원본 버그 수정)
+    n_cluster = np.sort(cluster_n_triangles.copy())[-keep]
+    n_cluster = max(n_cluster, 50)  # filter meshes smaller than 50
+    triangles_to_remove = cluster_n_triangles[triangle_clusters] < n_cluster
+    mesh_0.remove_triangles_by_mask(triangles_to_remove)
+    mesh_0.remove_unreferenced_vertices()
+    mesh_0.remove_degenerate_triangles()
+    print("num vertices raw {}".format(len(mesh.vertices)))
+    print("num vertices post {}".format(len(mesh_0.vertices)))
+    return mesh_0
 
 
 # ---------------------------------------------------------------------------
@@ -197,7 +221,7 @@ def main():
     parser.add_argument("--depth_trunc", default=6.0, type=float, help="최대 depth (back-project cutoff)")
     parser.add_argument("--voxel_size", default=0.01, type=float, help="marching cubes 복셀 크기(그리드 산출)")
     parser.add_argument("--sdf_trunc", default=0.04, type=float, help="(참고, SDF 경로 미사용)")
-    parser.add_argument("--num_cluster", default=10000, type=int, help="post_process_mesh 유지 클러스터 수")
+    parser.add_argument("--num_cluster", default=10000, type=int, help="post-process 유지 클러스터 수(클램프됨)")
     # SDF 관련
     parser.add_argument("--alpha_thr", default=0.5, type=float, help="이하 alpha 픽셀 제거(배경/floater)")
     parser.add_argument("--pts_per_view", default=40000, type=int)
@@ -274,7 +298,7 @@ def main():
     _, ni = cKDTree(P).query(verts)
     vcol = np.clip(C[ni], 0, 1)
 
-    # 5) o3d 메쉬 + post_process_mesh(num_cluster) — TSDF 경로와 동일한 후처리
+    # 5) o3d 메쉬 + safe_post_process_mesh(num_cluster) — TSDF 경로와 동일 로직(클램프 추가)
     mesh = o3d.geometry.TriangleMesh()
     mesh.vertices = o3d.utility.Vector3dVector(verts)
     mesh.triangles = o3d.utility.Vector3iVector(faces)
@@ -290,7 +314,7 @@ def main():
     o3d.io.write_triangle_mesh(out, mesh)
     print(f"mesh saved at {out}  verts {len(verts)} faces {len(faces)}")
 
-    mesh_post = post_process_mesh(mesh, cluster_to_keep=args.num_cluster)
+    mesh_post = safe_post_process_mesh(mesh, cluster_to_keep=args.num_cluster)
     out_post = out.replace(".ply", "_post.ply")
     o3d.io.write_triangle_mesh(out_post, mesh_post)
     print(f"mesh post processed saved at {out_post}")
