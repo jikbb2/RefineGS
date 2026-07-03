@@ -216,7 +216,7 @@ def collect_oriented_points(scene, gaussians, pipe, background, args, mask_dir=N
 
         # 빈 광선 수집: alpha≈0 픽셀 = "이 광선 위엔 아무것도 없음"이 관측된 것
         if args.empty_per_view > 0:
-            em = alpha < 0.1
+            em = alpha < args.empty_alpha
             eidx = em.nonzero(as_tuple=False)
             if len(eidx) > 0:
                 sel_e = eidx[torch.randperm(len(eidx), device="cuda")[:args.empty_per_view]]
@@ -335,6 +335,8 @@ def main():
     parser.add_argument("--w_empty", default=1.0, type=float,
                         help="empty-ray carving 가중치(0=off). alpha≈0 광선의 bbox 통과 구간 SDF≥0 — 진짜 구멍 보존/부풀림 제거")
     parser.add_argument("--empty_per_view", default=4096, type=int)
+    parser.add_argument("--empty_alpha", default=0.1, type=float,
+                        help="이 alpha 미만 픽셀을 빈 광선으로 간주. junk가 alpha를 깔면 0.3~0.5로 완화")
     parser.add_argument("--offsurf_delta", default=0.01, type=float, help="정규화 좌표 기준 off-surface 오프셋")
     parser.add_argument("--grid", default=0, type=int, help="marching cubes 해상도(0=voxel_size로 산출)")
     parser.add_argument("--max_grid", default=512, type=int)
@@ -402,6 +404,8 @@ def main():
     if len(EOn):
         t0 = -(EOn * ED).sum(-1)
         dmin = np.linalg.norm(EOn + ED * t0[:, None], axis=-1)
+        print(f"empty ray 진단: t0(전방거리) 중앙값 {np.median(t0):.2f} (양수여야 정상), "
+              f"dmin(중심 최근접) min/중앙값 {dmin.min():.2f}/{np.median(dmin):.2f} (단위=정규화, bbox≈1)")
         keep_e = (t0 > 0) & (dmin < 1.2)             # 객체 bbox 근처를 실제로 지나는 광선만
         EOn, ED = EOn[keep_e], ED[keep_e]
         print(f"empty ray 필터: {int(keep_e.sum())}/{len(keep_e)} 유지 (bbox 관통 광선)")
