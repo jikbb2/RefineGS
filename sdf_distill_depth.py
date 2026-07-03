@@ -128,11 +128,25 @@ def grad(y, x):
 
 
 # ---------------------------------------------------------------------------
+def load_view_mask(mask_dir, image_name, H, W):
+    """뷰별 객체 마스크 로드(없으면 None). data/<scene>/masks/<gid>/masks/<stem>.png 규약."""
+    from PIL import Image
+    stem = os.path.splitext(image_name)[0]
+    for ext in (".png", ".jpg", ".jpeg", ".JPG", ".PNG"):
+        p = os.path.join(mask_dir, stem + ext)
+        if os.path.exists(p):
+            m = Image.open(p).convert("L").resize((W, H), Image.NEAREST)
+            return torch.from_numpy(np.array(m) > 127).cuda()
+    return None
+
+
 @torch.no_grad()
-def collect_oriented_points(scene, gaussians, pipe, background, args):
-    """뷰별 depth를 월드 점군으로 back-project. 법선은 카메라 방향으로 정렬."""
+def collect_oriented_points(scene, gaussians, pipe, background, args, mask_dir=None):
+    """뷰별 depth를 월드 점군으로 back-project. 법선은 카메라 방향으로 정렬.
+    mask_dir가 있으면 객체 마스크 밖 픽셀은 back-project에서 제외(TSDF 경로와 동일 철학)."""
     views = scene.getTrainCameras()
     P_all, N_all, C_all = [], [], []
+    n_masked_views = 0
     for cam in views:
         pkg = render(cam, gaussians, pipe, background)
         depth = pkg["surf_depth"][0]                      # [H,W]
@@ -153,6 +167,11 @@ def collect_oriented_points(scene, gaussians, pipe, background, args):
         pts_w = pts_cam @ c2w[:3, :3].T + cam_center      # [H,W,3] world
 
         valid = (depth > 0) & (depth < args.depth_trunc) & (alpha > args.alpha_thr)
+        if mask_dir is not None:
+            m = load_view_mask(mask_dir, cam.image_name, H, W)
+            if m is not None:
+                valid &= m
+                n_masked_views += 1
         pts_w = pts_w[valid]
         n = nrm[valid]
         c = rgb[valid].clamp(0, 1)
@@ -169,6 +188,8 @@ def collect_oriented_points(scene, gaussians, pipe, background, args):
 
         P_all.append(pts_w.cpu()); N_all.append(n.cpu()); C_all.append(c.cpu())
 
+    if mask_dir is not None:
+        print(f"객체 마스크 적용: {n_masked_views}/{len(views)} 뷰 (경로 {mask_dir})")
     P = torch.cat(P_all).numpy().astype(np.float64)
     N = torch.cat(N_all).numpy().astype(np.float64)
     C = torch.cat(C_all).numpy().astype(np.float64)
@@ -242,6 +263,8 @@ def main():
     parser.add_argument("--roi_mesh", default="", type=str,
                         help="관측 anchor mesh(예: TSDF fuse_post.ply). 이 mesh에서 roi_dist 밖 점은 SDF 입력에서 제외")
     parser.add_argument("--roi_dist", default=0.15, type=float)
+    parser.add_argument("--mask_dir", default="auto", type=str,
+                        help="뷰별 객체 마스크 폴더. 'auto'=<source_path>/masks (있으면 사용), ''=사용 안 함")
     parser.add_argument("--out", default="", type=str)
     args = get_combined_args(parser)
 
@@ -253,9 +276,15 @@ def main():
     bg = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg, dtype=torch.float32, device="cuda")
 
-    # 1) oriented point cloud
+    # 1) oriented point cloud (객체 마스크 밖 픽셀 제외 — TSDF 경로와 동일)
+    mask_dir = None
+    if args.mask_dir == "auto":
+        cand = os.path.join(dataset.source_path, "masks")
+        mask_dir = cand if os.path.isdir(cand) else None
+    elif args.mask_dir:
+        mask_dir = args.mask_dir
     print("뷰별 depth back-project + 법선 정렬 ...")
-    P, N, C = collect_oriented_points(scene, gaussians, pipe, background, args)
+    P, N, C = collect_oriented_points(scene, gaussians, pipe, background, args, mask_dir=mask_dir)
     print(f"표면점 {len(P)} (관측 back-projected)")
 
     # 1b) ROI crop — 신뢰 가능한 관측 mesh(TSDF fuse_post 등) 근방 점만 유지.
