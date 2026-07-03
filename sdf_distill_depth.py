@@ -237,7 +237,11 @@ def main():
     parser.add_argument("--grid", default=0, type=int, help="marching cubes 해상도(0=voxel_size로 산출)")
     parser.add_argument("--max_grid", default=512, type=int)
     parser.add_argument("--mask_dist", default=0.10, type=float,
-                        help="메쉬 정점이 관측 점군에서 이 거리(world) 초과면 제거(0=off) — 박스 제거 vs 구멍채움 균형")
+                        help="메쉬 정점이 관측 점군에서 이 거리(world) 초과면 제거(0=off) — 박스 제거 vs 구멍채움 균형. "
+                             "unseen 완성(측면/뒷면 보간)을 보존하려면 ROI crop과 함께 0 또는 크게")
+    parser.add_argument("--roi_mesh", default="", type=str,
+                        help="관측 anchor mesh(예: TSDF fuse_post.ply). 이 mesh에서 roi_dist 밖 점은 SDF 입력에서 제외")
+    parser.add_argument("--roi_dist", default=0.15, type=float)
     parser.add_argument("--out", default="", type=str)
     args = get_combined_args(parser)
 
@@ -253,6 +257,19 @@ def main():
     print("뷰별 depth back-project + 법선 정렬 ...")
     P, N, C = collect_oriented_points(scene, gaussians, pipe, background, args)
     print(f"표면점 {len(P)} (관측 back-projected)")
+
+    # 1b) ROI crop — 신뢰 가능한 관측 mesh(TSDF fuse_post 등) 근방 점만 유지.
+    #     instance 모델의 배경/마스크 경계 junk(검은 노이즈)를 SDF 피팅 전에 제거.
+    if args.roi_mesh:
+        from scipy.spatial import cKDTree as _KD
+        rm = o3d.io.read_triangle_mesh(args.roi_mesh)
+        rv = np.asarray(rm.vertices)
+        assert len(rv) > 0, f"ROI mesh 비어있음: {args.roi_mesh}"
+        d, _ = _KD(rv).query(P, workers=-1)
+        keep = d < args.roi_dist
+        print(f"ROI crop: {int(keep.sum())}/{len(P)} 유지 (dist<{args.roi_dist}, mesh={args.roi_mesh})")
+        P, N, C = P[keep], N[keep], C[keep]
+
     if len(P) > args.n_pts:
         idx = np.random.choice(len(P), args.n_pts, replace=False)
         P, N, C = P[idx], N[idx], C[idx]
