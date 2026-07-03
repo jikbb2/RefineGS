@@ -170,6 +170,7 @@ def collect_oriented_points(scene, gaussians, pipe, background, args, mask_dir=N
     mask_dir가 있으면 객체 마스크 밖 픽셀은 back-project에서 제외(TSDF 경로와 동일 철학)."""
     views = scene.getTrainCameras()
     P_all, N_all, C_all, O_all = [], [], [], []
+    EO_all, ED_all = [], []
     n_masked_views = 0
     for cam in views:
         pkg = render(cam, gaussians, pipe, background)
@@ -213,22 +214,40 @@ def collect_oriented_points(scene, gaussians, pipe, background, args, mask_dir=N
         P_all.append(pts_w.cpu()); N_all.append(n.cpu()); C_all.append(c.cpu())
         O_all.append(cam_center[None].expand(len(pts_w), 3).cpu())  # 점별 관측 카메라 중심
 
+        # 빈 광선 수집: alpha≈0 픽셀 = "이 광선 위엔 아무것도 없음"이 관측된 것
+        if args.empty_per_view > 0:
+            em = alpha < 0.1
+            eidx = em.nonzero(as_tuple=False)
+            if len(eidx) > 0:
+                sel_e = eidx[torch.randperm(len(eidx), device="cuda")[:args.empty_per_view]]
+                ve, ue = sel_e[:, 0].float(), sel_e[:, 1].float()
+                de = torch.stack([(ue - cx) / fx, (ve - cy) / fy, torch.ones_like(ue)], -1)
+                de = torch.nn.functional.normalize(de @ c2w[:3, :3].T, dim=-1)
+                EO_all.append(cam_center[None].expand(len(de), 3).cpu())
+                ED_all.append(de.cpu())
+
     if mask_dir is not None:
         print(f"객체 마스크 적용: {n_masked_views}/{len(views)} 뷰 (경로 {mask_dir})")
     P = torch.cat(P_all).numpy().astype(np.float64)
     N = torch.cat(N_all).numpy().astype(np.float64)
     C = torch.cat(C_all).numpy().astype(np.float64)
     O = torch.cat(O_all).numpy().astype(np.float64)
-    return P, N, C, O
+    EO = torch.cat(EO_all).numpy().astype(np.float64) if EO_all else np.zeros((0, 3))
+    ED = torch.cat(ED_all).numpy().astype(np.float64) if ED_all else np.zeros((0, 3))
+    print(f"빈 광선(empty ray) {len(EO)}개 수집")
+    return P, N, C, O, EO, ED
 
 
-def train_sdf(P, N, O, args):
+def train_sdf(P, N, O, EO, ED, args):
     """정규화된 oriented point cloud에 IGR SDF 피팅.
-    O = 점별 관측 카메라 중심(정규화 좌표). free-space 손실(카메라~표면 사이 SDF>0)에 사용."""
+    O = 점별 관측 카메라 중심(정규화 좌표) — 표면 근처 free-space carving.
+    EO/ED = 빈 광선(alpha≈0 픽셀)의 카메라 중심/방향 — empty-ray carving."""
     dev = "cuda"
     Pt = torch.tensor(P, dtype=torch.float32, device=dev)
     Nt = torch.tensor(N, dtype=torch.float32, device=dev)
     Ot = torch.tensor(O, dtype=torch.float32, device=dev)
+    EOt = torch.tensor(EO, dtype=torch.float32, device=dev) if EO is not None and len(EO) else None
+    EDt = torch.tensor(ED, dtype=torch.float32, device=dev) if ED is not None and len(ED) else None
     net = SDFNet(pe_L=args.pe_L).to(dev)
     opt = torch.optim.Adam(net.parameters(), lr=args.lr)
     delta = args.offsurf_delta
@@ -246,13 +265,28 @@ def train_sdf(P, N, O, args):
         pm = (Pt[bi] - delta * nrm)
         l_sign = (net(pp) - delta).abs().mean() + (net(pm) + delta).abs().mean()
 
-        # free-space carving: 카메라 o와 관측점 p 사이 광선 위 점은 빈 공간 → SDF ≥ 0 강제.
-        # TSDF의 truncation-band carving과 같은 정보. 카메라가 통과해 본 공간의 '보자기 막' 제거.
+        # free-space carving (표면 근처): 관측점 p에서 카메라 방향으로 s∈[2δ, free_range] 후퇴한
+        # 점은 빈 공간 → SDF ≥ 0. (bbox 안 표면 근처를 집중 샘플 — 멀리 카메라 쪽은 정보 없음)
         l_free = torch.tensor(0.0, device=dev)
         if args.w_free > 0:
-            t = (torch.rand(args.batch, 1, device=dev) * 0.85 + 0.05)   # 표면 앞 5%~90% 구간
-            xf = Ot[bi] * (1 - t) + Pt[bi] * t
-            l_free = torch.relu(-net(xf)).mean()                         # 음수(내부)만 벌점
+            dirv = Pt[bi] - Ot[bi]
+            dist = dirv.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+            dirn = dirv / dist
+            s = torch.rand(args.batch, 1, device=dev) * (args.free_range - 2 * delta) + 2 * delta
+            s = torch.minimum(s, dist * 0.95)
+            xf = Pt[bi] - dirn * s
+            l_free = torch.relu(-net(xf)).mean()
+
+        # empty-ray carving: 렌더 alpha≈0 픽셀의 광선은 '아무것도 없음'이 관측된 것 →
+        # 광선이 bbox를 지나는 구간 전체 SDF ≥ 0. (진짜 구멍 보존 / 미관측 부풀림 제거)
+        l_empty = torch.tensor(0.0, device=dev)
+        if args.w_empty > 0 and EOt is not None and len(EOt) > 0:
+            bj = torch.randint(0, len(EOt), (args.batch,), device=dev)
+            o, dn = EOt[bj], EDt[bj]
+            t0 = -(o * dn).sum(-1, keepdim=True)                 # 원점(객체 중심) 최근접 파라미터
+            t = (t0 + (torch.rand_like(t0) * 2 - 1) * 1.5).clamp(min=0.05)
+            xe = o + dn * t
+            l_empty = torch.relu(-net(xe)).mean()                         # 음수(내부)만 벌점
 
         # eikonal: 표면 근처 + 균등 랜덤
         rp = torch.cat([Pt[torch.randint(0, len(Pt), (args.batch,), device=dev)]
@@ -262,11 +296,12 @@ def train_sdf(P, N, O, args):
         l_eik = ((ge.norm(dim=-1) - 1) ** 2).mean()
 
         loss = (l_man + args.w_normal * l_nrm + args.w_sign * l_sign
-                + args.w_eik * l_eik + args.w_free * l_free)
+                + args.w_eik * l_eik + args.w_free * l_free + args.w_empty * l_empty)
         opt.zero_grad(); loss.backward(); opt.step()
         if it % 500 == 0:
             print(f"[{it}] man {l_man.item():.4f} nrm {l_nrm.item():.4f} "
-                  f"sign {l_sign.item():.4f} eik {l_eik.item():.4f} free {l_free.item():.4f}")
+                  f"sign {l_sign.item():.4f} eik {l_eik.item():.4f} "
+                  f"free {l_free.item():.4f} empty {l_empty.item():.4f}")
     return net
 
 
@@ -292,7 +327,12 @@ def main():
     parser.add_argument("--w_sign", default=1.0, type=float)
     parser.add_argument("--w_eik", default=0.5, type=float)
     parser.add_argument("--w_free", default=1.0, type=float,
-                        help="free-space carving 가중치(0=off). 카메라~관측점 사이 광선에서 SDF≥0 강제 — unseen '보자기 막' 제거")
+                        help="표면 근처 free-space carving 가중치(0=off)")
+    parser.add_argument("--free_range", default=0.5, type=float,
+                        help="관측점에서 카메라 쪽으로 carve하는 최대 거리(정규화 좌표)")
+    parser.add_argument("--w_empty", default=1.0, type=float,
+                        help="empty-ray carving 가중치(0=off). alpha≈0 광선의 bbox 통과 구간 SDF≥0 — 진짜 구멍 보존/부풀림 제거")
+    parser.add_argument("--empty_per_view", default=4096, type=int)
     parser.add_argument("--offsurf_delta", default=0.01, type=float, help="정규화 좌표 기준 off-surface 오프셋")
     parser.add_argument("--grid", default=0, type=int, help="marching cubes 해상도(0=voxel_size로 산출)")
     parser.add_argument("--max_grid", default=512, type=int)
@@ -323,7 +363,7 @@ def main():
     elif args.mask_dir:
         mask_dir = args.mask_dir
     print("뷰별 depth back-project + 법선 정렬 ...")
-    P, N, C, O = collect_oriented_points(scene, gaussians, pipe, background, args, mask_dir=mask_dir)
+    P, N, C, O, EO, ED = collect_oriented_points(scene, gaussians, pipe, background, args, mask_dir=mask_dir)
     print(f"표면점 {len(P)} (관측 back-projected)")
     if len(P) < 1000:
         raise SystemExit(f"[중단] 유효 표면점 {len(P)}개 — 마스크 값 규약 또는 alpha_thr 확인 필요. "
@@ -356,10 +396,11 @@ def main():
     print(f"robust bbox: outlier {n_drop}점 제거, scale={scale:.3f} world (bbox {np.round(hi-lo,3)})")
     Pn = (P - center) / scale
     On = (O - center) / scale
+    EOn = (EO - center) / scale if len(EO) else EO   # 방향(ED)은 정규화 불변
 
     # 2) SDF 학습
     print("IGR SDF 학습 ...")
-    net = train_sdf(Pn, N, On, args)
+    net = train_sdf(Pn, N, On, EOn, ED, args)
 
     # 3) 그리드 평가
     G = args.grid if args.grid > 0 else int(round(2 * scale / args.voxel_size))
