@@ -278,13 +278,15 @@ def train_sdf(P, N, O, EO, ED, args):
             l_free = torch.relu(-net(xf)).mean()
 
         # empty-ray carving: 렌더 alpha≈0 픽셀의 광선은 '아무것도 없음'이 관측된 것 →
-        # 광선이 bbox를 지나는 구간 전체 SDF ≥ 0. (진짜 구멍 보존 / 미관측 부풀림 제거)
+        # 광선이 반경 1.2 구(=bbox) 를 지나는 chord 구간 안에서만 샘플해 SDF ≥ 0 강제.
         l_empty = torch.tensor(0.0, device=dev)
         if args.w_empty > 0 and EOt is not None and len(EOt) > 0:
             bj = torch.randint(0, len(EOt), (args.batch,), device=dev)
             o, dn = EOt[bj], EDt[bj]
-            t0 = -(o * dn).sum(-1, keepdim=True)                 # 원점(객체 중심) 최근접 파라미터
-            t = (t0 + (torch.rand_like(t0) * 2 - 1) * 1.5).clamp(min=0.05)
+            t0 = -(o * dn).sum(-1, keepdim=True)                 # 원점 최근접 파라미터
+            cp = o + dn * t0
+            half = (1.44 - (cp * cp).sum(-1, keepdim=True)).clamp(min=0.0).sqrt()
+            t = (t0 + (torch.rand_like(t0) * 2 - 1) * half).clamp(min=0.05)
             xe = o + dn * t
             l_empty = torch.relu(-net(xe)).mean()                         # 음수(내부)만 벌점
 
@@ -397,6 +399,12 @@ def main():
     Pn = (P - center) / scale
     On = (O - center) / scale
     EOn = (EO - center) / scale if len(EO) else EO   # 방향(ED)은 정규화 불변
+    if len(EOn):
+        t0 = -(EOn * ED).sum(-1)
+        dmin = np.linalg.norm(EOn + ED * t0[:, None], axis=-1)
+        keep_e = (t0 > 0) & (dmin < 1.2)             # 객체 bbox 근처를 실제로 지나는 광선만
+        EOn, ED = EOn[keep_e], ED[keep_e]
+        print(f"empty ray 필터: {int(keep_e.sum())}/{len(keep_e)} 유지 (bbox 관통 광선)")
 
     # 2) SDF 학습
     print("IGR SDF 학습 ...")
