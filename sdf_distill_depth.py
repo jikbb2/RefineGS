@@ -145,7 +145,7 @@ def collect_oriented_points(scene, gaussians, pipe, background, args, mask_dir=N
     """뷰별 depth를 월드 점군으로 back-project. 법선은 카메라 방향으로 정렬.
     mask_dir가 있으면 객체 마스크 밖 픽셀은 back-project에서 제외(TSDF 경로와 동일 철학)."""
     views = scene.getTrainCameras()
-    P_all, N_all, C_all = [], [], []
+    P_all, N_all, C_all, O_all = [], [], [], []
     n_masked_views = 0
     for cam in views:
         pkg = render(cam, gaussians, pipe, background)
@@ -187,20 +187,24 @@ def collect_oriented_points(scene, gaussians, pipe, background, args, mask_dir=N
             pts_w, n, c = pts_w[sel], n[sel], c[sel]
 
         P_all.append(pts_w.cpu()); N_all.append(n.cpu()); C_all.append(c.cpu())
+        O_all.append(cam_center[None].expand(len(pts_w), 3).cpu())  # 점별 관측 카메라 중심
 
     if mask_dir is not None:
         print(f"객체 마스크 적용: {n_masked_views}/{len(views)} 뷰 (경로 {mask_dir})")
     P = torch.cat(P_all).numpy().astype(np.float64)
     N = torch.cat(N_all).numpy().astype(np.float64)
     C = torch.cat(C_all).numpy().astype(np.float64)
-    return P, N, C
+    O = torch.cat(O_all).numpy().astype(np.float64)
+    return P, N, C, O
 
 
-def train_sdf(P, N, args):
-    """정규화된 oriented point cloud에 IGR SDF 피팅."""
+def train_sdf(P, N, O, args):
+    """정규화된 oriented point cloud에 IGR SDF 피팅.
+    O = 점별 관측 카메라 중심(정규화 좌표). free-space 손실(카메라~표면 사이 SDF>0)에 사용."""
     dev = "cuda"
     Pt = torch.tensor(P, dtype=torch.float32, device=dev)
     Nt = torch.tensor(N, dtype=torch.float32, device=dev)
+    Ot = torch.tensor(O, dtype=torch.float32, device=dev)
     net = SDFNet(pe_L=args.pe_L).to(dev)
     opt = torch.optim.Adam(net.parameters(), lr=args.lr)
     delta = args.offsurf_delta
@@ -218,6 +222,14 @@ def train_sdf(P, N, args):
         pm = (Pt[bi] - delta * nrm)
         l_sign = (net(pp) - delta).abs().mean() + (net(pm) + delta).abs().mean()
 
+        # free-space carving: 카메라 o와 관측점 p 사이 광선 위 점은 빈 공간 → SDF ≥ 0 강제.
+        # TSDF의 truncation-band carving과 같은 정보. 카메라가 통과해 본 공간의 '보자기 막' 제거.
+        l_free = torch.tensor(0.0, device=dev)
+        if args.w_free > 0:
+            t = (torch.rand(args.batch, 1, device=dev) * 0.85 + 0.05)   # 표면 앞 5%~90% 구간
+            xf = Ot[bi] * (1 - t) + Pt[bi] * t
+            l_free = torch.relu(-net(xf)).mean()                         # 음수(내부)만 벌점
+
         # eikonal: 표면 근처 + 균등 랜덤
         rp = torch.cat([Pt[torch.randint(0, len(Pt), (args.batch,), device=dev)]
                         + 0.02 * torch.randn(args.batch, 3, device=dev),
@@ -225,11 +237,12 @@ def train_sdf(P, N, args):
         ge = grad(net(rp), rp)
         l_eik = ((ge.norm(dim=-1) - 1) ** 2).mean()
 
-        loss = l_man + args.w_normal * l_nrm + args.w_sign * l_sign + args.w_eik * l_eik
+        loss = (l_man + args.w_normal * l_nrm + args.w_sign * l_sign
+                + args.w_eik * l_eik + args.w_free * l_free)
         opt.zero_grad(); loss.backward(); opt.step()
         if it % 500 == 0:
             print(f"[{it}] man {l_man.item():.4f} nrm {l_nrm.item():.4f} "
-                  f"sign {l_sign.item():.4f} eik {l_eik.item():.4f}")
+                  f"sign {l_sign.item():.4f} eik {l_eik.item():.4f} free {l_free.item():.4f}")
     return net
 
 
@@ -254,6 +267,8 @@ def main():
     parser.add_argument("--w_normal", default=1.0, type=float)
     parser.add_argument("--w_sign", default=1.0, type=float)
     parser.add_argument("--w_eik", default=0.5, type=float)
+    parser.add_argument("--w_free", default=1.0, type=float,
+                        help="free-space carving 가중치(0=off). 카메라~관측점 사이 광선에서 SDF≥0 강제 — unseen '보자기 막' 제거")
     parser.add_argument("--offsurf_delta", default=0.01, type=float, help="정규화 좌표 기준 off-surface 오프셋")
     parser.add_argument("--grid", default=0, type=int, help="marching cubes 해상도(0=voxel_size로 산출)")
     parser.add_argument("--max_grid", default=512, type=int)
@@ -284,7 +299,7 @@ def main():
     elif args.mask_dir:
         mask_dir = args.mask_dir
     print("뷰별 depth back-project + 법선 정렬 ...")
-    P, N, C = collect_oriented_points(scene, gaussians, pipe, background, args, mask_dir=mask_dir)
+    P, N, C, O = collect_oriented_points(scene, gaussians, pipe, background, args, mask_dir=mask_dir)
     print(f"표면점 {len(P)} (관측 back-projected)")
 
     # 1b) ROI crop — 신뢰 가능한 관측 mesh(TSDF fuse_post 등) 근방 점만 유지.
@@ -297,26 +312,27 @@ def main():
         d, _ = _KD(rv).query(P, workers=-1)
         keep = d < args.roi_dist
         print(f"ROI crop: {int(keep.sum())}/{len(P)} 유지 (dist<{args.roi_dist}, mesh={args.roi_mesh})")
-        P, N, C = P[keep], N[keep], C[keep]
+        P, N, C, O = P[keep], N[keep], C[keep], O[keep]
 
     if len(P) > args.n_pts:
         idx = np.random.choice(len(P), args.n_pts, replace=False)
-        P, N, C = P[idx], N[idx], C[idx]
+        P, N, C, O = P[idx], N[idx], C[idx], O[idx]
 
     # robust 정규화 [-1,1] — floater가 scale을 부풀리지 않도록 percentile bbox 밖 점 제거
     lo = np.percentile(P, 0.5, axis=0); hi = np.percentile(P, 99.5, axis=0)
     pad = 0.05 * (hi - lo)
     keep = np.all((P >= lo - pad) & (P <= hi + pad), axis=1)
     n_drop = int((~keep).sum())
-    P, N, C = P[keep], N[keep], C[keep]
+    P, N, C, O = P[keep], N[keep], C[keep], O[keep]
     center = (lo + hi) / 2
     scale = np.abs(P - center).max() * 1.1
     print(f"robust bbox: outlier {n_drop}점 제거, scale={scale:.3f} world (bbox {np.round(hi-lo,3)})")
     Pn = (P - center) / scale
+    On = (O - center) / scale
 
     # 2) SDF 학습
     print("IGR SDF 학습 ...")
-    net = train_sdf(Pn, N, args)
+    net = train_sdf(Pn, N, On, args)
 
     # 3) 그리드 평가
     G = args.grid if args.grid > 0 else int(round(2 * scale / args.voxel_size))
