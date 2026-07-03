@@ -143,16 +143,21 @@ def load_view_mask(mask_dir, image_name, H, W):
     for ext in (".png", ".jpg", ".jpeg", ".JPG", ".PNG"):
         p = os.path.join(mask_dir, stem + ext)
         if os.path.exists(p):
-            a = np.array(Image.open(p).convert("L").resize((W, H), Image.NEAREST))
+            img = Image.open(p).resize((W, H), Image.NEAREST)
+            a = np.array(img)
+            if a.ndim == 3 and a.shape[2] == 4:
+                a = a[..., 3]          # RGBA: 객체 마스크는 알파 채널 (RGB는 인스턴스 색 코드)
+            elif a.ndim == 3:
+                a = np.array(img.convert("L"))
             if a.max() <= 1:
                 mm = a > 0
             elif (a == 188).any():
-                mm = a == 188
+                mm = a == 188          # amodal 규약: 188=visible
             else:
                 mm = a > 127
             if not _mask_info_printed:
                 u, c = np.unique(a, return_counts=True)
-                print(f"마스크 값 분포(첫 뷰 {os.path.basename(p)}): "
+                print(f"마스크 값 분포(첫 뷰 {os.path.basename(p)}, 채널 처리 후): "
                       f"{dict(zip(u.tolist()[:6], c.tolist()[:6]))} → 객체 픽셀 {int(mm.sum())}")
                 _mask_info_printed = True
             return torch.from_numpy(mm).cuda()
