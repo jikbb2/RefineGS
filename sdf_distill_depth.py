@@ -237,7 +237,7 @@ def main():
     parser.add_argument("--grid", default=0, type=int, help="marching cubes 해상도(0=voxel_size로 산출)")
     parser.add_argument("--max_grid", default=512, type=int)
     parser.add_argument("--mask_dist", default=0.10, type=float,
-                        help="관측점에서 이 거리(world) 밖 복셀은 비움 — 박스 제거 vs 구멍채움 균형")
+                        help="메쉬 정점이 관측 점군에서 이 거리(world) 초과면 제거(0=off) — 박스 제거 vs 구멍채움 균형")
     parser.add_argument("--out", default="", type=str)
     args = get_combined_args(parser)
 
@@ -257,8 +257,15 @@ def main():
         idx = np.random.choice(len(P), args.n_pts, replace=False)
         P, N, C = P[idx], N[idx], C[idx]
 
-    # 정규화 [-1,1] (여유 1.1)
-    center = P.mean(0); scale = np.abs(P - center).max() * 1.1
+    # robust 정규화 [-1,1] — floater가 scale을 부풀리지 않도록 percentile bbox 밖 점 제거
+    lo = np.percentile(P, 0.5, axis=0); hi = np.percentile(P, 99.5, axis=0)
+    pad = 0.05 * (hi - lo)
+    keep = np.all((P >= lo - pad) & (P <= hi + pad), axis=1)
+    n_drop = int((~keep).sum())
+    P, N, C = P[keep], N[keep], C[keep]
+    center = (lo + hi) / 2
+    scale = np.abs(P - center).max() * 1.1
+    print(f"robust bbox: outlier {n_drop}점 제거, scale={scale:.3f} world (bbox {np.round(hi-lo,3)})")
     Pn = (P - center) / scale
 
     # 2) SDF 학습
@@ -279,31 +286,35 @@ def main():
             s = net(torch.tensor(pts, dtype=torch.float32, device="cuda")).cpu().numpy().reshape(G, G)
             vol[:, :, k] = s
 
-    # 4) 미관측 복셀 마스킹: 관측점을 복셀에 찍고 dilation, 그 밖은 +큰값 → 빈 공간 박스 제거
-    from scipy.ndimage import binary_dilation
-    vi = np.clip(np.round((Pn + 1) / 2 * (G - 1)).astype(np.int64), 0, G - 1)
-    occ = np.zeros((G, G, G), bool)
-    occ[vi[:, 0], vi[:, 1], vi[:, 2]] = True
-    iters = max(1, int(round(args.mask_dist / (2 * scale / (G - 1)))))
-    occ = binary_dilation(occ, iterations=iters)
-    vol[~occ] = 1.0  # 미관측 = 바깥(양수)
-
+    # 4) 전체 볼륨 marching cubes → '메쉬 단계' 트리밍
+    #    (복셀 마스킹은 마스크 경계에 인위적 zero-crossing → 계단/큐브 아티팩트를 만들어 폐기.
+    #     대신 관측 점군에서 mask_dist 초과인 정점을 메쉬에서 제거 — 경계가 표면을 따라감)
     from skimage.measure import marching_cubes
     verts, faces, _, _ = marching_cubes(vol, level=0.0, spacing=(2.0 / (G - 1),) * 3)
     verts = verts - 1.0
     verts = verts * scale + center
 
-    # 색: 최근접 관측점
-    from scipy.spatial import cKDTree
-    _, ni = cKDTree(P).query(verts)
-    vcol = np.clip(C[ni], 0, 1)
-
-    # 5) o3d 메쉬 + safe_post_process_mesh(num_cluster) — TSDF 경로와 동일 로직(클램프 추가)
     mesh = o3d.geometry.TriangleMesh()
     mesh.vertices = o3d.utility.Vector3dVector(verts)
     mesh.triangles = o3d.utility.Vector3iVector(faces)
-    mesh.vertex_colors = o3d.utility.Vector3dVector(vcol)
+
+    from scipy.spatial import cKDTree
+    tree = cKDTree(P)
+    if args.mask_dist > 0:
+        d, _ = tree.query(verts, workers=-1)
+        far = d > args.mask_dist
+        mesh.remove_vertices_by_mask(far)
+        mesh.remove_unreferenced_vertices()
+        mesh.remove_degenerate_triangles()
+        print(f"거리 트리밍(d>{args.mask_dist}): {int(far.sum())}/{len(verts)} 정점 제거")
+
+    # 색: 최근접 관측점 (트리밍 후 정점 기준)
+    verts2 = np.asarray(mesh.vertices)
+    _, ni = tree.query(verts2, workers=-1)
+    mesh.vertex_colors = o3d.utility.Vector3dVector(np.clip(C[ni], 0, 1))
     mesh.compute_vertex_normals()
+
+    # 5) safe_post_process_mesh(num_cluster) — TSDF 경로와 동일 로직(클램프 추가)
 
     out = args.out
     if not out:
