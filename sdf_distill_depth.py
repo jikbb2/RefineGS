@@ -147,14 +147,27 @@ def load_carve_points(carve_dir, center, scale, n_max=2000000, margin=0.02,
         v, u = vs[sel], us[sel]
         d = depth[v, u]
         dirs = np.stack([(u - cx) / fx, (v - cy) / fy, np.ones_like(u, np.float32)], -1) @ c2w[:3, :3].T
-        o = c2w[:3, 3]
-        tmax = np.maximum(d - margin, 0.0)
+        dnorm = np.linalg.norm(dirs, axis=-1)
+        dn = dirs / dnorm[:, None]
+        on = (c2w[:3, 3] - center) / scale                       # 정규화 좌표 카메라 중심
+        # 광선-구(반경 1.2) 교차 구간(chord)에서만 샘플 → 전 샘플이 bbox 내부·표면 앞
+        b = (on[None] * dn).sum(-1)
+        disc = b * b - ((on * on).sum() - 1.44)
+        hit = disc > 0
+        if not hit.any():
+            continue
+        sq = np.sqrt(disc[hit])
+        t_in = np.maximum(-b[hit] - sq, 0.02)
+        t_out = -b[hit] + sq
+        tmax_n = (d[hit] * dnorm[hit] - margin) / scale          # depth까지(단위방향·정규화), margin 여유
+        hi = np.minimum(t_out, tmax_n)
+        ok = hi > t_in
+        if not ok.any():
+            continue
+        t_in, hi, dh = t_in[ok], hi[ok], dn[hit][ok]
         for _ in range(samples_per_ray):
-            t = np.random.rand(len(d)).astype(np.float32) * tmax
-            xn = (o + dirs * t[:, None] - center) / scale
-            keep = np.all(np.abs(xn) < 1.2, axis=1)
-            if keep.any():
-                pts.append(xn[keep])
+            t = t_in + np.random.rand(len(t_in)).astype(np.float32) * (hi - t_in)
+            pts.append(on[None] + dh * t[:, None])
     if not pts:
         return np.zeros((0, 3))
     P = np.concatenate(pts)
