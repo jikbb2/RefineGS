@@ -128,15 +128,34 @@ def grad(y, x):
 
 
 # ---------------------------------------------------------------------------
+_mask_info_printed = False
+
+
 def load_view_mask(mask_dir, image_name, H, W):
-    """뷰별 객체 마스크 로드(없으면 None). data/<scene>/masks/<gid>/masks/<stem>.png 규약."""
+    """뷰별 객체 마스크 로드(없으면 None). 값 규약 자동 판별:
+    - 0/1 바이너리      → >0 이 객체
+    - amodal(188/0/255) → 188(visible)만 객체 (255=bg, 0=occluded 제외)
+    - 0/255 바이너리    → >127 이 객체
+    """
+    global _mask_info_printed
     from PIL import Image
     stem = os.path.splitext(image_name)[0]
     for ext in (".png", ".jpg", ".jpeg", ".JPG", ".PNG"):
         p = os.path.join(mask_dir, stem + ext)
         if os.path.exists(p):
-            m = Image.open(p).convert("L").resize((W, H), Image.NEAREST)
-            return torch.from_numpy(np.array(m) > 127).cuda()
+            a = np.array(Image.open(p).convert("L").resize((W, H), Image.NEAREST))
+            if a.max() <= 1:
+                mm = a > 0
+            elif (a == 188).any():
+                mm = a == 188
+            else:
+                mm = a > 127
+            if not _mask_info_printed:
+                u, c = np.unique(a, return_counts=True)
+                print(f"마스크 값 분포(첫 뷰 {os.path.basename(p)}): "
+                      f"{dict(zip(u.tolist()[:6], c.tolist()[:6]))} → 객체 픽셀 {int(mm.sum())}")
+                _mask_info_printed = True
+            return torch.from_numpy(mm).cuda()
     return None
 
 
@@ -301,6 +320,9 @@ def main():
     print("뷰별 depth back-project + 법선 정렬 ...")
     P, N, C, O = collect_oriented_points(scene, gaussians, pipe, background, args, mask_dir=mask_dir)
     print(f"표면점 {len(P)} (관측 back-projected)")
+    if len(P) < 1000:
+        raise SystemExit(f"[중단] 유효 표면점 {len(P)}개 — 마스크 값 규약 또는 alpha_thr 확인 필요. "
+                         f"(마스크 없이 테스트: --mask_dir '' , alpha 완화: --alpha_thr 0.5)")
 
     # 1b) ROI crop — 신뢰 가능한 관측 mesh(TSDF fuse_post 등) 근방 점만 유지.
     #     instance 모델의 배경/마스크 경계 junk(검은 노이즈)를 SDF 피팅 전에 제거.
