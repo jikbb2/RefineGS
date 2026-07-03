@@ -127,6 +127,42 @@ def grad(y, x):
     return torch.autograd.grad(y, x, torch.ones_like(y), create_graph=True)[0]
 
 
+def load_carve_points(carve_dir, center, scale, n_max=2000000, margin=0.02,
+                      px_per_view=20000, samples_per_ray=4):
+    """전체 씬 depth 덤프(dump_scene_depth.py)에서 free-space 샘플 생성.
+    각 픽셀 광선의 (카메라 → depth-margin) 구간에서 샘플 → 객체 bbox(정규화 |x|<1.2) 안만 유지."""
+    import glob as _glob
+    files = sorted(_glob.glob(os.path.join(os.path.expanduser(carve_dir), "*.npz")))
+    assert files, f"carve depth 없음: {carve_dir}"
+    pts = []
+    for f in files:
+        z = np.load(f)
+        depth = z["depth"].astype(np.float32)
+        fx, fy, cx, cy = float(z["fx"]), float(z["fy"]), float(z["cx"]), float(z["cy"])
+        c2w = z["c2w"].astype(np.float32)
+        vs, us = np.nonzero(depth > 0)
+        if len(vs) == 0:
+            continue
+        sel = np.random.choice(len(vs), min(px_per_view, len(vs)), replace=False)
+        v, u = vs[sel], us[sel]
+        d = depth[v, u]
+        dirs = np.stack([(u - cx) / fx, (v - cy) / fy, np.ones_like(u, np.float32)], -1) @ c2w[:3, :3].T
+        o = c2w[:3, 3]
+        tmax = np.maximum(d - margin, 0.0)
+        for _ in range(samples_per_ray):
+            t = np.random.rand(len(d)).astype(np.float32) * tmax
+            xn = (o + dirs * t[:, None] - center) / scale
+            keep = np.all(np.abs(xn) < 1.2, axis=1)
+            if keep.any():
+                pts.append(xn[keep])
+    if not pts:
+        return np.zeros((0, 3))
+    P = np.concatenate(pts)
+    if len(P) > n_max:
+        P = P[np.random.choice(len(P), n_max, replace=False)]
+    return P
+
+
 # ---------------------------------------------------------------------------
 _mask_info_printed = False
 
@@ -238,16 +274,18 @@ def collect_oriented_points(scene, gaussians, pipe, background, args, mask_dir=N
     return P, N, C, O, EO, ED
 
 
-def train_sdf(P, N, O, EO, ED, args):
+def train_sdf(P, N, O, EO, ED, args, CV=None):
     """정규화된 oriented point cloud에 IGR SDF 피팅.
     O = 점별 관측 카메라 중심(정규화 좌표) — 표면 근처 free-space carving.
-    EO/ED = 빈 광선(alpha≈0 픽셀)의 카메라 중심/방향 — empty-ray carving."""
+    EO/ED = 빈 광선(alpha≈0 픽셀)의 카메라 중심/방향 — empty-ray carving.
+    CV = 전체 씬 depth 기반 free-space 샘플 풀(carve_depth_dir) — 있으면 empty-ray 대신 사용."""
     dev = "cuda"
     Pt = torch.tensor(P, dtype=torch.float32, device=dev)
     Nt = torch.tensor(N, dtype=torch.float32, device=dev)
     Ot = torch.tensor(O, dtype=torch.float32, device=dev)
     EOt = torch.tensor(EO, dtype=torch.float32, device=dev) if EO is not None and len(EO) else None
     EDt = torch.tensor(ED, dtype=torch.float32, device=dev) if ED is not None and len(ED) else None
+    CVt = torch.tensor(CV, dtype=torch.float32, device=dev) if CV is not None and len(CV) else None
     net = SDFNet(pe_L=args.pe_L).to(dev)
     opt = torch.optim.Adam(net.parameters(), lr=args.lr)
     delta = args.offsurf_delta
@@ -280,7 +318,10 @@ def train_sdf(P, N, O, EO, ED, args):
         # empty-ray carving: 렌더 alpha≈0 픽셀의 광선은 '아무것도 없음'이 관측된 것 →
         # 광선이 반경 1.2 구(=bbox) 를 지나는 chord 구간 안에서만 샘플해 SDF ≥ 0 강제.
         l_empty = torch.tensor(0.0, device=dev)
-        if args.w_empty > 0 and EOt is not None and len(EOt) > 0:
+        if args.w_empty > 0 and CVt is not None:
+            bj = torch.randint(0, len(CVt), (args.batch,), device=dev)
+            l_empty = torch.relu(-net(CVt[bj])).mean()
+        elif args.w_empty > 0 and EOt is not None and len(EOt) > 0:
             bj = torch.randint(0, len(EOt), (args.batch,), device=dev)
             o, dn = EOt[bj], EDt[bj]
             t0 = -(o * dn).sum(-1, keepdim=True)                 # 원점 최근접 파라미터
@@ -337,6 +378,8 @@ def main():
     parser.add_argument("--empty_per_view", default=4096, type=int)
     parser.add_argument("--empty_alpha", default=0.1, type=float,
                         help="이 alpha 미만 픽셀을 빈 광선으로 간주. junk가 alpha를 깔면 0.3~0.5로 완화")
+    parser.add_argument("--carve_depth_dir", default="", type=str,
+                        help="dump_scene_depth.py 출력 폴더. 전체 씬 200뷰 depth로 free-space carving (empty-ray보다 우선)")
     parser.add_argument("--offsurf_delta", default=0.01, type=float, help="정규화 좌표 기준 off-surface 오프셋")
     parser.add_argument("--grid", default=0, type=int, help="marching cubes 해상도(0=voxel_size로 산출)")
     parser.add_argument("--max_grid", default=512, type=int)
@@ -410,9 +453,15 @@ def main():
         EOn, ED = EOn[keep_e], ED[keep_e]
         print(f"empty ray 필터: {int(keep_e.sum())}/{len(keep_e)} 유지 (bbox 관통 광선)")
 
+    # 1c) 전체 씬 depth 기반 carve 샘플 (있으면 empty-ray보다 우선)
+    CV = None
+    if args.carve_depth_dir:
+        CV = load_carve_points(args.carve_depth_dir, center, scale)
+        print(f"carve 샘플 {len(CV)}개 (전체 씬 depth, bbox 내부)")
+
     # 2) SDF 학습
     print("IGR SDF 학습 ...")
-    net = train_sdf(Pn, N, On, EOn, ED, args)
+    net = train_sdf(Pn, N, On, EOn, ED, args, CV=CV)
 
     # 3) 그리드 평가
     G = args.grid if args.grid > 0 else int(round(2 * scale / args.voxel_size))
