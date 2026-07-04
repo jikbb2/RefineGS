@@ -43,12 +43,17 @@ import open3d as o3d
 # ---------------------------------------------------------------------------
 def cam_intrinsics(cam):
     W, H = cam.image_width, cam.image_height
-    ndc2pix = torch.tensor([[W / 2, 0, 0, (W - 1) / 2],
-                            [0, H / 2, 0, (H - 1) / 2],
-                            [0, 0, 0, 1]]).float().cuda().T
-    intrins = (cam.projection_matrix @ ndc2pix)[:3, :3].T
-    fx, fy = intrins[0, 0].item(), intrins[1, 1].item()
-    cx, cy = intrins[0, 2].item(), intrins[1, 2].item()
+    if hasattr(cam, "projection_matrix"):
+        ndc2pix = torch.tensor([[W / 2, 0, 0, (W - 1) / 2],
+                                [0, H / 2, 0, (H - 1) / 2],
+                                [0, 0, 0, 1]]).float().cuda().T
+        intrins = (cam.projection_matrix @ ndc2pix)[:3, :3].T
+        fx, fy = intrins[0, 0].item(), intrins[1, 1].item()
+        cx, cy = intrins[0, 2].item(), intrins[1, 2].item()
+    else:  # MiniCam (extra_poses) — FoV에서 직접 산출
+        fx = W / (2.0 * np.tan(cam.FoVx / 2))
+        fy = H / (2.0 * np.tan(cam.FoVy / 2))
+        cx, cy = (W - 1) / 2.0, (H - 1) / 2.0
     extrinsic = cam.world_view_transform.T  # world->camera (w2c), CV 규약(+Z forward)
     return fx, fy, cx, cy, W, H, extrinsic
 
@@ -214,14 +219,21 @@ def load_view_mask(mask_dir, image_name, H, W):
 
 
 @torch.no_grad()
-def collect_oriented_points(scene, gaussians, pipe, background, args, mask_dir=None):
+def collect_oriented_points(scene, gaussians, pipe, background, args, mask_dir=None,
+                            require_mask=False, extra_cams=None):
     """뷰별 depth를 월드 점군으로 back-project. 법선은 카메라 방향으로 정렬.
-    mask_dir가 있으면 객체 마스크 밖 픽셀은 back-project에서 제외(TSDF 경로와 동일 철학)."""
-    views = scene.getTrainCameras()
+    mask_dir: 객체 마스크 밖 픽셀 제외(TSDF 경로와 동일 철학).
+    require_mask: 마스크 없는 학습 뷰는 통째로 skip (composed 200뷰 모델 + 객체 마스크 8뷰 케이스).
+    extra_cams: 추가 novel 카메라(MiniCam) — 마스크 미적용(ROI crop으로 제한 권장).
+                See3D 정제된 unseen은 orbit 포즈에서만 보이므로 추출에 필수."""
+    views = [(c, True) for c in scene.getTrainCameras()]
+    if extra_cams:
+        views += [(c, False) for c in extra_cams]
     P_all, N_all, C_all, O_all = [], [], [], []
     EO_all, ED_all = [], []
     n_masked_views = 0
-    for cam in views:
+    n_skipped = 0
+    for cam, use_mask in views:
         pkg = render(cam, gaussians, pipe, background)
         depth = pkg["surf_depth"][0]                      # [H,W]
         alpha = pkg["rend_alpha"][0]                      # [H,W]
@@ -241,11 +253,14 @@ def collect_oriented_points(scene, gaussians, pipe, background, args, mask_dir=N
         pts_w = pts_cam @ c2w[:3, :3].T + cam_center      # [H,W,3] world
 
         valid = (depth > 0) & (depth < args.depth_trunc) & (alpha > args.alpha_thr)
-        if mask_dir is not None:
+        if mask_dir is not None and use_mask:
             m = load_view_mask(mask_dir, cam.image_name, H, W)
             if m is not None:
                 valid &= m
                 n_masked_views += 1
+            elif require_mask:
+                n_skipped += 1
+                continue          # 마스크 없는 학습 뷰 제외 (씬 전체 점 유입 방지)
         pts_w = pts_w[valid]
         n = nrm[valid]
         c = rgb[valid].clamp(0, 1)
@@ -276,7 +291,9 @@ def collect_oriented_points(scene, gaussians, pipe, background, args, mask_dir=N
                 ED_all.append(de.cpu())
 
     if mask_dir is not None:
-        print(f"객체 마스크 적용: {n_masked_views}/{len(views)} 뷰 (경로 {mask_dir})")
+        print(f"객체 마스크 적용: {n_masked_views}/{len(views)} 뷰, skip {n_skipped}뷰 (경로 {mask_dir})")
+    if extra_cams:
+        print(f"extra 포즈 렌더: {len(extra_cams)}뷰 (마스크 미적용)")
     P = torch.cat(P_all).numpy().astype(np.float64)
     N = torch.cat(N_all).numpy().astype(np.float64)
     C = torch.cat(C_all).numpy().astype(np.float64)
@@ -404,6 +421,11 @@ def main():
     parser.add_argument("--roi_dist", default=0.15, type=float)
     parser.add_argument("--mask_dir", default="auto", type=str,
                         help="뷰별 객체 마스크 폴더. 'auto'=<source_path>/masks (있으면 사용), ''=사용 안 함")
+    parser.add_argument("--require_mask", action="store_true",
+                        help="마스크 없는 학습 뷰는 통째로 skip (composed 모델에서 객체만 추출할 때 필수)")
+    parser.add_argument("--extra_poses", default="", type=str,
+                        help="추가 novel 포즈 npz(render_hole_novel soft_out poses.npz). "
+                             "See3D 정제된 unseen 밴드를 추출에 포함(마스크 미적용 — roi_mesh로 제한 권장)")
     parser.add_argument("--out", default="", type=str)
     args = get_combined_args(parser)
 
@@ -422,8 +444,24 @@ def main():
         mask_dir = cand if os.path.isdir(cand) else None
     elif args.mask_dir:
         mask_dir = args.mask_dir
+
+    extra_cams = []
+    if args.extra_poses:
+        from scene.cameras import MiniCam
+        recs = np.load(os.path.expanduser(args.extra_poses), allow_pickle=True)["records"]
+        for r in recs:
+            wvt = torch.tensor(np.asarray(r["world_view_transform"]), dtype=torch.float32).cuda()
+            fpt = torch.tensor(np.asarray(r["full_proj_transform"]), dtype=torch.float32).cuda()
+            mc = MiniCam(int(r["width"]), int(r["height"]),
+                         float(r["FoVy"]), float(r["FoVx"]), 0.01, 100.0, wvt, fpt)
+            mc.image_name = f"extra{int(r['idx']):04d}"
+            extra_cams.append(mc)
+
     print("뷰별 depth back-project + 법선 정렬 ...")
-    P, N, C, O, EO, ED = collect_oriented_points(scene, gaussians, pipe, background, args, mask_dir=mask_dir)
+    P, N, C, O, EO, ED = collect_oriented_points(scene, gaussians, pipe, background, args,
+                                                 mask_dir=mask_dir,
+                                                 require_mask=args.require_mask,
+                                                 extra_cams=extra_cams)
     print(f"표면점 {len(P)} (관측 back-projected)")
     if len(P) < 1000:
         raise SystemExit(f"[중단] 유효 표면점 {len(P)}개 — 마스크 값 규약 또는 alpha_thr 확인 필요. "
