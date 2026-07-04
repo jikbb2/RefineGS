@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """RefineGS — GT depth forward-warp to novel pose (See3D 입력, noisy 렌더 대체).
 
+[v2 패치]
+  - cross-source z-buffer 버그 수정: 색 기록에 z-테스트 적용(이전엔 나중 소스가 무조건 덮어써
+    먼 표면이 가까운 표면을 뚫고 나옴 — k_nearest 클수록 증폭).
+  - depth 경계(streamer) 필터: 실루엣 경계의 전경/배경 혼합 depth 픽셀 제거(--edge_thr).
+    큰 baseline novel pose에서 '공중에 뜬 조각'의 원인.
+
 근본 문제: 2DGS 를 unseen pose 에서 렌더하면 floater/streak 노이즈 → See3D 입력으로 부적합.
 해결(See3D 원래 방식): *실제 GT 픽셀*을 GT depth 로 target novel pose 에 forward-projection.
   → 관측면 = 진짜 색(노이즈 없음), hole = 진짜 미관측/disocclusion 만(작음).
@@ -10,23 +16,17 @@
   view_<i>.jpg   GT-warp (실색, hole 은 검정)
   weight_<i>.png hole map (255=hole/미관측, 0=known/실색) ← generate_novel_views see3d 가 mask 로 사용
   poses.npz      복사
-
-※ valid/hole 은 *GT 투영 여부(zbuf)* 로 판정 — 색이 검정이어도 GT 가 투영된 진짜 객체는 hole 아님(보존).
-※ '검은 영역을 학습에서 제외' 하려면 학습 weight = (1 - hole) = filled(실색). (주입 단계에서 반전 처리.)
-
-forward-warp:
-  src 픽셀 (u,v,d) → Xc = d·K^-1[u,v,1] → Xw = R_s^T(Xc - t_s)
-  → target: Xc_t = R_t·Xw + t_t,  uv_t = K_t·Xc_t/z   (z-buffer 로 최근접 색 채택)
-  k_nearest GT 프레임을 합쳐 채움. 빈 픽셀 = hole.
+scene_mesh 지정 시 weight = 3단계: 255=관측 / 128=미관측 실제표면(See3D 대상) / 0=frustum-밖(제외).
 
 실행(권장 stride=1):
   python warp_gt_to_pose.py \
-    --poses ~/See3D/dataset/refinegs_obj24/soft_in_carved/poses.npz \
+    --poses ~/See3D/dataset/obj24_v2/soft/poses.npz \
     --gt_images data/replica_room0_v2/images \
     --gt_depth /home/elicer/nice-slam/Datasets/Replica/room0/results \
     --colmap data/replica_room0_v2/sparse/0 \
-    --depth_scale 6553.5 --k_nearest 6 --src_stride 1 \
-    --out ~/See3D/dataset/refinegs_obj24/soft_in_gtwarp
+    --depth_scale 6553.5 --k_nearest 24 --src_stride 1 --edge_thr 0.05 \
+    --scene_mesh output/replica_room0_v2/scene_mono_reg/train/ours_30000/fuse_post.ply \
+    --out ~/See3D/dataset/obj24_v2/soft_in_gtwarp
 
 Deps: numpy, PIL.
 """
@@ -116,6 +116,8 @@ def main():
     ap.add_argument("--depth_scale", type=float, default=6553.5)
     ap.add_argument("--k_nearest", type=int, default=6)
     ap.add_argument("--src_stride", type=int, default=1, help="src 픽셀 stride(속도). 1=full(권장)")
+    ap.add_argument("--edge_thr", type=float, default=0.05,
+                    help="depth 경계 필터: 인접 픽셀 상대 depth 변화가 이 비율 초과면 drop(streamer 방지). 0=off")
     ap.add_argument("--scene_mesh", default="",
                     help="장면(방) 메쉬(예 base fuse_cropped.ply). 지정 시 weight=3단계 학습weight: "
                          "255=관측(실색), 128=미관측 실제표면(See3D 대상, 0.5), 0=frustum-밖(void, 제외). "
@@ -133,7 +135,6 @@ def main():
         print(f"scene raycast on {a.scene_mesh} → 3단계 weight")
 
     cams = read_colmap(a.colmap)
-    # GT 이미지/depth 있는 프레임만
     src = []
     for c in cams:
         ip = os.path.join(a.gt_images, c["stem"] + ".jpg")
@@ -160,21 +161,27 @@ def main():
 
         zbuf = np.full(H*W, np.inf, np.float32)
         color = np.zeros((H*W, 3), np.float32)
+        # ---- pass 1: 전 소스에 대해 전역 min-z 누적 ----
+        cache = []
         for si in order:
             c = src[si]
             img = np.asarray(Image.open(c["img_path"]).convert("RGB")).astype(np.float32)
             Hs, Ws = img.shape[:2]
             dep = load_depth(c["depth_path"], a.depth_scale, Ws, Hs)
+            # depth 경계 필터: 실루엣 혼합 depth 픽셀 제거 (공중 조각 방지)
+            if a.edge_thr > 0:
+                gy, gx = np.gradient(dep)
+                edge = (np.abs(gx) + np.abs(gy)) > a.edge_thr * np.clip(dep, 1e-3, None)
+            else:
+                edge = np.zeros_like(dep, bool)
             vs, us = np.mgrid[0:Hs:st, 0:Ws:st]
             us = us.ravel(); vs = vs.ravel(); d = dep[vs, us]
-            ok = d > 1e-3
+            ok = (d > 1e-3) & (~edge[vs, us])
             us, vs, d = us[ok], vs[ok], d[ok]
-            # backproject (src cam) → world
             x = (us - c["cx"]) / c["fx"] * d
             y = (vs - c["cy"]) / c["fy"] * d
             Xc = np.stack([x, y, d], 1)
-            Xw = (Xc - c["t"]) @ c["R"]                     # R^T(Xc-t) = (Xc-t)@R
-            # project → target
+            Xw = (Xc - c["t"]) @ c["R"]
             Xct = Xw @ Rt.T + tt
             z = Xct[:, 2]
             front = z > 1e-3
@@ -184,31 +191,31 @@ def main():
             vt = (Xct[:, 1]/z*fyt + cyt).astype(np.int64)
             inb = (ut >= 0)&(ut < W)&(vt >= 0)&(vt < H)
             flat = vt[inb]*W + ut[inb]; zz = z[inb]; cc = col[inb]
-            # z-buffer: 최근접만
-            srt = np.argsort(-zz)                            # 먼 것 먼저 → 가까운 것이 나중에 덮음
-            flat, zz, cc = flat[srt], zz[srt], cc[srt]
-            color[flat] = cc
-            zbuf[flat] = np.minimum(zbuf[flat], zz)
+            np.minimum.at(zbuf, flat, zz)
+            cache.append((flat, zz, cc))
+        # ---- pass 2: 전역 z-테스트 통과 픽셀만 색 기록 (cross-source 관통 방지) ----
+        for flat, zz, cc in cache:
+            win = zz <= zbuf[flat] * 1.002
+            color[flat[win]] = cc[win]
+        del cache
 
         filled = (zbuf < np.inf).reshape(H, W)
         view = color.reshape(H, W, 3).astype(np.uint8)
         Image.fromarray(view).save(os.path.join(a.out, f"view_{i:04d}.jpg"), quality=95)
 
         if rc_scene is not None:
-            # per-pixel ray → 장면 메쉬에 닿나? (닿음=실제표면, 놓침=frustum-밖 void)
             import open3d as o3d
             uu, vv = np.meshgrid(np.arange(W), np.arange(H))
             dc = np.stack([(uu-cxt)/fxt, (vv-cyt)/fyt, np.ones_like(uu, float)], -1).reshape(-1, 3)
-            Rc2w = Rt.T; cc = (-Rt.T @ tt).astype(np.float32)
+            Rc2w = Rt.T; ccam = (-Rt.T @ tt).astype(np.float32)
             dw = dc @ Rc2w.T
             dw /= (np.linalg.norm(dw, axis=1, keepdims=True) + 1e-9)
-            rays = np.concatenate([np.broadcast_to(cc, dw.shape), dw], 1).astype(np.float32)
+            rays = np.concatenate([np.broadcast_to(ccam, dw.shape), dw], 1).astype(np.float32)
             thit = rc_scene.cast_rays(o3d.core.Tensor(rays))["t_hit"].numpy()
             scene_hit = np.isfinite(thit).reshape(H, W)
             w = np.zeros((H, W), np.uint8)
-            w[filled] = 255                                    # 관측 실색 → 1.0
-            w[(~filled) & scene_hit] = 128                     # 미관측 실제표면 → See3D, 0.5
-            # (~filled & ~scene_hit) = frustum-밖 void → 0 (학습 제외)
+            w[filled] = 255
+            w[(~filled) & scene_hit] = 128
             Image.fromarray(w).save(os.path.join(a.out, f"weight_{i:04d}.png"))
             print(f"[{i:04d}] known {filled.mean():.3f}  미관측표면 {((~filled)&scene_hit).mean():.3f}  frustum밖 {((~filled)&~scene_hit).mean():.3f}")
         else:
@@ -217,7 +224,7 @@ def main():
             print(f"[{i:04d}] filled {filled.mean():.3f}  hole {hole.mean():.3f}")
 
     shutil.copy(a.poses, os.path.join(a.out, "poses.npz"))
-    print(f"\n→ {a.out} (view=GT-warp, weight=hole, poses.npz).")
+    print(f"\n→ {a.out} (view=GT-warp, weight, poses.npz).")
 
 
 if __name__ == "__main__":
