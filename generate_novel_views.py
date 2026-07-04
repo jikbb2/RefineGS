@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """RefineGS — 조건부 novel-view 생성 어댑터 (task 5, model-agnostic).
 
-입력  : soft_in/  (render_hole_novel.py --soft_out)
-          view_<i>.jpg    조건용 RGB 렌더(현재 형상을 그 pose에서)
-          weight_<i>.png  연속 soft weight(미관측·gen↑ = refine 대상)
+[v2 패치]
+  - --super_resolution: inference.py SR 경로 사용 + SR_predict_* 출력 우선 채택 (해상도 개선).
+  - 출력 수집 glob 이 SR/일반 예측 모두 커버.
+
+입력  : soft_in/  (render_hole_novel.py --soft_out 또는 GT-warp 합성본)
+          view_<i>.jpg    조건용 RGB (실측 warp + coarse 렌더 합성 권장)
+          weight_<i>.png  weight(높음=hole/refine 대상 — 어댑터 규약)
           poses.npz       카메라
 출력  : gen_out/  gen_<i>.jpg + weight_<i>.png(soft, 학습 loss용) + poses.npz
 
@@ -11,19 +15,11 @@
   copy   : view 를 그대로 복사(identity). 주입 배관(task6) 검증용.
   see3d  : See3D inference.py 호출(디렉토리 배치, multi-view diffusion).
            warp=view, mask=binary(weight 임계: 흰=known/검=hole) → predict → gen.
-           ★조건뷰는 *실측 재학습된* 모델에서 렌더하는 게 좋음(조건 품질↑).
 
-See3D 실행(see3d 백엔드 내부, See3D env 에서):
-  python inference.py --base_model_path <ckpt> --source_imgs_dir <ref>/ \
-      --warp_root_dir <tmp_warps> --output_dir <tmp_out>
-
-실행:
-  # 배관검증
-  python generate_novel_views.py --soft_in .../soft_in --out .../gen_out --backend copy
-  # 실제 생성(See3D env, See3D 디렉토리에서)
-  python generate_novel_views.py --soft_in .../soft_in --out .../gen_out --backend see3d \
+실행(See3D env, See3D 디렉토리에서):
+  python generate_novel_views.py --soft_in .../soft_in_adapter --out .../gen_out --backend see3d \
       --see3d_root /home/elicer/See3D --base_model_path <See3D ckpt> \
-      --ref_views /home/elicer/See3D/dataset/refinegs_obj24/ref --hole_thr 0.3
+      --ref_views .../ref --hole_thr 0.3 --super_resolution
 
 Deps: numpy, PIL. (see3d 백엔드는 See3D 레포/환경)
 """
@@ -59,7 +55,6 @@ def run_copy(args):
         Image.open(vp).convert("RGB").save(os.path.join(args.out, f"gen_{i:04d}.jpg"), quality=95)
         if os.path.exists(wp):
             if args.invert_weight:
-                # warp_gt_to_pose 의 weight=hole → 학습 weight=validity(1-hole). 검은 영역 학습 제외.
                 w = np.asarray(Image.open(wp).convert("L"))
                 Image.fromarray(255 - w).save(os.path.join(args.out, f"weight_{i:04d}.png"))
             else:
@@ -80,7 +75,7 @@ def run_see3d(args):
                                 if os.path.isdir(os.path.expanduser("~/tmp")) else None)
     out_tmp = tempfile.mkdtemp(prefix="see3d_out_", dir=os.path.dirname(warp_dir))
 
-    # 1) warp_*.jpg(=view) + mask_*.png(See3D: 흰=known/검=hole) 준비
+    # 1) warp_*.png(=view) + mask_*.png(See3D: 흰=known/검=hole) 준비
     idxs = []
     for rec in recs:
         i = int(rec["idx"])
@@ -88,16 +83,15 @@ def run_see3d(args):
         wp = os.path.join(args.soft_in, f"weight_{i:04d}.png")
         if not (os.path.exists(vp) and os.path.exists(wp)):
             continue
-        # ⚠️ inference.py 가 mask 를 warp 와 *같은 확장자*로 찾음(ins.replace('warp','mask')) → 둘 다 .png
         Image.open(vp).convert("RGB").save(os.path.join(warp_dir, f"warp_{i:04d}.png"))
         w = np.asarray(Image.open(wp).convert("L")).astype(np.float32) / 255.0
-        known = (w < args.hole_thr).astype(np.uint8) * 255          # 흰=known(weight 낮음), 검=hole(미관측)
+        known = (w < args.hole_thr).astype(np.uint8) * 255
         Image.fromarray(known).save(os.path.join(warp_dir, f"mask_{i:04d}.png"))
         idxs.append(i)
     if not idxs:
         raise SystemExit("see3d 입력 0개 — soft_in 비었거나 weight 전부 0. MIN_WEIGHT/hole_thr 확인.")
 
-    ref = args.ref_views if args.ref_views.endswith("/") else args.ref_views + "/"   # inference.py 가 문자열 concat
+    ref = args.ref_views if args.ref_views.endswith("/") else args.ref_views + "/"
     cmd = [sys.executable, os.path.join(args.see3d_root, "inference.py"),
            "--base_model_path", args.base_model_path,
            "--source_imgs_dir", ref,
@@ -105,32 +99,39 @@ def run_see3d(args):
            "--output_dir", out_tmp]
     if args.single_view:
         cmd.append("--single_view")
-    # env 오염 방지: PYTHONPATH/LD_LIBRARY_PATH(=split_and_splat) 제거 → see3d 자체 torch/lib 사용
-    # (핸드오프의 split_and_splat 오염 이슈와 동일 — undefined symbol libtorch_python 방지)
+    if args.super_resolution:
+        cmd.append("--super_resolution")
     env = os.environ.copy()
     env.pop("PYTHONPATH", None)
     env["LD_LIBRARY_PATH"] = ""
     print("See3D inference:", " ".join(cmd))
     subprocess.run(cmd, check=True, cwd=args.see3d_root, env=env)
 
-    # 2) predict_warp_<i>*.jpg → gen_<i>.jpg
+    # 2) 예측 수집: SR 출력(SR_predict_*) 우선, 없으면 일반(predict_*)
+    def collect(pattern):
+        d = {}
+        for p in glob.glob(os.path.join(out_tmp, pattern)):
+            m = re.search(r"warp_(\d+)", os.path.basename(p))
+            if m:
+                d[int(m.group(1))] = p
+        return d
+    preds = collect("SR_predict_*warp_*") if args.super_resolution else {}
+    normal = collect("predict_*warp_*")
+    for i, p in normal.items():
+        preds.setdefault(i, p)          # SR 없는 인덱스는 일반 예측으로 보충
     meta = []
-    preds = glob.glob(os.path.join(out_tmp, "predict_*warp_*"))
-    for p in preds:
-        m = re.search(r"warp_(\d+)", os.path.basename(p))
-        if not m:
-            continue
-        i = int(m.group(1))
-        Image.open(p).convert("RGB").save(os.path.join(args.out, f"gen_{i:04d}.jpg"), quality=95)
+    for i in sorted(preds):
+        Image.open(preds[i]).convert("RGB").save(os.path.join(args.out, f"gen_{i:04d}.jpg"), quality=95)
         wp = os.path.join(args.soft_in, f"weight_{i:04d}.png")
         if os.path.exists(wp):
             shutil.copy(wp, os.path.join(args.out, f"weight_{i:04d}.png"))
-        meta.append(dict(idx=i, gen=f"gen_{i:04d}.jpg", weight=f"weight_{i:04d}.png"))
-        print(f"[see3d] gen_{i:04d} ← predict {os.path.basename(p)}")
+        meta.append(dict(idx=i, gen=f"gen_{i:04d}.jpg", weight=f"weight_{i:04d}.png",
+                         src=os.path.basename(preds[i])))
+        print(f"[see3d] gen_{i:04d} ← {os.path.basename(preds[i])}")
     if not meta:
         raise SystemExit(f"See3D 출력 0개 — {out_tmp} 확인(predict_*warp_* 없음).")
     finalize(args.out, args.soft_in, meta)
-    print(f"\n→ {len(meta)} (see3d) → {args.out}")
+    print(f"\n→ {len(meta)} (see3d{'/SR' if args.super_resolution else ''}) → {args.out}")
 
 
 def main():
@@ -143,6 +144,8 @@ def main():
     ap.add_argument("--ref_views", default="", help="관측 앵커 이미지 dir (source_imgs_dir)")
     ap.add_argument("--hole_thr", type=float, default=0.3, help="weight>thr = hole(See3D 생성), 이하=known")
     ap.add_argument("--single_view", action="store_true")
+    ap.add_argument("--super_resolution", action="store_true",
+                    help="inference.py SR 경로 사용 + SR_predict_* 우선 채택 (해상도 개선)")
     ap.add_argument("--invert_weight", action="store_true",
                     help="weight=hole(warp_gt_to_pose) → 학습 weight=validity(1-hole)로 반전. "
                          "GT-warp 를 학습에 쓸 때(검은 영역 제외) 사용.")
