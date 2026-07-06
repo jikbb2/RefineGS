@@ -91,21 +91,49 @@ def run_see3d(args):
     if not idxs:
         raise SystemExit("see3d 입력 0개 — soft_in 비었거나 weight 전부 0. MIN_WEIGHT/hole_thr 확인.")
 
-    ref = args.ref_views if args.ref_views.endswith("/") else args.ref_views + "/"
-    cmd = [sys.executable, os.path.join(args.see3d_root, "inference.py"),
-           "--base_model_path", args.base_model_path,
-           "--source_imgs_dir", ref,
-           "--warp_root_dir", warp_dir,
-           "--output_dir", out_tmp]
-    if args.single_view:
-        cmd.append("--single_view")
-    if args.super_resolution:
-        cmd.append("--super_resolution")
-    env = os.environ.copy()
-    env.pop("PYTHONPATH", None)
-    env["LD_LIBRARY_PATH"] = ""
-    print("See3D inference:", " ".join(cmd))
-    subprocess.run(cmd, check=True, cwd=args.see3d_root, env=env)
+    def run_inference(ref_dir, wdir, odir):
+        ref = ref_dir if ref_dir.endswith("/") else ref_dir + "/"
+        cmd = [sys.executable, os.path.join(args.see3d_root, "inference.py"),
+               "--base_model_path", args.base_model_path,
+               "--source_imgs_dir", ref,
+               "--warp_root_dir", wdir,
+               "--output_dir", odir]
+        if args.single_view:
+            cmd.append("--single_view")
+        if args.super_resolution:
+            cmd.append("--super_resolution")
+        env = os.environ.copy()
+        env.pop("PYTHONPATH", None)
+        env["LD_LIBRARY_PATH"] = ""
+        print("See3D inference:", " ".join(cmd))
+        subprocess.run(cmd, check=True, cwd=args.see3d_root, env=env)
+
+    if args.chunk <= 0:
+        run_inference(args.ref_views, warp_dir, out_tmp)
+    else:
+        # ── 점진(progressive) 체이닝: 궤적 순서대로 chunk씩 생성, 직전 예측을 다음 ref로 편입 ──
+        # (idxs는 poses.npz 순서 = 궤적 순서여야 함. GT 근처 각도에서 시작하도록 궤적을 설계할 것.)
+        prev_preds = []
+        for c0 in range(0, len(idxs), args.chunk):
+            sub = idxs[c0:c0 + args.chunk]
+            wdir = tempfile.mkdtemp(prefix=f"see3d_w{c0:03d}_", dir=os.path.dirname(warp_dir))
+            for i in sub:
+                shutil.copy(os.path.join(warp_dir, f"warp_{i:04d}.png"), os.path.join(wdir, f"warp_{i:04d}.png"))
+                shutil.copy(os.path.join(warp_dir, f"mask_{i:04d}.png"), os.path.join(wdir, f"mask_{i:04d}.png"))
+            rdir = tempfile.mkdtemp(prefix=f"see3d_r{c0:03d}_", dir=os.path.dirname(warp_dir))
+            for p in sorted(glob.glob(os.path.join(args.ref_views, "*"))):
+                shutil.copy(p, rdir)
+            for j, p in enumerate(prev_preds[-args.carry:]):        # 직전 예측 carry개를 ref로
+                shutil.copy(p, os.path.join(rdir, f"zz_prev_{j}.jpg"))
+            run_inference(rdir, wdir, out_tmp)
+            # 이 chunk의 예측(궤적 마지막 것)을 다음 chunk ref 후보로
+            got = sorted(glob.glob(os.path.join(out_tmp, f"predict_*warp_*")))
+            for i in sub[::-1]:
+                m = [p for p in got if f"warp_{i:04d}" in os.path.basename(p)]
+                if m:
+                    prev_preds.append(m[0])
+                    break
+            print(f"[chunk {c0//args.chunk}] {sub} 완료 (carry {min(len(prev_preds), args.carry)} ref)")
 
     # 2) 예측 수집: SR 출력(SR_predict_*) 우선, 없으면 일반(predict_*)
     def collect(pattern):
@@ -146,6 +174,9 @@ def main():
     ap.add_argument("--single_view", action="store_true")
     ap.add_argument("--super_resolution", action="store_true",
                     help="inference.py SR 경로 사용 + SR_predict_* 우선 채택 (해상도 개선)")
+    ap.add_argument("--chunk", type=int, default=0,
+                    help=">0: 점진 체이닝 — 궤적 순서로 chunk개씩 생성, 직전 예측을 다음 ref로 편입(할루시네이션 억제)")
+    ap.add_argument("--carry", type=int, default=2, help="다음 chunk ref로 넘길 직전 예측 수")
     ap.add_argument("--invert_weight", action="store_true",
                     help="weight=hole(warp_gt_to_pose) → 학습 weight=validity(1-hole)로 반전. "
                          "GT-warp 를 학습에 쓸 때(검은 영역 제외) 사용.")
