@@ -182,6 +182,42 @@ def load_carve_points(carve_dir, center, scale, n_max=2000000, margin=0.02,
 
 
 # ---------------------------------------------------------------------------
+_C0 = 0.28209479177387814
+
+
+def _set_label_color(gaussians, label):
+    """gaussian 색을 라벨 값으로 교체(label-buffer 렌더용). render_hole_novel과 동일 트릭."""
+    fdc, frest = gaussians._features_dc, gaussians._features_rest
+    saved = (fdc.detach().clone(), frest.detach().clone(), int(gaussians.active_sh_degree))
+    dc = (label - 0.5) / _C0
+    with torch.no_grad():
+        fdc[:, 0, 0] = dc; fdc[:, 0, 1] = dc; fdc[:, 0, 2] = dc
+        frest.zero_()
+    gaussians.active_sh_degree = 0
+    return saved
+
+
+def _restore_color(gaussians, saved):
+    fdc_s, frest_s, sh = saved
+    with torch.no_grad():
+        gaussians._features_dc.copy_(fdc_s)
+        gaussians._features_rest.copy_(frest_s)
+    gaussians.active_sh_degree = sh
+
+
+@torch.no_grad()
+def render_extra_masks(extra_cams, gaussians, pipe, background, label, thr=0.3):
+    """extra 포즈에서 객체 라벨을 렌더해 per-view 객체 마스크 생성 (base/바닥 유입 차단)."""
+    from gaussian_renderer import render as _render
+    saved = _set_label_color(gaussians, label)
+    masks = {}
+    for cam in extra_cams:
+        lab = _render(cam, gaussians, pipe, background)["render"][0].clamp(0, 1)
+        masks[cam.image_name] = lab > thr
+    _restore_color(gaussians, saved)
+    return masks
+
+
 _mask_info_printed = False
 
 
@@ -220,7 +256,7 @@ def load_view_mask(mask_dir, image_name, H, W):
 
 @torch.no_grad()
 def collect_oriented_points(scene, gaussians, pipe, background, args, mask_dir=None,
-                            require_mask=False, extra_cams=None):
+                            require_mask=False, extra_cams=None, extra_masks=None):
     """뷰별 depth를 월드 점군으로 back-project. 법선은 카메라 방향으로 정렬.
     mask_dir: 객체 마스크 밖 픽셀 제외(TSDF 경로와 동일 철학).
     require_mask: 마스크 없는 학습 뷰는 통째로 skip (composed 200뷰 모델 + 객체 마스크 8뷰 케이스).
@@ -261,6 +297,8 @@ def collect_oriented_points(scene, gaussians, pipe, background, args, mask_dir=N
             elif require_mask:
                 n_skipped += 1
                 continue          # 마스크 없는 학습 뷰 제외 (씬 전체 점 유입 방지)
+        if not use_mask and extra_masks is not None and cam.image_name in extra_masks:
+            valid &= extra_masks[cam.image_name]   # extra 포즈: label-buffer 객체 마스크
         pts_w = pts_w[valid]
         n = nrm[valid]
         c = rgb[valid].clamp(0, 1)
@@ -425,7 +463,11 @@ def main():
                         help="마스크 없는 학습 뷰는 통째로 skip (composed 모델에서 객체만 추출할 때 필수)")
     parser.add_argument("--extra_poses", default="", type=str,
                         help="추가 novel 포즈 npz(render_hole_novel soft_out poses.npz). "
-                             "See3D 정제된 unseen 밴드를 추출에 포함(마스크 미적용 — roi_mesh로 제한 권장)")
+                             "See3D 정제된 unseen 밴드를 추출에 포함")
+    parser.add_argument("--extra_mask_npy", default="", type=str,
+                        help="per-Gaussian 객체 라벨 npy — extra 포즈에서 label-buffer 렌더로 "
+                             "객체 마스크 생성(base/바닥 유입 차단). 미지정 시 extra 뷰는 마스크 없음")
+    parser.add_argument("--extra_mask_thr", default=0.3, type=float)
     parser.add_argument("--out", default="", type=str)
     args = get_combined_args(parser)
 
@@ -457,11 +499,22 @@ def main():
             mc.image_name = f"extra{int(r['idx']):04d}"
             extra_cams.append(mc)
 
+    extra_masks = None
+    if extra_cams and args.extra_mask_npy:
+        lab_np = np.load(os.path.expanduser(args.extra_mask_npy)).astype(np.float32)
+        assert len(lab_np) == gaussians.get_xyz.shape[0], \
+            f"extra_mask_npy {len(lab_np)} != gaussians {gaussians.get_xyz.shape[0]}"
+        extra_masks = render_extra_masks(extra_cams, gaussians, pipe, background,
+                                         torch.from_numpy(lab_np).cuda(), thr=args.extra_mask_thr)
+        cov = np.mean([m.float().mean().item() for m in extra_masks.values()])
+        print(f"extra 객체 마스크 생성: {len(extra_masks)}뷰 (평균 커버 {cov*100:.1f}%)")
+
     print("뷰별 depth back-project + 법선 정렬 ...")
     P, N, C, O, EO, ED = collect_oriented_points(scene, gaussians, pipe, background, args,
                                                  mask_dir=mask_dir,
                                                  require_mask=args.require_mask,
-                                                 extra_cams=extra_cams)
+                                                 extra_cams=extra_cams,
+                                                 extra_masks=extra_masks)
     print(f"표면점 {len(P)} (관측 back-projected)")
     if len(P) < 1000:
         raise SystemExit(f"[중단] 유효 표면점 {len(P)}개 — 마스크 값 규약 또는 alpha_thr 확인 필요. "
