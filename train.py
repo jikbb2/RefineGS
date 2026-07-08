@@ -6,7 +6,15 @@
 #   - depth distortion + normal consistency 정규화는 [2DGS] → graft
 #   - [제거] SparseGaussianAdam, exposure, separate_sh, inverse-depth 감독, antialiasing
 #
-# 각 변경 블록에 base 표시: [S&S] / [2DGS] / [제거]
+# [v2 패치 — 원자료 기하 감독]
+#   (a) GT-depth 손실 활성화: --gt_depth_dir 로 외부 depth 폴더 지정 가능,
+#       frame↔depth 이름 규약 자동 매칭 (기존엔 <source>/depths 없으면 무음 skip 이었음)
+#   (b) 비대칭 depth 손실: 렌더 depth 가 GT 보다 '앞'(=카메라~표면 사이에 질량, free-space 위반)
+#       이면 --front_mult 배 강벌점 → 학습 단계 carving
+#   (c) NV normal 감독: novelview_dir 에 normal_%04d.png(단안 추정, camera-space) 있으면
+#       weight ⊙ (1-|cos|) 항 추가 — 생성 뷰의 RGB 대신 방향 정보로 기하 감독
+#
+# 각 변경 블록에 base 표시: [S&S] / [2DGS] / [제거] / [v2]
 # 원저작권: graphdeco-inria 3DGS, 2DGS(hbb1), Split&Splat(LTTM)
 ################################################################################
 
@@ -42,17 +50,31 @@ except Exception:
 
 
 
-# === [RefineGS depth supervision] ====================================
+# === [RefineGS depth supervision, v2] =================================
 _DEPTH_CACHE = {}
-def _load_gt_depth(cam, source_path, scale=6553.5):
-    """GT metric depth(meters) + (객체∩유효) 마스크. 캐시."""
+def _load_gt_depth(cam, source_path, scale=6553.5, override_dir=None):
+    """GT metric depth(meters) + (객체∩유효) 마스크. 캐시.
+    탐색: override_dir → <source>/depths.  이름: <stem>.png → frame↔depth 치환."""
     import os, cv2, numpy as np, torch
     key = getattr(cam, "image_name", None)
     if key in _DEPTH_CACHE:
         return _DEPTH_CACHE[key]
     stem = os.path.splitext(key)[0] if key else None
-    p = os.path.join(source_path, "depths", stem + ".png") if stem else None
-    if not p or not os.path.exists(p):
+    p = None
+    if stem:
+        dirs = ([override_dir] if override_dir else []) + [os.path.join(source_path, "depths")]
+        names = [stem + ".png", stem.replace("frame", "depth") + ".png"]
+        for d in dirs:
+            if not d:
+                continue
+            for nm in names:
+                c = os.path.join(os.path.expanduser(d), nm)
+                if os.path.exists(c):
+                    p = c
+                    break
+            if p:
+                break
+    if not p:
         _DEPTH_CACHE[key] = (None, None); return None, None
     d = cv2.imread(p, cv2.IMREAD_UNCHANGED).astype(np.float32) / scale  # meters
     d = cv2.resize(d, (cam.image_width, cam.image_height), interpolation=cv2.INTER_NEAREST)
@@ -78,14 +100,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         gaussians.active_sh_degree = gaussians.max_sh_degree
         print('[B4a] init from ' + args.init_ply + ': ' + str(gaussians.get_xyz.shape[0]) + ' gaussians')
     gaussians.training_setup(opt)
-    # [NV] novel-view soft-weighted supervision 로드
+    # [NV] novel-view soft-weighted supervision 로드 (+ [v2] normal_%04d.png 선택 로드)
     _NV_CAMS, _NV_LAMBDA, _NV_EVERY = [], float(getattr(args, "nv_lambda", 0.5)), int(getattr(args, "nv_every", 2))
+    _NV_LAMBDA_N = float(getattr(args, "nv_lambda_normal", 0.0))
     if getattr(args, "novelview_dir", None):
         import os as _os, numpy as _np, torch as _t
         from PIL import Image as _Img
         from scene.cameras import MiniCam as _MiniCam
         _nvd = args.novelview_dir
         _recs = _np.load(_os.path.join(_nvd, "poses.npz"), allow_pickle=True)["records"]
+        _n_nrm = 0
         for _r in _recs:
             _r = _r.item() if hasattr(_r, "item") and not isinstance(_r, dict) else _r
             _i = int(_r["idx"])
@@ -101,8 +125,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             _w = _t.from_numpy(_np.asarray(_Img.open(_wp).convert("L"))).float().cuda() / 255.0
             _cam.gt_image = _g
             _cam.weight = _w[None]
+            # [v2] 단안 추정 normal (camera-space, png [0,255]→[-1,1])
+            _npn = _os.path.join(_nvd, "normal_%04d.png" % _i)
+            _cam.gt_normal = None
+            if _NV_LAMBDA_N > 0 and _os.path.exists(_npn):
+                _n = _t.from_numpy(_np.asarray(_Img.open(_npn).convert("RGB"))).float().permute(2, 0, 1).cuda()
+                _cam.gt_normal = _t.nn.functional.normalize(_n / 127.5 - 1.0, dim=0)
+                _n_nrm += 1
             _NV_CAMS.append(_cam)
-        print("[NV] %d novel-view cams (lambda=%.3f every=%d) from %s" % (len(_NV_CAMS), _NV_LAMBDA, _NV_EVERY, _nvd))
+        print("[NV] %d novel-view cams (lambda=%.3f every=%d, normal %d뷰 λ=%.2f) from %s"
+              % (len(_NV_CAMS), _NV_LAMBDA, _NV_EVERY, _n_nrm, _NV_LAMBDA_N, _nvd))
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
@@ -113,21 +145,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     iter_start = torch.cuda.Event(enable_timing=True)
     iter_end = torch.cuda.Event(enable_timing=True)
 
-    # [제거] depth_l1_weight (inverse-depth 감독) — 필요 시 직접 depth 감독으로 재도입(가이드 §5.3)
-
     viewpoint_stack = scene.getTrainCameras().copy()
     viewpoint_indices = list(range(len(viewpoint_stack)))
     ema_loss_for_log = 0.0
     ema_dist_for_log = 0.0     # [2DGS]
     ema_normal_for_log = 0.0   # [2DGS]
+    ema_gtd_for_log = 0.0      # [v2]
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
 
     for iteration in range(first_iter, opt.iterations + 1):
-        # ---- network gui (선택) ----
-        # network gui 비활성화 (headless + 2DGS network_gui 시그니처 상이 → 뷰어 미사용)
-
         iter_start.record()
         gaussians.update_learning_rate(iteration)
 
@@ -148,7 +176,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         bg = torch.rand((3), device="cuda") if opt.random_background else background
 
-        # [변경] render 호출에서 use_trained_exp/separate_sh 제거
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg)
         image = render_pkg["render"]
         mask = render_pkg["mask"]                              # [S&S]
@@ -168,12 +195,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         else:
             ssim_value = ssim(image, gt_image)
 
-        # [S&S] mask 가중치 0.25 (composition 시 sed 로 0.05/0.1/0.25 치환 — README 그대로 동작)
+        # [S&S] mask 가중치 0.25
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value) + Ll1_mask * 0.25
 
         # ---- [2DGS] regularization: depth distortion + normal consistency ----
-#         lambda_normal = opt.lambda_normal if iteration > 7000 else 0.0
-#         lambda_dist = opt.lambda_dist if iteration > 3000 else 0.0
         lambda_normal = opt.lambda_normal if iteration > 1500 else 0.0
         lambda_dist   = opt.lambda_dist   if iteration > 500  else 0.0
 
@@ -183,25 +208,33 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         normal_error = (1 - (rend_normal * surf_normal).sum(dim=0))[None]
         normal_loss = lambda_normal * normal_error.mean()
         dist_loss = lambda_dist * rend_dist.mean()
-        # (선택, 가이드 §5.3) 경계 보호: 기하 손실을 마스크 내부로 한정하려면
-        #   m = GT_mask[:1] if GT_mask.dim()==3 else GT_mask
-        #   normal_loss = lambda_normal * (normal_error * m).mean(); dist_loss = lambda_dist * (rend_dist * m).mean()
 
         total_loss = loss + dist_loss + normal_loss
-        # [RefineGS depth supervision] GT metric depth L1 (마스크 내부)
-        _ld = 0.5 if iteration > 500 else 0.0
+
+        # [v2] (a)+(b) 비대칭 GT-depth 손실 — front(카메라~GT표면 사이 질량)=free-space 위반 강벌점
+        _gtd_val = 0.0
+        _ld = float(getattr(args, "lambda_gtdepth", 0.5)) if iteration > 500 else 0.0
         if _ld > 0 and ('depth' in render_pkg):
-            _gd, _vm = _load_gt_depth(viewpoint_cam, dataset.source_path)
+            _gd, _vm = _load_gt_depth(viewpoint_cam, dataset.source_path,
+                                      scale=float(getattr(args, "gt_depth_scale", 6553.5)),
+                                      override_dir=getattr(args, "gt_depth_dir", None))
             if _gd is not None and _vm.sum() > 0:
                 _rd = render_pkg['depth']
                 if _rd.dim() == 2: _rd = _rd[None]
-                _dl = (torch.abs(_rd - _gd) * _vm).sum() / _vm.sum().clamp_min(1.0)
+                _diff = _rd - _gd
+                _front = torch.relu(-_diff)              # 렌더가 GT 앞 → carving 벌점
+                _back = torch.relu(_diff)
+                _fm = float(getattr(args, "front_mult", 3.0))
+                _dl = ((_fm * _front + _back) * _vm).sum() / _vm.sum().clamp_min(1.0)
                 total_loss = total_loss + _ld * _dl
-        # [NV] novel-view weighted supervision (weight~0 관측 보존 / weight~1 미관측 refine)
+                _gtd_val = _dl.item()
+
+        # [NV] novel-view weighted supervision (+ [v2] normal 항)
         if _NV_CAMS and (iteration % _NV_EVERY == 0):
             from random import randint as _ri
             _nv = _NV_CAMS[_ri(0, len(_NV_CAMS) - 1)]
-            _nvr = render(_nv, gaussians, pipe, bg)["render"]
+            _pkg = render(_nv, gaussians, pipe, bg)
+            _nvr = _pkg["render"]
             _w = _nv.weight
             if _w.shape[-2:] != _nvr.shape[-2:]:
                 _w = torch.nn.functional.interpolate(_w[None], _nvr.shape[-2:], mode="bilinear")[0]
@@ -210,6 +243,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 _gt = torch.nn.functional.interpolate(_gt[None], _nvr.shape[-2:], mode="bilinear")[0]
             _nv_l1 = (torch.abs(_nvr - _gt) * _w).sum() / _w.sum().clamp_min(1.0)
             total_loss = total_loss + _NV_LAMBDA * _nv_l1
+            # [v2] (c) normal 감독: world→camera 회전 후 방향 일치 (1-|cos| — 부호 규약 무관)
+            if _NV_LAMBDA_N > 0 and getattr(_nv, "gt_normal", None) is not None:
+                _rn = _pkg["rend_normal"]                                    # (3,H,W) world
+                _Rw2c = _nv.world_view_transform[:3, :3].T                   # wvt=w2c^T → R_w2c
+                _rn_c = torch.einsum('ij,jhw->ihw', _Rw2c, _rn)
+                _rn_c = torch.nn.functional.normalize(_rn_c, dim=0)
+                _gn = _nv.gt_normal
+                if _gn.shape[-2:] != _rn_c.shape[-2:]:
+                    _gn = torch.nn.functional.normalize(
+                        torch.nn.functional.interpolate(_gn[None], _rn_c.shape[-2:], mode="bilinear")[0], dim=0)
+                _cos = (_rn_c * _gn).sum(0, keepdim=True).abs()
+                _nl = ((1.0 - _cos) * _w).sum() / _w.sum().clamp_min(1.0)
+                total_loss = total_loss + _NV_LAMBDA_N * _nl
         total_loss.backward()
 
         iter_end.record()
@@ -218,12 +264,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             ema_dist_for_log = 0.4 * dist_loss.item() + 0.6 * ema_dist_for_log
             ema_normal_for_log = 0.4 * normal_loss.item() + 0.6 * ema_normal_for_log
+            ema_gtd_for_log = 0.4 * _gtd_val + 0.6 * ema_gtd_for_log
 
             if iteration % 10 == 0:
                 progress_bar.set_postfix({
                     "Loss": f"{ema_loss_for_log:.5f}",
                     "dist": f"{ema_dist_for_log:.5f}",
                     "normal": f"{ema_normal_for_log:.5f}",
+                    "gtd": f"{ema_gtd_for_log:.4f}",
                 })
                 progress_bar.update(10)
             if iteration == opt.iterations:
@@ -238,23 +286,22 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 scene.save(iteration)
 
             # ---- Densification ----
-            if iteration < opt.densify_until_iter:          # [2DGS] 단순 조건 (S&S 의 max_num_splats cap 제거)
+            if iteration < opt.densify_until_iter:          # [2DGS]
                 gaussians.max_radii2D[visibility_filter] = torch.max(
                     gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    # [2DGS] densify_and_prune 4-arg (S&S 의 trailing radii 제거)
                     gaussians.densify_and_prune(opt.densify_grad_threshold, opt.opacity_cull,
                                                 scene.cameras_extent, size_threshold)
 
                 if iteration % opt.opacity_reset_interval == 0 or \
                    (dataset.white_background and iteration == opt.densify_from_iter) or \
-                   (scene.composition and iteration == 0):   # [S&S] composition 시작 시 opacity reset
+                   (scene.composition and iteration == 0):   # [S&S]
                     gaussians.reset_opacity()
 
-            # ---- Optimizer step ([제거] sparse adam / exposure) ----
+            # ---- Optimizer step ----
             if iteration < opt.iterations:
                 gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none=True)
@@ -264,8 +311,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
     # [S&S] per-instance 학습 종료 후 빈/검은 뷰 정리
-    # ⚠️ image_filter 가 내부에서 render 를 호출하면 변경된 시그니처/2DGS 출력과 안 맞을 수 있음.
-    #    첫 동작 검증 때 깨지면 try/except 로 감싸거나 잠시 주석 처리 (가이드 §4.4).
     if not scene.composition:
         black_cameras = scene.getBlackCameras()
         print("Empty views: ", len(black_cameras))
@@ -314,7 +359,6 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                 l1_test = 0.0
                 psnr_test = 0.0
                 for idx, viewpoint in enumerate(config['cameras']):
-                    # [변경] render 호출 단순화 (separate_sh/use_trained_exp 제거)
                     out = renderFunc(viewpoint, scene.gaussians, *renderArgs)
                     image = torch.clamp(out["render"], 0.0, 1.0)
                     mask = torch.clamp(out["mask"], 0.0, 1.0) if out["mask"] is not None else None
@@ -371,6 +415,15 @@ if __name__ == "__main__":
     parser.add_argument("--nv_lambda", type=float, default=0.5)      # [NV]
     parser.add_argument("--nv_every", type=int, default=2)           # [NV]
     parser.add_argument("--init_ply", type=str, default=None)  # [B4a]
+    # [v2] 원자료 기하 감독
+    parser.add_argument("--gt_depth_dir", type=str, default=None,
+                        help="GT depth 폴더(예: nice-slam results). 미지정 시 <source>/depths 탐색")
+    parser.add_argument("--gt_depth_scale", type=float, default=6553.5)
+    parser.add_argument("--lambda_gtdepth", type=float, default=0.5, help="0=off")
+    parser.add_argument("--front_mult", type=float, default=3.0,
+                        help="렌더 depth < GT depth (free-space 위반) 벌점 배율")
+    parser.add_argument("--nv_lambda_normal", type=float, default=0.0,
+                        help=">0: novelview_dir 의 normal_%%04d.png 로 NV normal 감독")
 
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
