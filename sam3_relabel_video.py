@@ -18,17 +18,23 @@
         concept별 empty_cache.
 ★ v2.3: CPU RAM — 마스크 bit-pack(8×↓), propagate 스트리밍 즉시 압축, dcache window별 해제, RSS 로그.
 
-★ v2.4 패치 (checkpoint/resume + NVML assert 자동 복구) ★
-  window 9/9 의 94% 지점 NVML assert 로 수 시간 런이 전멸하는 문제 대응:
+★ v2.4 패치 (checkpoint/resume) ★
     1. window 완료마다 tracks 를 <out_root>/tracks_ckpt.pkl 에 저장. 재실행 시 자동으로
        완료된 window 를 건너뛰고 이어감(★같은 --stride/--window/--win_overlap 필수★, 자동 검증).
        정상 완료 시 ckpt 자동 삭제. --no_resume 으로 무시 가능.
-    2. concept propagate 중 RuntimeError(NVML assert/OOM) 발생 시: 세션 폐기 → predictor 재빌드
-       → 같은 window 세션 재시작 → 해당 concept 부터 재시도(같은 concept 최대 2회).
-    3. 시작 시 PYTORCH_CUDA_ALLOC_CONF=expandable_segments 감지 경고 — 이 allocator 옵션이
-       NVML_SUCCESS INTERNAL ASSERT 의 유발 혐의. unset 권장.
-    4. 최종 저장 전 out_root 의 기존 숫자 폴더 제거 — 크래시 후 이전 런 잔재가 "N objects 성공"
+    2. 시작 시 PYTORCH_CUDA_ALLOC_CONF=expandable_segments 감지 경고.
+    3. 최종 저장 전 out_root 의 기존 숫자 폴더 제거 — 크래시 후 이전 런 잔재가 "N objects 성공"
        으로 위장하는 사고 방지 (run_full_pipeline.sh 는 exit code 를 확인하지 않고 폴더 수만 센다).
+
+★ v2.5 패치 (concept 단위 resume — in-process 복구 폐기) ★
+  실측: NVML assert 후 empty_cache freed 0 bytes / reserved 20.6GB 유지 → predictor 재빌드해도
+  첫 .to(device) 에서 재발. 한 번 assert 가 나면 그 프로세스의 allocator 는 회생 불가.
+  수정:
+    1. RuntimeError 발생 시 in-process 재시도 대신, 완료된 concept 까지의 tracks 를
+       ckpt(partial: window wi, concept ci)에 저장하고 exit code 3 으로 종료.
+    2. 재실행 시 같은 window 의 죽은 concept 부터 이어감 (window 재시작 불필요).
+    3. 외부 wrapper 로 무인 완주:
+       until bash run_full_pipeline.sh relabel; do echo "=== restart ==="; sleep 5; done
 
 출력: <out_root>/<gid>/<stem>.png (마스크) + points3d.ply (depth voxel 센터, init) → prepare_folder 입력.
 
@@ -46,7 +52,7 @@
         --exclude_concepts "door,blind,vent,window,wall,floor,ceiling,light switch,thermostat" \
         --out_root ~/relabel_video_room0
 """
-import argparse, glob, json, os, gc, pickle, shutil, tempfile
+import argparse, glob, json, os, gc, pickle, shutil, sys, tempfile
 from collections import Counter, defaultdict
 import numpy as np, torch
 from PIL import Image
@@ -295,17 +301,24 @@ def main():
     ckpt_path=os.path.join(args.out_root,"tracks_ckpt.pkl")
     ckpt_key=dict(N=N,stride=args.stride,window=args.window,win_overlap=args.win_overlap,
                   n_windows=len(windows),vocab=len(VOCAB))
-    tracks=[]; done_windows=0
+    tracks=[]; done_windows=0; partial_ci=0        # partial_ci: 재개 window 에서 건너뛸 concept 수
     if args.resume and os.path.isfile(ckpt_path):
         try:
             with open(ckpt_path,"rb") as f: ck=pickle.load(f)
             if ck.get("key")==ckpt_key:
                 tracks=ck["tracks"]; done_windows=ck["done_windows"]
-                print(f"★resume: window {done_windows}/{len(windows)} 완료 체크포인트 로드 (tracks={len(tracks)})")
+                partial_ci=ck.get("partial_ci",0)
+                print(f"★resume: window {done_windows}/{len(windows)} 완료 + partial concept {partial_ci} "
+                      f"체크포인트 로드 (tracks={len(tracks)})")
             else:
                 print(f"★ckpt 무시: 파라미터 불일치 {ck.get('key')} != {ckpt_key}")
         except Exception as e:
             print(f"★ckpt 로드 실패({e}) — 처음부터 실행")
+
+    def save_ckpt(dw, pci=0):
+        with open(ckpt_path+".tmp","wb") as f:
+            pickle.dump(dict(key=ckpt_key,done_windows=dw,partial_ci=pci,tracks=tracks),f,protocol=4)
+        os.replace(ckpt_path+".tmp",ckpt_path)
 
     # depth 접근성 sanity check (첫 프레임)
     if N:
@@ -338,7 +351,10 @@ def main():
                         offload_video_to_cpu=args.offload_video,
                         offload_state_to_cpu=args.offload_state))["session_id"]
             sid=open_session()
-            wtracks=0; ci=0; retry=Counter()
+            wtracks=0
+            ci=partial_ci if wi==done_windows else 0    # ★v2.5: 죽은 concept 부터 재개
+            partial_ci=0
+            if ci>0: print(f"  ★partial resume: window {wi+1} concept {ci}({VOCAB[ci]}) 부터")
             while ci<len(VOCAB):
                 c=VOCAB[ci]
                 try:
@@ -356,20 +372,14 @@ def main():
                             dd=byid.setdefault(int(oid),{"masks":{},"score":0.0})
                             dd["masks"][stem]=pack_mask(m>0); dd["score"]=max(dd["score"],float(probs[k]))
                 except RuntimeError as e:
-                    # ★v2.4: NVML assert / OOM → predictor 통째 재빌드 후 같은 concept 재시도
-                    retry[ci]+=1
+                    # ★v2.5: NVML assert 후 이 프로세스의 allocator 는 회생 불가(실측: empty_cache
+                    #        freed 0 bytes → 재빌드 즉시 재발). concept 단위 ckpt 저장 후 종료 —
+                    #        재실행(resume)이 이 concept 부터 깨끗한 프로세스로 이어감.
                     print(f"  ★RuntimeError @[{c}] window {wi+1}: {str(e).splitlines()[0]}")
-                    if retry[ci]>2:
-                        raise
-                    print(f"  ★predictor 재빌드 후 [{c}] 재시도 ({retry[ci]}/2)")
-                    try: predictor.handle_request(dict(type="close_session",session_id=sid))
-                    except Exception: pass
-                    try: predictor.shutdown()
-                    except Exception: pass
-                    del predictor; gc.collect(); torch.cuda.empty_cache()
-                    predictor=build_predictor()
-                    sid=open_session()
-                    continue
+                    save_ckpt(wi, ci)
+                    print(f"  ★ckpt 저장(window {wi}, concept {ci}) → exit 3. 재실행하면 [{c}] 부터 재개.\n"
+                          f"    무인 완주: until bash run_full_pipeline.sh relabel; do sleep 5; done")
+                    sys.exit(3)
                 kept=0
                 for oid,dd in byid.items():
                     if len(dd["masks"])<mt_track: continue        # window: 완화(1)
@@ -386,10 +396,8 @@ def main():
             # window 세션 해제 → GPU 메모리 반환 + ★v2.3: depth 캐시/RSS 관리
             predictor.handle_request(dict(type="close_session",session_id=sid))
             dcache.clear(); gc.collect(); torch.cuda.empty_cache()
-            # ★v2.4: window 체크포인트 저장 (원자적 rename)
-            with open(ckpt_path+".tmp","wb") as f:
-                pickle.dump(dict(key=ckpt_key,done_windows=wi+1,tracks=tracks),f,protocol=4)
-            os.replace(ckpt_path+".tmp",ckpt_path)
+            # ★v2.4/2.5: window 체크포인트 저장 (원자적 rename)
+            save_ckpt(wi+1, 0)
             print(f"  [window {wi+1}/{len(windows)}] frames {wr.start}..{wr.stop-1}  "
                   f"new tracks={wtracks}  total={len(tracks)}  RSS={rss_gb():.1f}GB  ckpt✓")
     try: predictor.shutdown()
