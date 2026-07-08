@@ -13,30 +13,27 @@
        *시간적으로 배타적*이고 3D footprint(voxel)가 겹치면 → re-identification 병합.
   4) 구조물 concept 제외 + min_track 필터.
 
-★ v2.1 메모리 패치: --window N ★
-  프레임을 N개 단위 window로 잘라 window마다 세션 start/close + empty_cache (GPU 상한 고정).
-  --win_overlap 로 경계 객체 온전 포착.
+★ v2.1: --window N — 프레임을 window로 잘라 세션별 처리(GPU 상한 고정), --win_overlap 로 경계 보호.
+★ v2.2: pose-coverage — compute_sig 분모=유효 프레임만, cam coverage 진단, --posed_only(기본 ON),
+        concept별 empty_cache.
+★ v2.3: CPU RAM — 마스크 bit-pack(8×↓), propagate 스트리밍 즉시 압축, dcache window별 해제, RSS 로그.
 
-★ v2.2 패치 (pose-coverage) ★
-  colmap 이 stride-10 서브셋만 커버하던 문제:
-    1. compute_sig: 임계 분모 nf = cam+depth 유효 프레임 수만 (unposed 프레임 중립화).
-    2. cam coverage 출력 + --posed_only(기본 ON).
-    3. concept 루프마다 empty_cache.
-    4. expandable_segments 제거 권장 (NVML assert 혐의).
-
-★ v2.3 패치 (CPU RAM — OOM killer 'Killed' 대응) ★
-  dense pose + v2.2 수정 후 native tracks 가 23 → 500+ 로 정상 회복되자, track 마다
-  full-res bool 마스크를 RAM에 쌓는 구조가 host 메모리를 고갈시킴 (0.8MB/장 × 수만 장).
-  수정:
-    1. 마스크를 np.packbits 압축(bit-pack, 8×↓)으로 저장; 필요 시점에만 unpack.
-       (compute_sig / mask_iou / 그룹 OR / 최종 저장 모두 on-demand unpack)
-    2. propagate 출력을 dict 로 모아두지 않고 스트리밍 즉시 필터+압축 (transient 피크 제거).
-    3. depth 캐시(dcache)를 window 마다 해제 (~3GB 상한 제거).
-    4. window 마다 RSS(GB) 로그 — 다음 병목 조기 발견용.
+★ v2.4 패치 (checkpoint/resume + NVML assert 자동 복구) ★
+  window 9/9 의 94% 지점 NVML assert 로 수 시간 런이 전멸하는 문제 대응:
+    1. window 완료마다 tracks 를 <out_root>/tracks_ckpt.pkl 에 저장. 재실행 시 자동으로
+       완료된 window 를 건너뛰고 이어감(★같은 --stride/--window/--win_overlap 필수★, 자동 검증).
+       정상 완료 시 ckpt 자동 삭제. --no_resume 으로 무시 가능.
+    2. concept propagate 중 RuntimeError(NVML assert/OOM) 발생 시: 세션 폐기 → predictor 재빌드
+       → 같은 window 세션 재시작 → 해당 concept 부터 재시도(같은 concept 최대 2회).
+    3. 시작 시 PYTORCH_CUDA_ALLOC_CONF=expandable_segments 감지 경고 — 이 allocator 옵션이
+       NVML_SUCCESS INTERNAL ASSERT 의 유발 혐의. unset 권장.
+    4. 최종 저장 전 out_root 의 기존 숫자 폴더 제거 — 크래시 후 이전 런 잔재가 "N objects 성공"
+       으로 위장하는 사고 방지 (run_full_pipeline.sh 는 exit code 를 확인하지 않고 폴더 수만 센다).
 
 출력: <out_root>/<gid>/<stem>.png (마스크) + points3d.ply (depth voxel 센터, init) → prepare_folder 입력.
 
 실행 (sam3 env):
+    unset PYTORCH_CUDA_ALLOC_CONF
     LD_LIBRARY_PATH= \
     python sam3_relabel_video.py \
         --frames data/replica_room0_v2/images --img_ext .jpg \
@@ -49,7 +46,7 @@
         --exclude_concepts "door,blind,vent,window,wall,floor,ceiling,light switch,thermostat" \
         --out_root ~/relabel_video_room0
 """
-import argparse, glob, json, os, gc, tempfile
+import argparse, glob, json, os, gc, pickle, shutil, tempfile
 from collections import Counter, defaultdict
 import numpy as np, torch
 from PIL import Image
@@ -221,6 +218,9 @@ def main():
     ap.add_argument("--offload_video",action="store_true",default=True,
                     help="★비디오 프레임 텐서를 CPU로 offload. 기본 ON.")
     ap.add_argument("--no_offload_video",dest="offload_video",action="store_false")
+    ap.add_argument("--resume",action="store_true",default=True,
+                    help="★v2.4: window 체크포인트에서 이어가기(기본 ON).")
+    ap.add_argument("--no_resume",dest="resume",action="store_false")
     ap.add_argument("--prompt_frame",type=int,default=0,help="concept를 프롬프트할 window-로컬 프레임 인덱스")
     ap.add_argument("--min_area",type=float,default=0.0008,
                     help="프레임 마스크 최소 면적")
@@ -242,6 +242,13 @@ def main():
     ap.add_argument("--exclude_concepts",default="")
     ap.add_argument("--out_root",required=True)
     args=ap.parse_args(); os.makedirs(args.out_root,exist_ok=True)
+
+    # ── ★v2.4: allocator 옵션 경고 ──
+    acc=os.environ.get("PYTORCH_CUDA_ALLOC_CONF","")
+    if "expandable_segments" in acc:
+        print(f"★★경고: PYTORCH_CUDA_ALLOC_CONF={acc}\n"
+              "  expandable_segments 는 NVML_SUCCESS INTERNAL ASSERT(CUDACachingAllocator) 유발 혐의.\n"
+              "  `unset PYTORCH_CUDA_ALLOC_CONF` 후 실행을 강력 권장.")
 
     VOCAB=(json.load(open(args.vocab_json))["vocab"] if args.vocab_json
            else [v.strip() for v in args.vocab.split(",")])
@@ -284,6 +291,22 @@ def main():
     mt_track = 1 if args.window>0 else args.min_track
     print(f"frames={N}  window={win}  n_windows={len(windows)}  (single-prompt @local frame {args.prompt_frame}, streaming)")
 
+    # ── ★v2.4: 체크포인트 로드 ──
+    ckpt_path=os.path.join(args.out_root,"tracks_ckpt.pkl")
+    ckpt_key=dict(N=N,stride=args.stride,window=args.window,win_overlap=args.win_overlap,
+                  n_windows=len(windows),vocab=len(VOCAB))
+    tracks=[]; done_windows=0
+    if args.resume and os.path.isfile(ckpt_path):
+        try:
+            with open(ckpt_path,"rb") as f: ck=pickle.load(f)
+            if ck.get("key")==ckpt_key:
+                tracks=ck["tracks"]; done_windows=ck["done_windows"]
+                print(f"★resume: window {done_windows}/{len(windows)} 완료 체크포인트 로드 (tracks={len(tracks)})")
+            else:
+                print(f"★ckpt 무시: 파라미터 불일치 {ck.get('key')} != {ckpt_key}")
+        except Exception as e:
+            print(f"★ckpt 로드 실패({e}) — 처음부터 실행")
+
     # depth 접근성 sanity check (첫 프레임)
     if N:
         _D=load_depth(stems_all[0],dcfg,dcache)
@@ -292,40 +315,61 @@ def main():
                  else "★없음★ — --depth_dir/--depth_from/--depth_to 확인 필요"))
 
     from sam3.model_builder import build_sam3_video_predictor
-    try:
-        predictor=build_sam3_video_predictor(gpus_to_use=range(torch.cuda.device_count()),bpe_path=args.bpe) \
-                  if args.bpe else build_sam3_video_predictor(gpus_to_use=range(torch.cuda.device_count()))
-    except TypeError:
-        predictor=build_sam3_video_predictor(gpus_to_use=range(torch.cuda.device_count()))
+    def build_predictor():
+        try:
+            return build_sam3_video_predictor(gpus_to_use=range(torch.cuda.device_count()),bpe_path=args.bpe) \
+                   if args.bpe else build_sam3_video_predictor(gpus_to_use=range(torch.cuda.device_count()))
+        except TypeError:
+            return build_sam3_video_predictor(gpus_to_use=range(torch.cuda.device_count()))
+    predictor=build_predictor()
 
     # ── window별 세션 → concept별 single-prompt streaming → track 수집 ──
-    tracks=[]
     with torch.inference_mode(), torch.autocast("cuda",dtype=torch.bfloat16):
         for wi,wr in enumerate(windows):
+            if wi<done_windows: continue                     # ★v2.4: resume skip
             # window 프레임을 정수명으로 심링크 (로컬 idx→전역 stem)
             wdir=tempfile.mkdtemp(prefix=f"sam3relabel_w{wi}_"); local2stem=[]
             for li,gi in enumerate(wr):
                 os.symlink(os.path.abspath(src[gi]),os.path.join(wdir,f"{li}.jpg"))
                 local2stem.append(stems_all[gi])
             Nw=len(local2stem); pf=int(np.clip(args.prompt_frame,0,max(Nw-1,0)))
-            sid=predictor.handle_request(dict(type="start_session",resource_path=wdir,
-                    offload_video_to_cpu=args.offload_video,
-                    offload_state_to_cpu=args.offload_state))["session_id"]
-            wtracks=0
-            for c in VOCAB:
-                predictor.handle_request(dict(type="reset_session",session_id=sid))
-                predictor.handle_request(dict(type="add_prompt",session_id=sid,frame_index=pf,text=c))
-                # ★v2.3: propagate 스트림을 모아두지 않고 즉시 필터 + bit-pack
-                byid={}
-                for r in predictor.handle_stream_request(dict(type="propagate_in_video",session_id=sid)):
-                    o=r["outputs"]; stem=local2stem[r["frame_index"]]
-                    ids=np.asarray(o["out_obj_ids"]).reshape(-1)
-                    masks=np.asarray(o["out_binary_masks"]); probs=np.asarray(o["out_probs"]).reshape(-1)
-                    for k,oid in enumerate(ids):
-                        m=masks[k]
-                        if m.mean()<args.min_area: continue
-                        dd=byid.setdefault(int(oid),{"masks":{},"score":0.0})
-                        dd["masks"][stem]=pack_mask(m>0); dd["score"]=max(dd["score"],float(probs[k]))
+            def open_session():
+                return predictor.handle_request(dict(type="start_session",resource_path=wdir,
+                        offload_video_to_cpu=args.offload_video,
+                        offload_state_to_cpu=args.offload_state))["session_id"]
+            sid=open_session()
+            wtracks=0; ci=0; retry=Counter()
+            while ci<len(VOCAB):
+                c=VOCAB[ci]
+                try:
+                    predictor.handle_request(dict(type="reset_session",session_id=sid))
+                    predictor.handle_request(dict(type="add_prompt",session_id=sid,frame_index=pf,text=c))
+                    # ★v2.3: propagate 스트림을 모아두지 않고 즉시 필터 + bit-pack
+                    byid={}
+                    for r in predictor.handle_stream_request(dict(type="propagate_in_video",session_id=sid)):
+                        o=r["outputs"]; stem=local2stem[r["frame_index"]]
+                        ids=np.asarray(o["out_obj_ids"]).reshape(-1)
+                        masks=np.asarray(o["out_binary_masks"]); probs=np.asarray(o["out_probs"]).reshape(-1)
+                        for k,oid in enumerate(ids):
+                            m=masks[k]
+                            if m.mean()<args.min_area: continue
+                            dd=byid.setdefault(int(oid),{"masks":{},"score":0.0})
+                            dd["masks"][stem]=pack_mask(m>0); dd["score"]=max(dd["score"],float(probs[k]))
+                except RuntimeError as e:
+                    # ★v2.4: NVML assert / OOM → predictor 통째 재빌드 후 같은 concept 재시도
+                    retry[ci]+=1
+                    print(f"  ★RuntimeError @[{c}] window {wi+1}: {str(e).splitlines()[0]}")
+                    if retry[ci]>2:
+                        raise
+                    print(f"  ★predictor 재빌드 후 [{c}] 재시도 ({retry[ci]}/2)")
+                    try: predictor.handle_request(dict(type="close_session",session_id=sid))
+                    except Exception: pass
+                    try: predictor.shutdown()
+                    except Exception: pass
+                    del predictor; gc.collect(); torch.cuda.empty_cache()
+                    predictor=build_predictor()
+                    sid=open_session()
+                    continue
                 kept=0
                 for oid,dd in byid.items():
                     if len(dd["masks"])<mt_track: continue        # window: 완화(1)
@@ -338,11 +382,16 @@ def main():
                       + (f"  (window {wi+1}/{len(windows)})" if len(windows)>1 else ""))
                 del byid
                 torch.cuda.empty_cache()                  # ★v2.2: concept 축 누적 완화
+                ci+=1
             # window 세션 해제 → GPU 메모리 반환 + ★v2.3: depth 캐시/RSS 관리
             predictor.handle_request(dict(type="close_session",session_id=sid))
             dcache.clear(); gc.collect(); torch.cuda.empty_cache()
+            # ★v2.4: window 체크포인트 저장 (원자적 rename)
+            with open(ckpt_path+".tmp","wb") as f:
+                pickle.dump(dict(key=ckpt_key,done_windows=wi+1,tracks=tracks),f,protocol=4)
+            os.replace(ckpt_path+".tmp",ckpt_path)
             print(f"  [window {wi+1}/{len(windows)}] frames {wr.start}..{wr.stop-1}  "
-                  f"new tracks={wtracks}  total={len(tracks)}  RSS={rss_gb():.1f}GB")
+                  f"new tracks={wtracks}  total={len(tracks)}  RSS={rss_gb():.1f}GB  ckpt✓")
     try: predictor.shutdown()
     except Exception: pass
     print(f"\nnative tracks(전 concept·전 window): {len(tracks)}  RSS={rss_gb():.1f}GB")
@@ -398,6 +447,12 @@ def main():
     objs.sort(key=lambda o:-len(o["masks"]))
     print(f"구조물 제외+min_track 후 유효 객체: {len(objs)}")
 
+    # ── ★v2.4: 이전 런 잔재 제거 (숫자 폴더만) — 크래시 잔재의 '성공 위장' 방지 ──
+    stale=[d for d in glob.glob(os.path.join(args.out_root,"[0-9]*")) if os.path.isdir(d)]
+    if stale:
+        print(f"★기존 객체 폴더 {len(stale)}개 제거 후 새로 저장")
+        for d in stale: shutil.rmtree(d)
+
     # ── 저장 (sig voxel-key → 센터 점) ──
     for gid,o in enumerate(objs):
         od=os.path.join(args.out_root,str(gid)); os.makedirs(od,exist_ok=True)
@@ -411,9 +466,10 @@ def main():
         write_ply(os.path.join(od,"points3d.ply"),pts.astype(np.float32))
         print(f"  obj{gid}: frames={len(o['masks'])} init_pts={len(pts)} "
               f"concept~{o['concepts'].most_common(1)[0][0]}")
+    # 정상 완료 → 체크포인트 삭제
+    if os.path.isfile(ckpt_path): os.remove(ckpt_path)
     print(f"저장: {args.out_root}/<gid>/<stem>.png + points3d.ply")
-    print("판정(v2.3): bit-packed 마스크 + 스트리밍 수집 + dcache 해제 — host RAM 상한 8×↓. "
-          "RSS 로그로 잔여 병목 감시.")
+    print("판정(v2.4): window 체크포인트 + NVML/OOM 자동 복구 — 크래시가 나도 완료 window 는 보존.")
 
 
 if __name__=="__main__":
