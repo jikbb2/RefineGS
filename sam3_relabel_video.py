@@ -36,6 +36,14 @@
     3. 외부 wrapper 로 무인 완주:
        until bash run_full_pipeline.sh relabel; do echo "=== restart ==="; sleep 5; done
 
+★ v2.6 패치 (concept 단위 window 분할 — 결정론적 per-concept OOM 대응) ★
+  실측: fresh 프로세스 + window 9 단독에서도 [cushion] 이 매번 frame 182/200 에서 NVML assert.
+  → 인스턴스가 많은 concept 은 다수 객체 동시 tracking 으로 window 200프레임의 피크가 GPU 를
+  결정론적으로 초과. 재시작해도 같은 자리에서 죽어 무한 반복.
+  수정: 같은 (window, concept) 이 실패하면 ckpt 에 split_lv 를 올려 저장 → 재시작 시 그 concept
+  만 window 를 2^lv 조각(2→4)으로 분할해 세션별 처리(피크 1/2, 1/4). 조각 track 은 시간 배타라
+  기존 3D re-id 가 재결합. 4조각에서도 실패하면 skipped_concepts.txt 기록 후 다음 concept 진행.
+
 출력: <out_root>/<gid>/<stem>.png (마스크) + points3d.ply (depth voxel 센터, init) → prepare_folder 입력.
 
 실행 (sam3 env):
@@ -301,23 +309,25 @@ def main():
     ckpt_path=os.path.join(args.out_root,"tracks_ckpt.pkl")
     ckpt_key=dict(N=N,stride=args.stride,window=args.window,win_overlap=args.win_overlap,
                   n_windows=len(windows),vocab=len(VOCAB))
-    tracks=[]; done_windows=0; partial_ci=0        # partial_ci: 재개 window 에서 건너뛸 concept 수
+    tracks=[]; done_windows=0; partial_ci=0; split_lv=0   # partial_ci/split_lv: 재개 지점·분할 레벨
     if args.resume and os.path.isfile(ckpt_path):
         try:
             with open(ckpt_path,"rb") as f: ck=pickle.load(f)
             if ck.get("key")==ckpt_key:
                 tracks=ck["tracks"]; done_windows=ck["done_windows"]
-                partial_ci=ck.get("partial_ci",0)
-                print(f"★resume: window {done_windows}/{len(windows)} 완료 + partial concept {partial_ci} "
-                      f"체크포인트 로드 (tracks={len(tracks)})")
+                partial_ci=ck.get("partial_ci",0); split_lv=ck.get("split_lv",0)
+                print(f"★resume: window {done_windows}/{len(windows)} 완료 + partial concept {partial_ci}"
+                      + (f" (split_lv={split_lv})" if split_lv else "")
+                      + f" 체크포인트 로드 (tracks={len(tracks)})")
             else:
                 print(f"★ckpt 무시: 파라미터 불일치 {ck.get('key')} != {ckpt_key}")
         except Exception as e:
             print(f"★ckpt 로드 실패({e}) — 처음부터 실행")
 
-    def save_ckpt(dw, pci=0):
+    def save_ckpt(dw, pci=0, slv=0):
         with open(ckpt_path+".tmp","wb") as f:
-            pickle.dump(dict(key=ckpt_key,done_windows=dw,partial_ci=pci,tracks=tracks),f,protocol=4)
+            pickle.dump(dict(key=ckpt_key,done_windows=dw,partial_ci=pci,split_lv=slv,tracks=tracks),
+                        f,protocol=4)
         os.replace(ckpt_path+".tmp",ckpt_path)
 
     # depth 접근성 sanity check (첫 프레임)
@@ -353,32 +363,69 @@ def main():
             sid=open_session()
             wtracks=0
             ci=partial_ci if wi==done_windows else 0    # ★v2.5: 죽은 concept 부터 재개
-            partial_ci=0
-            if ci>0: print(f"  ★partial resume: window {wi+1} concept {ci}({VOCAB[ci]}) 부터")
+            slv=split_lv if wi==done_windows else 0     # ★v2.6: 죽은 concept 의 분할 레벨
+            partial_ci=0; split_lv=0
+            if ci>0: print(f"  ★partial resume: window {wi+1} concept {ci}({VOCAB[ci]}) 부터"
+                           + (f" split_lv={slv}" if slv else ""))
             while ci<len(VOCAB):
                 c=VOCAB[ci]
+                cur_slv,slv = slv,0                     # 분할 레벨은 재개된 concept 에만 적용
                 try:
-                    predictor.handle_request(dict(type="reset_session",session_id=sid))
-                    predictor.handle_request(dict(type="add_prompt",session_id=sid,frame_index=pf,text=c))
                     # ★v2.3: propagate 스트림을 모아두지 않고 즉시 필터 + bit-pack
                     byid={}
-                    for r in predictor.handle_stream_request(dict(type="propagate_in_video",session_id=sid)):
-                        o=r["outputs"]; stem=local2stem[r["frame_index"]]
-                        ids=np.asarray(o["out_obj_ids"]).reshape(-1)
-                        masks=np.asarray(o["out_binary_masks"]); probs=np.asarray(o["out_probs"]).reshape(-1)
-                        for k,oid in enumerate(ids):
-                            m=masks[k]
-                            if m.mean()<args.min_area: continue
-                            dd=byid.setdefault(int(oid),{"masks":{},"score":0.0})
-                            dd["masks"][stem]=pack_mask(m>0); dd["score"]=max(dd["score"],float(probs[k]))
+                    def collect(stream, off):
+                        for r in stream:
+                            o=r["outputs"]; stem=local2stem[off+r["frame_index"]]
+                            ids=np.asarray(o["out_obj_ids"]).reshape(-1)
+                            masks=np.asarray(o["out_binary_masks"]); probs=np.asarray(o["out_probs"]).reshape(-1)
+                            for k,oid in enumerate(ids):
+                                m=masks[k]
+                                if m.mean()<args.min_area: continue
+                                dd=byid.setdefault((off,int(oid)),{"masks":{},"score":0.0})
+                                dd["masks"][stem]=pack_mask(m>0); dd["score"]=max(dd["score"],float(probs[k]))
+                    if cur_slv>0:
+                        # ★v2.6: 이 concept 이 full-window 에서 OOM → 2^lv 조각으로 분할 처리.
+                        #        조각 track 은 시간 배타 → 3D re-id 가 재결합.
+                        nsub=2**cur_slv
+                        print(f"  ★[{c}] split mode: {Nw}프레임 → {nsub}조각")
+                        try: predictor.handle_request(dict(type="close_session",session_id=sid))
+                        except Exception: pass
+                        gc.collect(); torch.cuda.empty_cache()
+                        bounds=np.linspace(0,Nw,nsub+1).astype(int)
+                        for si in range(nsub):
+                            lo,hi=int(bounds[si]),int(bounds[si+1])
+                            if hi<=lo: continue
+                            sdir=tempfile.mkdtemp(prefix=f"sam3relabel_w{wi}s{si}_")
+                            for lj,gj in enumerate(range(lo,hi)):
+                                os.symlink(os.path.abspath(src[wr[gj]]),os.path.join(sdir,f"{lj}.jpg"))
+                            ssid=predictor.handle_request(dict(type="start_session",resource_path=sdir,
+                                    offload_video_to_cpu=args.offload_video,
+                                    offload_state_to_cpu=args.offload_state))["session_id"]
+                            predictor.handle_request(dict(type="add_prompt",session_id=ssid,frame_index=0,text=c))
+                            collect(predictor.handle_stream_request(
+                                dict(type="propagate_in_video",session_id=ssid)), lo)
+                            predictor.handle_request(dict(type="close_session",session_id=ssid))
+                            gc.collect(); torch.cuda.empty_cache()
+                        sid=open_session()              # 다음 concept 용 main 세션 복구
+                    else:
+                        predictor.handle_request(dict(type="reset_session",session_id=sid))
+                        predictor.handle_request(dict(type="add_prompt",session_id=sid,frame_index=pf,text=c))
+                        collect(predictor.handle_stream_request(
+                            dict(type="propagate_in_video",session_id=sid)), 0)
                 except RuntimeError as e:
-                    # ★v2.5: NVML assert 후 이 프로세스의 allocator 는 회생 불가(실측: empty_cache
-                    #        freed 0 bytes → 재빌드 즉시 재발). concept 단위 ckpt 저장 후 종료 —
-                    #        재실행(resume)이 이 concept 부터 깨끗한 프로세스로 이어감.
-                    print(f"  ★RuntimeError @[{c}] window {wi+1}: {str(e).splitlines()[0]}")
-                    save_ckpt(wi, ci)
-                    print(f"  ★ckpt 저장(window {wi}, concept {ci}) → exit 3. 재실행하면 [{c}] 부터 재개.\n"
-                          f"    무인 완주: until bash run_full_pipeline.sh relabel; do sleep 5; done")
+                    # ★v2.5/2.6: NVML assert 후 이 프로세스는 회생 불가 → ckpt 저장 후 종료.
+                    #   같은 concept 반복 실패 시 분할 레벨 상승(2→4조각), 그래도 실패면 skip.
+                    print(f"  ★RuntimeError @[{c}] window {wi+1} (split_lv={cur_slv}): {str(e).splitlines()[0]}")
+                    if cur_slv>=2:
+                        with open(os.path.join(args.out_root,"skipped_concepts.txt"),"a") as f:
+                            f.write(f"window{wi} {c}\n")
+                        print(f"  ★[{c}] 4조각에서도 실패 → skipped_concepts.txt 기록, 다음 concept 부터 재개")
+                        save_ckpt(wi, ci+1, 0)
+                    else:
+                        save_ckpt(wi, ci, cur_slv+1)
+                        print(f"  ★ckpt 저장(window {wi}, concept {ci}, split_lv={cur_slv+1}) → exit 3. "
+                              f"재실행하면 [{c}] 를 분할 처리로 재개.")
+                    print("    무인 완주: until bash run_full_pipeline.sh relabel; do sleep 5; done")
                     sys.exit(3)
                 kept=0
                 for oid,dd in byid.items():
