@@ -51,14 +51,17 @@ def main():
     FoVy = 2 * np.arctan(H / (2 * cam0["fy"]))
     proj = getProjectionMatrix(args.znear, args.zfar, FoVx, FoVy).transpose(0, 1)
 
-    rc, occ_tree = None, None
+    rc, occ_tree, occ_bb = None, None, None
     if args.occluder and os.path.exists(args.occluder):
         m = o3d.io.read_triangle_mesh(args.occluder)
         rc = o3d.t.geometry.RaycastingScene()
         rc.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(m))
         from scipy.spatial import cKDTree
-        occ_tree = cKDTree(np.asarray(m.vertices))   # 카메라가 가구/벽 '내부'에 박히는 것 방지
+        vv = np.asarray(m.vertices)
+        occ_tree = cKDTree(vv)                        # 카메라가 가구/벽 '내부'에 박히는 것 방지
+        occ_bb = (vv.min(0) + 0.3, vv.max(0) - 0.3)   # 방 내부 bbox (벽 밖 포즈 차단)
         print(f"free-space 필터: {args.occluder}")
+        print(f"방 내부 bbox: {np.round(occ_bb[0],2)} ~ {np.round(occ_bb[1],2)}")
 
     up = np.zeros(3); up[args.up_axis] = 1.0
     a0, a1 = [j for j in range(3) if j != args.up_axis]
@@ -86,6 +89,9 @@ def main():
             offs[args.up_axis] = np.sin(el)
             pos = ctr + rad * offs
 
+            if occ_bb is not None:    # 방 밖 포즈 reject (벽 뒤에서 known=0 되는 원인 차단)
+                if np.any(pos < occ_bb[0]) or np.any(pos > occ_bb[1]):
+                    continue
             if occ_tree is not None:  # 카메라 위치가 메쉬 표면 25cm 이내(내부/밀착) → reject
                 if occ_tree.query(pos)[0] < args.min_clear:
                     continue
