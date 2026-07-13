@@ -113,7 +113,15 @@ def run_see3d(args):
     else:
         # ── 점진(progressive) 체이닝: 궤적 순서대로 chunk씩 생성, 직전 예측을 다음 ref로 편입 ──
         # (idxs는 poses.npz 순서 = 궤적 순서여야 함. GT 근처 각도에서 시작하도록 궤적을 설계할 것.)
+        # ref 매칭: ref 파일명이 ref_g<gid>.* 이고 pose stem이 g<gid>_o## 이면
+        #           chunk 에 등장하는 gid 의 ref 만 사용(그룹 크기 억제). 매칭 없으면 전체 ref.
+        stem_of = {}
+        for rec in recs:
+            r = rec.item() if hasattr(rec, "item") and not isinstance(rec, dict) else rec
+            stem_of[int(r["idx"])] = str(r.get("stem", ""))
+        all_refs = sorted(glob.glob(os.path.join(args.ref_views, "*")))
         prev_preds = []
+        last_gids = None
         for c0 in range(0, len(idxs), args.chunk):
             sub = idxs[c0:c0 + args.chunk]
             wdir = tempfile.mkdtemp(prefix=f"see3d_w{c0:03d}_", dir=os.path.dirname(warp_dir))
@@ -121,8 +129,18 @@ def run_see3d(args):
                 shutil.copy(os.path.join(warp_dir, f"warp_{i:04d}.png"), os.path.join(wdir, f"warp_{i:04d}.png"))
                 shutil.copy(os.path.join(warp_dir, f"mask_{i:04d}.png"), os.path.join(wdir, f"mask_{i:04d}.png"))
             rdir = tempfile.mkdtemp(prefix=f"see3d_r{c0:03d}_", dir=os.path.dirname(warp_dir))
-            for p in sorted(glob.glob(os.path.join(args.ref_views, "*"))):
+            gids = set()
+            for i in sub:
+                m = re.match(r"g(.+?)_o", stem_of.get(i, ""))
+                if m:
+                    gids.add(m.group(1))
+            matched = [p for p in all_refs
+                       if any(re.match(rf"ref_g{re.escape(g)}[._]", os.path.basename(p)) for g in gids)]
+            for p in (matched if matched else all_refs):
                 shutil.copy(p, rdir)
+            if last_gids is not None and gids != last_gids:
+                prev_preds = []                                     # 객체가 바뀌면 carry 초기화
+            last_gids = gids
             for j, p in enumerate(prev_preds[-args.carry:]):        # 직전 예측 carry개를 ref로
                 shutil.copy(p, os.path.join(rdir, f"zz_prev_{j}.jpg"))
             run_inference(rdir, wdir, out_tmp)
