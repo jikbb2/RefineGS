@@ -120,6 +120,8 @@ def main():
                     help="depth 경계 필터: 인접 픽셀 상대 depth 변화가 이 비율 초과면 drop(streamer 방지). 0=off")
     ap.add_argument("--scene_margin", type=float, default=0.10,
                     help="[v4] warp depth 가 scene mesh 표면보다 이 거리(m) 이상 뒤면 phantom-known 취소")
+    ap.add_argument("--void_fallback", default="aabb", choices=["aabb", "off"],
+                    help="[v5] 메쉬 놓친 ray 를 방 AABB 로 2차 판정 — 실내 메쉬 구멍을 128(생성 대상)로 승격")
     ap.add_argument("--scene_mesh", default="",
                     help="장면(방) 메쉬(예 base fuse_cropped.ply). 지정 시 weight=3단계 학습weight: "
                          "255=관측(실색), 128=미관측 실제표면(See3D 대상, 0.5), 0=frustum-밖(void, 제외). "
@@ -128,13 +130,16 @@ def main():
     a = ap.parse_args()
 
     # scene raycast (frustum-밖 vs 미관측표면 구분)
-    rc_scene = None
+    rc_scene, aabb_lo, aabb_hi = None, None, None
     if a.scene_mesh and os.path.exists(a.scene_mesh):
         import open3d as o3d
         _m = o3d.io.read_triangle_mesh(a.scene_mesh)
         rc_scene = o3d.t.geometry.RaycastingScene()
         rc_scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(_m))
-        print(f"scene raycast on {a.scene_mesh} → 3단계 weight")
+        _vv = np.asarray(_m.vertices)
+        aabb_lo, aabb_hi = _vv.min(0) - 0.05, _vv.max(0) + 0.05
+        print(f"scene raycast on {a.scene_mesh} → 3단계 weight"
+              f" (void fallback={a.void_fallback}: 메쉬 구멍 방향은 미관측표면(128)으로 승격)")
 
     cams = read_colmap(a.colmap)
     src = []
@@ -219,6 +224,16 @@ def main():
             rays = np.concatenate([np.broadcast_to(ccam, dwn.shape), dwn], 1).astype(np.float32)
             thit = rc_scene.cast_rays(o3d.core.Tensor(rays))["t_hit"].numpy()
             scene_hit = np.isfinite(thit).reshape(H, W)
+            # [v5] void fallback: 메쉬를 놓친 ray 라도 방 AABB 를 통과하면 실내 = 표면 존재 확실
+            #      (mono 메쉬 구멍 — 예: 바닥 구멍 — 이 0(제외) 대신 128(생성 대상) 이 되도록)
+            if a.void_fallback == "aabb" and aabb_lo is not None:
+                inv = 1.0 / np.where(np.abs(dwn) < 1e-9, 1e-9, dwn)
+                t0s = (aabb_lo[None, :] - ccam[None, :]) * inv
+                t1s = (aabb_hi[None, :] - ccam[None, :]) * inv
+                tmin = np.minimum(t0s, t1s).max(1)
+                tmax = np.maximum(t0s, t1s).min(1)
+                aabb_hit = (tmax >= np.maximum(tmin, 0.0)).reshape(H, W)
+                scene_hit = scene_hit | aabb_hit
             # [v4] 씬 수준 phantom 필터: mesh 표면보다 '뒤'에서 온 known 픽셀 = 관통 배경 →
             #      known 취소(검정+미관측 승격). 소파 관통 바닥, 떠 있는 꽃 같은 아티팩트 제거.
             #      hit점 = ccam + dwn*thit → 카메라 z = Rt[2]·hit + tt[2]
