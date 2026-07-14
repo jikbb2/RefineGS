@@ -60,6 +60,7 @@ def main():
 
     cams = read_colmap(args.colmap)
     center_of = {c["stem"]: cam_center(c["R"], c["t"]) for c in cams}
+    cam_of = {c["stem"]: c for c in cams}
 
     rc, occ_tree, occ_bb = None, None, None
     if args.occluder and os.path.exists(args.occluder):
@@ -104,16 +105,34 @@ def main():
         az0 = np.degrees(np.arctan2(mdir[a1], mdir[a0]))
         rad = float(np.clip(np.median(dist), args.radius_min, args.radius_max))
 
-        N = args.n_anchor + args.n_desc
+        # ── 실측 앵커: 정화 stem 중 균등 K장의 '실제 카메라 포즈' 그대로 (known 보장) ──
         kept = 0
-        for i in range(N):
-            if i < args.n_anchor:   # 앵커: 관측 방향 근방(±15° 지터), 관측 고도 유지
-                az = az0 + (i - (args.n_anchor - 1) / 2) * 15.0
-                el = el0
-            else:                    # 하강: el0 → elev_min, azimuth 선회
-                f = (i - args.n_anchor) / max(args.n_desc - 1, 1)
-                az = az0 + args.sweep_az * f
-                el = el0 + (args.elev_min - el0) * f
+        ks = [round(j * (len(stems) - 1) / max(args.n_anchor - 1, 1)) for j in range(args.n_anchor)]
+        anchor_pos = None
+        for j, k in enumerate(ks):
+            c = cam_of.get(stems[k])
+            if c is None:
+                continue
+            M = np.eye(4); M[:3, :3] = c["R"]; M[:3, 3] = c["t"]   # colmap w2c
+            wvt = torch.tensor(M.T, dtype=torch.float32)            # 저장 규약 = w2c^T
+            fpt = (wvt.unsqueeze(0).bmm(proj.unsqueeze(0))).squeeze(0)
+            records.append(dict(idx=idx, stem=f"g{gid}_o{j:02d}",
+                                world_view_transform=wvt.numpy(),
+                                full_proj_transform=fpt.numpy(),
+                                FoVx=float(FoVx), FoVy=float(FoVy), width=W, height=H))
+            idx += 1; kept += 1
+            anchor_pos = center_of[stems[k]]
+
+        # ── 하강 시작 방향: 마지막 실측 앵커의 위치 기준 (메쉬 중심 오류에 강건) ──
+        if anchor_pos is not None:
+            dv = anchor_pos - ctr; dvn = dv / (np.linalg.norm(dv) + 1e-9)
+            el0 = np.degrees(np.arcsin(np.clip(dvn[args.up_axis], -1, 1)))
+            az0 = np.degrees(np.arctan2(dvn[a1], dvn[a0]))
+
+        for i in range(args.n_desc):     # 하강: el0 → elev_min, azimuth 선회
+            f = i / max(args.n_desc - 1, 1)
+            az = az0 + args.sweep_az * f
+            el = el0 + (args.elev_min - el0) * f
             azr, elr = np.deg2rad(az), np.deg2rad(el)
             offs = np.zeros(3)
             offs[a0] = np.cos(elr) * np.cos(azr)
@@ -140,12 +159,13 @@ def main():
             t = -Rc2w.T @ pos
             wvt = torch.tensor(getWorld2View2(Rc2w, t)).transpose(0, 1).float()
             fpt = (wvt.unsqueeze(0).bmm(proj.unsqueeze(0))).squeeze(0)
-            records.append(dict(idx=idx, stem=f"g{gid}_o{i:02d}",
+            records.append(dict(idx=idx, stem=f"g{gid}_o{args.n_anchor + i:02d}",
                                 world_view_transform=wvt.numpy(),
                                 full_proj_transform=fpt.numpy(),
                                 FoVx=float(FoVx), FoVy=float(FoVy), width=W, height=H))
             idx += 1; kept += 1
-        print(f"gid {gid:>3}: obs {len(obs)}뷰  az0 {az0:6.1f}°  el0 {el0:5.1f}°  r={rad:.2f} → {kept}/{N}")
+        print(f"gid {gid:>3}: obs {len(obs)}뷰  az0 {az0:6.1f}°  el0 {el0:5.1f}°  r={rad:.2f} → "
+              f"{kept}/{args.n_anchor + args.n_desc} (실측앵커 {min(args.n_anchor, kept)})")
 
     out = os.path.expanduser(args.out)
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
