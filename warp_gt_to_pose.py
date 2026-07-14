@@ -118,6 +118,8 @@ def main():
     ap.add_argument("--src_stride", type=int, default=1, help="src 픽셀 stride(속도). 1=full(권장)")
     ap.add_argument("--edge_thr", type=float, default=0.05,
                     help="depth 경계 필터: 인접 픽셀 상대 depth 변화가 이 비율 초과면 drop(streamer 방지). 0=off")
+    ap.add_argument("--scene_margin", type=float, default=0.10,
+                    help="[v4] warp depth 가 scene mesh 표면보다 이 거리(m) 이상 뒤면 phantom-known 취소")
     ap.add_argument("--scene_mesh", default="",
                     help="장면(방) 메쉬(예 base fuse_cropped.ply). 지정 시 weight=3단계 학습weight: "
                          "255=관측(실색), 128=미관측 실제표면(See3D 대상, 0.5), 0=frustum-밖(void, 제외). "
@@ -212,15 +214,28 @@ def main():
             dc = np.stack([(uu-cxt)/fxt, (vv-cyt)/fyt, np.ones_like(uu, float)], -1).reshape(-1, 3)
             Rc2w = Rt.T; ccam = (-Rt.T @ tt).astype(np.float32)
             dw = dc @ Rc2w.T
-            dw /= (np.linalg.norm(dw, axis=1, keepdims=True) + 1e-9)
-            rays = np.concatenate([np.broadcast_to(ccam, dw.shape), dw], 1).astype(np.float32)
+            dnorm2 = np.linalg.norm(dw, axis=1, keepdims=True) + 1e-9
+            dwn = dw / dnorm2
+            rays = np.concatenate([np.broadcast_to(ccam, dwn.shape), dwn], 1).astype(np.float32)
             thit = rc_scene.cast_rays(o3d.core.Tensor(rays))["t_hit"].numpy()
             scene_hit = np.isfinite(thit).reshape(H, W)
+            # [v4] 씬 수준 phantom 필터: mesh 표면보다 '뒤'에서 온 known 픽셀 = 관통 배경 →
+            #      known 취소(검정+미관측 승격). 소파 관통 바닥, 떠 있는 꽃 같은 아티팩트 제거.
+            #      hit점 = ccam + dwn*thit → 카메라 z = Rt[2]·hit + tt[2]
+            hitp = ccam[None, :] + dwn * thit[:, None]
+            z_mesh_cam = np.where(np.isfinite(thit), hitp @ Rt[2] + tt[2], np.inf).reshape(H, W)
+            zb = np.where(zbuf < np.inf, zbuf, 0).reshape(H, W)
+            phantom = filled & scene_hit & (zb > z_mesh_cam + a.scene_margin)
+            if phantom.any():
+                view[phantom] = 0
+                Image.fromarray(view).save(os.path.join(a.out, f"view_{i:04d}.jpg"), quality=95)
+                filled = filled & ~phantom
             w = np.zeros((H, W), np.uint8)
             w[filled] = 255
             w[(~filled) & scene_hit] = 128
             Image.fromarray(w).save(os.path.join(a.out, f"weight_{i:04d}.png"))
-            print(f"[{i:04d}] known {filled.mean():.3f}  미관측표면 {((~filled)&scene_hit).mean():.3f}  frustum밖 {((~filled)&~scene_hit).mean():.3f}")
+            print(f"[{i:04d}] known {filled.mean():.3f}  미관측표면 {((~filled)&scene_hit).mean():.3f}  "
+                  f"frustum밖 {((~filled)&~scene_hit).mean():.3f}  phantom {phantom.mean():.3f}")
         else:
             hole = ~filled
             Image.fromarray((hole*255).astype(np.uint8)).save(os.path.join(a.out, f"weight_{i:04d}.png"))
