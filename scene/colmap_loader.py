@@ -468,131 +468,72 @@ def extract_by_name(elements, name):
 
 
 def filterPLY(path_ply, folder_path, intrinsics, extrinsics):
-
+    """[v2 벡터화] 뷰별 전체 점 일괄 투영 — 기존 O(views×points) Python 루프 대체.
+    동작 보존: hit 카운트 > len(images)/2 → instance / > 5 → bbox / fallback 순 저장.
+    (개선: 카메라 뒤(z<=0) 점의 가짜 적중 제거)"""
     point_cloud = o3d.io.read_point_cloud(path_ply)
-    
+    points = np.asarray(point_cloud.points)          # (N,3)
+    N = len(points)
+    counts = np.zeros(N, dtype=np.int32)
 
-
-    points = np.asarray(point_cloud.points)
-    filtered_3D = []
     images_path = os.path.join(folder_path, "images")
     images = os.listdir(images_path)
-    
-    for image_label in images:
-        
-        #image_path = os.path.join(images_path, image_label)
-        #image = cv2.imread(image_path)
-        img_lbl = image_label#.replace(".png", ".JPEG")
 
+    for image_label in images:
+        img_lbl = image_label
         if image_label.split(".")[-1].lower() != "png":
             image_label = os.path.splitext(image_label)[0] + ".png"
-
-        extrinsic_image =  extract_by_name(extrinsics, img_lbl)
-
+        extrinsic_image = extract_by_name(extrinsics, img_lbl)
         try:
             camera_id = extrinsic_image.camera_id
-        except:
+        except Exception:
             continue
-     
-        intrinsic_image =  intrinsics[camera_id]
-
-        f_x, f_y = intrinsic_image.params[:2] # Focal lengths in x and y (pixels)
-        c_x, c_y = intrinsic_image.params[2:] # Optical center (image center in pixels)
-
-        R = qvec2rotmat(extrinsic_image.qvec)  
-        t = extrinsic_image.tvec  
-
-        K = np.array([
-            [f_x, 0, c_x],
-            [0, f_y, c_y],
-            [0, 0, 1]])
-    
-
-        #mask_label = image_label.replace(".png", ".npy")
+        intrinsic_image = intrinsics[camera_id]
+        f_x, f_y = intrinsic_image.params[:2]
+        c_x, c_y = intrinsic_image.params[2:]
+        R = qvec2rotmat(extrinsic_image.qvec)
+        t = extrinsic_image.tvec
 
         mask_path = os.path.join(folder_path, "masks", image_label)
-
-        # mask_img = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
         try:
             mask_img = IMG.open(mask_path).convert("RGBA")
-        except: 
+        except Exception:
             continue
-       
-        alpha = np.array(mask_img)[:, :, 3]
-        mask = alpha > 0
+        mask = np.array(mask_img)[:, :, 3] > 0       # (H,W)
+        H, W = mask.shape
 
-        # mask = mask_img>127
+        # ---- 전체 점 일괄 투영 (기존 per-point 루프 대체) ----
+        pc = points @ R.T + t                        # (N,3) camera
+        z = pc[:, 2]
+        front = z > 1e-6
+        u = np.clip(f_x * pc[:, 0] / np.where(front, z, 1.0) + c_x, 0, W - 1).astype(np.int64)
+        v = np.clip(f_y * pc[:, 1] / np.where(front, z, 1.0) + c_y, 0, H - 1).astype(np.int64)
+        counts += (front & mask[v, u]).astype(np.int32)
 
-        # mask = np.squeeze(mask)
-
-        # plt.imshow(mask)
-        # plt.savefig("test.png")
-
-        #mask = np.squeeze(np.load(mask_path))
-   
-    
-        for point in points:
-            # Homogeneous coordinates of the 3D point
-            point_homogeneous = np.append(point, 1)  # [X, Y, Z, 1]
-            
-            # Camera projection (R * point + t)
-            projected_point = K @ (R @ point_homogeneous[:3] + t).reshape((3, 1))
-
-            # Convert from homogeneous to 2D
-            x_2d = (projected_point[0] / projected_point[2]).item()
-            y_2d = (projected_point[1] / projected_point[2]).item()
-
-            clipped_x = np.clip(x_2d, 0, mask.shape[1]-1)
-            clipped_y = np.clip(y_2d, 0, mask.shape[0]-1)
-
-            if mask[int(clipped_y), int(clipped_x)] :
-                filtered_3D.append(point)
-            
-
-    filtered_3D = np.array(filtered_3D)
-
-    #path 
-    path_filtered_ply = os.path.join(folder_path, "points3d.ply")
-
-   
-    if(len(filtered_3D)== 0): 
-        o3d.io.write_point_cloud(path_filtered_ply, point_cloud)
+    if counts.max() == 0:
+        o3d.io.write_point_cloud(os.path.join(folder_path, "points3d.ply"), point_cloud)
         print("NO POINTS!")
         return
-    
-    u, c = np.unique(filtered_3D, axis = 0, return_counts=True)
-    dup = u[c > len(images)/2]
 
-    u_1, c_1 = np.unique(filtered_3D, axis = 0, return_counts=True)
-    dup_1 = u_1[c_1 > 5]
+    idx_inst = np.where(counts > len(images) / 2)[0]     # 기존 dup(과반) 의미 보존
+    idx_bb   = np.where(counts > 5)[0]                    # 기존 dup_1 의미 보존
 
-    # Find indices of matching points in the point cloud
-    indices = np.where((points[:, None] == dup).all(axis=2).any(axis=1))[0]
+    filtered_pcd = point_cloud.select_by_index(idx_inst)
+    if len(idx_bb) > 0:
+        min_corner_bb = points[idx_bb].min(axis=0)
+        max_corner_bb = points[idx_bb].max(axis=0)
+        bbox = o3d.geometry.AxisAlignedBoundingBox(min_corner_bb, max_corner_bb)
+        cropped_pcd = point_cloud.crop(bbox)
+    else:
+        cropped_pcd = point_cloud
 
-    # Extract matched points
-    filtered_pcd = point_cloud.select_by_index(indices)
-
-    #Save the filtered point cloud to a PLY file
-    #o3d.io.write_point_cloud(path_filtered_ply, filtered_pcd)
-
-    min_corner_bb = np.min(dup_1, axis = 0 ) 
-    max_corner_bb = np.max(dup_1, axis = 0 ) 
-
-    bbox = o3d.geometry.AxisAlignedBoundingBox(min_corner_bb, max_corner_bb)
-    bbox.color = (1, 0, 0)  # Set bounding box color to red
-    cropped_pcd = point_cloud.crop(bbox)
-
-    print("Instance point: %d"%len(filtered_pcd.points))
-
-    print("Bounding box point: %d"%len(cropped_pcd.points))
-
-    #o3d.visualization.draw_geometries([point_cloud, bbox])
+    print("Instance point: %d" % len(filtered_pcd.points))
+    print("Bounding box point: %d" % len(cropped_pcd.points))
 
     path_filtered_ply = os.path.join(folder_path, "points3d.ply")
-    # Save the filtered point cloud to a PLY file
-    if(len(filtered_pcd.points)>10):
+    if len(filtered_pcd.points) > 10:
         o3d.io.write_point_cloud(path_filtered_ply, filtered_pcd)
-    elif(len(cropped_pcd.points)>10):
+    elif len(cropped_pcd.points) > 10:
         o3d.io.write_point_cloud(path_filtered_ply, cropped_pcd)
     else:
         o3d.io.write_point_cloud(path_filtered_ply, point_cloud)

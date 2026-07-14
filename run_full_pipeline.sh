@@ -16,7 +16,7 @@
 set -uo pipefail
 shopt -s nullglob                      # 빈 glob → 루프 skip (literal '*' 폴더 방지)
 STAGE=${1:-help}
-
+GTD=${GTD:-/home/elicer/nice-slam/Datasets/Replica/room0/results}
 SCENE=${SCENE:-replica_room0_v2}
 ROOT=/home/elicer/RefineGS
 FRAMES=${FRAMES:-${ROOT}/data/${SCENE}/images}
@@ -44,7 +44,7 @@ if [ "${STAGE}" = "relabel" ]; then
     --vocab_json ${VOCAB} --bpe ${BPE} --stride ${STRIDE} --window ${WINDOW}\
     --prompt_frame ${PROMPT_FRAME:-0} --min_area 0.003 --min_track 3 \
     --reid_th ${REID:-0.3} --iou_th ${IOU:-0.5} --cand_th ${CAND:-0.1} \
-    --exclude_concepts "${EXCLUDE}" --out_root ${RELABEL}
+    --exclude_concepts "${EXCLUDE}" --out_root ${RELABEL} || { echo "[ERROR] relabel FAILED"; exit 1; }
   N=$(ls -d ${RELABEL}/*/ 2>/dev/null | wc -l)
   echo "=== relabel DONE: ${N} objects → ${RELABEL}.  다음: conda activate split_and_splat && bash $0 recon ==="
   exit 0
@@ -87,6 +87,7 @@ if [ "${STAGE}" = "recon" ]; then
       echo "  [train] ${gid} (views=${NM}, iters=${IT})"
       python train.py -s "${D}" -m "${MDIR}" --iterations ${IT} --is_instance \
         --disable_viewer --lambda_dist ${LDIST} --lambda_normal ${LNORM} \
+        --gt_depth_dir ${GTD} --lambda_gtdepth 0.5 --front_mult 3.0 \
         || { echo "    train fail ${gid}"; continue; }
     fi
     [ -f "${MDIR}/train/ours_${IT}/fuse_post.ply" ] || \

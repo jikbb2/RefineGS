@@ -26,23 +26,34 @@ from scipy.optimize import linear_sum_assignment
 
 
 def load_gt_objects(gt_path, min_faces=50):
-    """semantic ply → {object_id: o3d mesh}. face 속성 object_id 기준."""
+    """semantic ply → {object_id: o3d mesh}. quad face 자동 삼각화."""
     ply = PlyData.read(os.path.expanduser(gt_path))
     v = ply["vertex"]
     verts = np.stack([v["x"], v["y"], v["z"]], -1).astype(np.float64)
     f = ply["face"]
     fname = [n for n in f.data.dtype.names if "vertex" in n][0]
-    faces = np.stack(f[fname]) if f[fname].dtype != object else np.array([list(x) for x in f[fname]])
     oid_name = [n for n in f.data.dtype.names if "object" in n.lower()]
     assert oid_name, f"GT face에 object_id 속성 없음: {f.data.dtype.names}"
     oids = np.asarray(f[oid_name[0]])
+
+    faces = np.vstack([np.asarray(x) for x in f[fname]])   # (N,3) 또는 (N,4)
+    k = faces.shape[1]
+    if k == 3:
+        tris, toids = faces, oids
+    elif k == 4:                                            # quad → 삼각형 2개
+        tris = np.concatenate([faces[:, [0, 1, 2]], faces[:, [0, 2, 3]]], axis=0)
+        toids = np.concatenate([oids, oids])
+    else:
+        raise SystemExit(f"지원 안 되는 face 크기: {k}")
+
     out = {}
-    for oid in np.unique(oids):
-        fi = faces[oids == oid]
+    for oid in np.unique(toids):
+        fi = tris[toids == oid]
         if len(fi) < min_faces:
             continue
         m = o3d.geometry.TriangleMesh(
-            o3d.utility.Vector3dVector(verts), o3d.utility.Vector3iVector(fi.astype(np.int32)))
+            o3d.utility.Vector3dVector(verts),
+            o3d.utility.Vector3iVector(np.ascontiguousarray(fi.astype(np.int32))))
         m.remove_unreferenced_vertices()
         out[int(oid)] = m
     return out

@@ -58,7 +58,8 @@ def _load_gt_depth(cam, source_path, scale=6553.5, override_dir=None):
     import os, cv2, numpy as np, torch
     key = getattr(cam, "image_name", None)
     if key in _DEPTH_CACHE:
-        return _DEPTH_CACHE[key]
+        gd, valid = _DEPTH_CACHE[key]
+        return (gd.cuda(), valid.cuda()) if gd is not None else (None, None)
     stem = os.path.splitext(key)[0] if key else None
     p = None
     if stem:
@@ -80,11 +81,10 @@ def _load_gt_depth(cam, source_path, scale=6553.5, override_dir=None):
     d = cv2.resize(d, (cam.image_width, cam.image_height), interpolation=cv2.INTER_NEAREST)
     gd = torch.from_numpy(d[None]).float().cuda()
     am = getattr(cam, "alpha_mask", None)
-    am = am if am is not None else torch.ones_like(gd)
+    am = am.to(gd.device) if am is not None else torch.ones_like(gd)
     valid = ((gd > 1e-3) & (am > 0.5)).float()
-    _DEPTH_CACHE[key] = (gd, valid)
+    _DEPTH_CACHE[key] = (gd.cpu(), valid.cpu())
     return gd, valid
-# =====================================================================
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
 
@@ -119,7 +119,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 continue
             _wvt = _t.tensor(_np.asarray(_r["world_view_transform"]), dtype=_t.float32).cuda()
             _fpt = _t.tensor(_np.asarray(_r["full_proj_transform"]), dtype=_t.float32).cuda()
-            _cam = _MiniCam(int(_r["width"]), int(_r["height"]), float(_r["FoVy"]), float(_r["FoVx"]),
+            _res = max(int(getattr(args, "resolution", 1) or 1), 1)
+            _W = max(int(_r["width"]) // _res, 1)
+            _H = max(int(_r["height"]) // _res, 1)
+            _cam = _MiniCam(_W, _H, float(_r["FoVy"]), float(_r["FoVx"]),
                             0.01, 100.0, _wvt, _fpt)
             _g = _t.from_numpy(_np.asarray(_Img.open(_gp).convert("RGB"))).float().permute(2, 0, 1).cuda() / 255.0
             _w = _t.from_numpy(_np.asarray(_Img.open(_wp).convert("L"))).float().cuda() / 255.0
