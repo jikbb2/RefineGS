@@ -202,6 +202,9 @@ def main():
         filled = (zbuf < np.inf).reshape(H, W)
         view = color.reshape(H, W, 3).astype(np.uint8)
         Image.fromarray(view).save(os.path.join(a.out, f"view_{i:04d}.jpg"), quality=95)
+        # [v3] warp depth 저장 — phantom-known(객체 뒤 배경이 관통해 보이는 픽셀) 재분류용
+        np.save(os.path.join(a.out, f"depth_{i:04d}.npy"),
+                np.where(zbuf < np.inf, zbuf, 0).reshape(H, W).astype(np.float16))
 
         if rc_scene is not None:
             import open3d as o3d

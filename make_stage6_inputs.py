@@ -41,6 +41,7 @@ def target_from_pose(rec):
 
 
 def obj_silhouette(verts, rec, dil=6):
+    """실루엣 + 픽셀별 객체 최근접 깊이(near-depth) — phantom-known 판정용."""
     R, t, fx, fy, cx, cy, W, H = target_from_pose(rec)
     pc = verts @ R.T + t
     z = pc[:, 2]
@@ -49,7 +50,13 @@ def obj_silhouette(verts, rec, dil=6):
     v = np.clip(fy * pc[ok, 1] / z[ok] + cy, 0, H - 1).astype(np.int64)
     m = np.zeros((H, W), bool)
     m[v, u] = True
-    return binary_dilation(m, iterations=dil)
+    zmap = np.full(H * W, np.inf, np.float32)
+    np.minimum.at(zmap, v * W + u, z[ok].astype(np.float32))
+    zmap = zmap.reshape(H, W)
+    sil = binary_dilation(m, iterations=dil)
+    zfill = np.median(z[ok]) if ok.any() else 0.0
+    zmap = np.where(np.isfinite(zmap), zmap, zfill)   # 스플랫 빈 픽셀은 객체 중앙 깊이로
+    return sil, zmap
 
 
 def crop_window(sil, zoom, min_side, W, H):
@@ -96,6 +103,8 @@ def main():
     ap.add_argument("--min_side", type=int, default=200, help="크롭 최소 변(px)")
     ap.add_argument("--min_known_obj", type=float, default=0.15)
     ap.add_argument("--min_unobs_obj", type=float, default=0.10)
+    ap.add_argument("--phantom_margin", type=float, default=0.10,
+                    help="warp depth 가 객체 near-depth 보다 이 거리(m) 이상 뒤면 phantom-known 으로 재분류")
     args = ap.parse_args()
 
     soft = os.path.expanduser(args.soft_in)
@@ -128,35 +137,52 @@ def main():
 
         w = np.array(Image.open(wp).convert("L"))
         H, W = w.shape
-        sil = obj_silhouette(verts_of(gid), rec)
+        sil, objz = obj_silhouette(verts_of(gid), rec)
         if sil.shape != w.shape:
             sil = np.array(Image.fromarray(sil).resize((W, H), Image.NEAREST)) > 0
+            objz = np.array(Image.fromarray(objz).resize((W, H), Image.NEAREST))
         if sil.sum() < 50:
             continue
-        known_o = (w == 255) & sil
-        unobs_o = (w == 128) & sil
-        s = max(sil.sum(), 1)
-        r_known, r_unobs = known_o.sum() / s, unobs_o.sum() / s
 
-        view = Image.open(os.path.join(soft, f"view_{i:04d}.jpg")).convert("RGB")
+        # [v3] phantom-known: 실루엣 안인데 warp depth 가 객체 깊이보다 '뒤' = 배경 관통 픽셀
+        #      → known 에서 제외하고 생성 대상으로 재분류 (잘린 책상 문제 수정)
+        phantom = np.zeros_like(sil)
+        dnp = os.path.join(soft, f"depth_{i:04d}.npy")
+        if os.path.exists(dnp):
+            wdep = np.load(dnp).astype(np.float32)
+            phantom = (w == 255) & sil & (wdep > objz + args.phantom_margin)
+
+        known_o = (w == 255) & sil & ~phantom          # NV 감독: 진짜 실측만
+        gen_o = ((w == 128) & sil) | phantom           # See3D 생성+감독: 미관측 + phantom
+        known_frame = (w == 255) & ~phantom            # See3D mask 용: 프레임 전체의 신뢰 known
+        s = max(sil.sum(), 1)
+        r_known, r_unobs = known_o.sum() / s, gen_o.sum() / s
+
+        view = np.asarray(Image.open(os.path.join(soft, f"view_{i:04d}.jpg")).convert("RGB")).copy()
+        view_sd = view.copy()
+        view_sd[phantom] = 0                            # 조건에서 유령 배경 제거(검정=생성 대상)
+
         if args.zoom > 0:
             x0, x1, y0, y1 = crop_window(sil, args.zoom, args.min_side, W, H)
             rec_out = crop_record(rec, x0, x1, y0, y1)
-            view_c = view.crop((x0, y0, x1, y1))
-            known_c = known_o[y0:y1, x0:x1]
-            unobs_c = unobs_o[y0:y1, x0:x1]
+            cr = lambda a: a[y0:y1, x0:x1]
         else:
-            rec_out, view_c, known_c, unobs_c = dict(rec), view, known_o, unobs_o
+            rec_out = dict(rec)
+            x0, x1, y0, y1 = 0, W, 0, H
+            cr = lambda a: a
 
         if r_known >= args.min_known_obj:
-            view_c.save(os.path.join(nv, f"gen_{i:04d}.jpg"), quality=95)
-            Image.fromarray((known_c * 255).astype(np.uint8)).save(os.path.join(nv, f"weight_{i:04d}.png"))
+            Image.fromarray(cr(view)).save(os.path.join(nv, f"gen_{i:04d}.jpg"), quality=95)
+            Image.fromarray((cr(known_o) * 255).astype(np.uint8)).save(os.path.join(nv, f"weight_{i:04d}.png"))
             nv_recs.append(rec_out)
         if r_unobs >= args.min_unobs_obj:
-            view_c.save(os.path.join(sd, f"view_{i:04d}.jpg"), quality=95)
-            Image.fromarray((unobs_c * 255).astype(np.uint8)).save(os.path.join(sd, f"weight_{i:04d}.png"))
+            Image.fromarray(cr(view_sd)).save(os.path.join(sd, f"view_{i:04d}.jpg"), quality=95)
+            Image.fromarray((cr(gen_o) * 255).astype(np.uint8)).save(os.path.join(sd, f"weight_{i:04d}.png"))
+            # [v3] 생성 mask 분리: known(신뢰 실측)만 흰색 — 나머지(모든 미관측+phantom)는 생성
+            Image.fromarray((cr(known_frame) * 255).astype(np.uint8)).save(os.path.join(sd, f"mask_{i:04d}.png"))
             sd_recs.append(rec_out)
-        print(f"[{i:04d}] g{gid:>3}  obj-known {r_known:.2f}  obj-unobs {r_unobs:.2f}"
+        print(f"[{i:04d}] g{gid:>3}  obj-known {r_known:.2f}  obj-gen {r_unobs:.2f}"
+              f"  phantom {phantom.sum()/s:.2f}"
               + (f"  crop {rec_out['width']}x{rec_out['height']}" if args.zoom > 0 else ""))
 
     np.savez(os.path.join(nv, "poses.npz"), records=np.array(nv_recs, dtype=object))

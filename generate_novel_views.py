@@ -84,9 +84,14 @@ def run_see3d(args):
         if not (os.path.exists(vp) and os.path.exists(wp)):
             continue
         Image.open(vp).convert("RGB").save(os.path.join(warp_dir, f"warp_{i:04d}.png"))
-        w = np.asarray(Image.open(wp).convert("L")).astype(np.float32) / 255.0
-        known = (w < args.hole_thr).astype(np.uint8) * 255
-        Image.fromarray(known).save(os.path.join(warp_dir, f"mask_{i:04d}.png"))
+        mp = os.path.join(args.soft_in, f"mask_{i:04d}.png")
+        if os.path.exists(mp):
+            # [v6] 분리 mask 우선: known(신뢰 실측)=흰 / 생성 대상=검 (학습 weight 와 독립)
+            Image.open(mp).convert("L").save(os.path.join(warp_dir, f"mask_{i:04d}.png"))
+        else:
+            w = np.asarray(Image.open(wp).convert("L")).astype(np.float32) / 255.0
+            known = (w < args.hole_thr).astype(np.uint8) * 255
+            Image.fromarray(known).save(os.path.join(warp_dir, f"mask_{i:04d}.png"))
         idxs.append(i)
     if not idxs:
         raise SystemExit("see3d 입력 0개 — soft_in 비었거나 weight 전부 0. MIN_WEIGHT/hole_thr 확인.")
