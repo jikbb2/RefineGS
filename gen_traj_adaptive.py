@@ -34,6 +34,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--recon_root", required=True)
     ap.add_argument("--masks_root", required=True)
+    ap.add_argument("--stems_dir", default="", help="clean_stems.py 출력 폴더 (gid.txt) — 관측 방향 계산에 정화 목록 사용")
     ap.add_argument("--colmap", required=True)
     ap.add_argument("--gids", required=True)
     ap.add_argument("--model_cams", required=True)
@@ -85,8 +86,13 @@ def main():
         obj_r = float(np.linalg.norm(v.max(0) - v.min(0)) / 2)
 
         # 이 객체를 관측한 실측 카메라들 → 관측 방향/거리
-        stems = [os.path.splitext(os.path.basename(p))[0]
-                 for p in glob.glob(os.path.join(args.masks_root, gid, "images", "*"))]
+        # --stems_dir 가 있으면 3D-일관 정화 목록(clean_stems.py) 사용 — 오염 프레임 배제
+        sf = os.path.join(os.path.expanduser(args.stems_dir), f"{gid}.txt") if args.stems_dir else ""
+        if sf and os.path.exists(sf):
+            stems = [ln.strip() for ln in open(sf) if ln.strip()]
+        else:
+            stems = [os.path.splitext(os.path.basename(p))[0]
+                     for p in glob.glob(os.path.join(args.masks_root, gid, "images", "*"))]
         obs = np.array([center_of[s] for s in stems if s in center_of])
         if len(obs) < 3:
             print(f"[skip] gid {gid}: 관측 카메라 매칭 {len(obs)}개"); continue
