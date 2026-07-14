@@ -85,6 +85,15 @@ def main():
         v = np.asarray(o3d.io.read_triangle_mesh(mp[-1]).vertices)
         ctr = (v.max(0) + v.min(0)) / 2
         obj_r = float(np.linalg.norm(v.max(0) - v.min(0)) / 2)
+        # centers.json(정화 마스크 back-projection 지배 클러스터) 있으면 우선 — 오염 메쉬 중심 무효화
+        if args.stems_dir:
+            cj = os.path.join(os.path.expanduser(args.stems_dir), "centers.json")
+            if os.path.exists(cj):
+                import json as _json
+                cc = _json.load(open(cj)).get(gid)
+                if cc:
+                    ctr = np.array(cc["center"], float)
+                    obj_r = float(cc["radius"])
 
         # 이 객체를 관측한 실측 카메라들 → 관측 방향/거리
         # --stems_dir 가 있으면 3D-일관 정화 목록(clean_stems.py) 사용 — 오염 프레임 배제

@@ -42,6 +42,7 @@ def main():
     cams = {c["stem"]: c for c in read_colmap(args.colmap)}
     out = os.path.expanduser(args.out)
     os.makedirs(out, exist_ok=True)
+    centers = {}
 
     for gid in args.gids.split(","):
         gid = gid.strip()
@@ -86,8 +87,15 @@ def main():
         kept = [s for s, k in zip(stems, keep) if k]
         with open(os.path.join(out, f"{gid}.txt"), "w") as f:
             f.write("\n".join(kept))
-        print(f"gid {gid:>3}: {len(kept)}/{len(stems)} 유지 (제거 {len(stems)-len(kept)})")
-    print(f"→ {out}/<gid>.txt")
+        med = np.median(C[keep], axis=0)                 # 지배 클러스터 3D 중심 (실측 기하)
+        spread = float(np.percentile(np.linalg.norm(C[keep] - med, axis=1), 90))
+        centers[gid] = dict(center=med.tolist(), radius=max(spread, 0.15))
+        print(f"gid {gid:>3}: {len(kept)}/{len(stems)} 유지 (제거 {len(stems)-len(kept)})  "
+              f"center {np.round(med,2).tolist()}  r90 {spread:.2f}")
+    import json
+    with open(os.path.join(out, "centers.json"), "w") as f:
+        json.dump(centers, f, indent=1)
+    print(f"→ {out}/<gid>.txt + centers.json")
 
 
 if __name__ == "__main__":
