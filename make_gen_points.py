@@ -117,6 +117,10 @@ def main():
             n_skip += 1; continue
         dep_al = dep * a + b
 
+        # [v2] 학습용 depth map 저장: 생성 영역만 유효(그 외 0) — train.py NV depth 손실에서 사용
+        dep_save = np.where(gw & (dep_al > 1e-3), dep_al, 0).astype(np.float16)
+        np.save(os.path.join(gen, f"depth_{i:04d}.npy"), dep_save)
+
         vs, us = np.nonzero(gw & (dep_al > 1e-3))
         if len(vs) == 0:
             n_skip += 1; continue
@@ -155,6 +159,7 @@ def main():
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
     o3d.io.write_point_cloud(out, pc)
     print(f"\n{n_ok}뷰 사용 / {n_skip}뷰 skip → {len(P)}점 → {out}")
+    print(f"학습용 depth map: {gen}/depth_%04d.npy (train.py --nv_lambda_depth 로 사용)")
 
 
 if __name__ == "__main__":

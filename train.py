@@ -58,8 +58,7 @@ def _load_gt_depth(cam, source_path, scale=6553.5, override_dir=None):
     import os, cv2, numpy as np, torch
     key = getattr(cam, "image_name", None)
     if key in _DEPTH_CACHE:
-        gd, valid = _DEPTH_CACHE[key]
-        return (gd.cuda(), valid.cuda()) if gd is not None else (None, None)
+        return _DEPTH_CACHE[key]
     stem = os.path.splitext(key)[0] if key else None
     p = None
     if stem:
@@ -81,10 +80,11 @@ def _load_gt_depth(cam, source_path, scale=6553.5, override_dir=None):
     d = cv2.resize(d, (cam.image_width, cam.image_height), interpolation=cv2.INTER_NEAREST)
     gd = torch.from_numpy(d[None]).float().cuda()
     am = getattr(cam, "alpha_mask", None)
-    am = am.to(gd.device) if am is not None else torch.ones_like(gd)
+    am = am if am is not None else torch.ones_like(gd)
     valid = ((gd > 1e-3) & (am > 0.5)).float()
-    _DEPTH_CACHE[key] = (gd.cpu(), valid.cpu())
+    _DEPTH_CACHE[key] = (gd, valid)
     return gd, valid
+# =====================================================================
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
 
@@ -103,13 +103,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     # [NV] novel-view soft-weighted supervision 로드 (+ [v2] normal_%04d.png 선택 로드)
     _NV_CAMS, _NV_LAMBDA, _NV_EVERY = [], float(getattr(args, "nv_lambda", 0.5)), int(getattr(args, "nv_every", 2))
     _NV_LAMBDA_N = float(getattr(args, "nv_lambda_normal", 0.0))
+    _NV_LAMBDA_D = float(getattr(args, "nv_lambda_depth", 0.0))
     if getattr(args, "novelview_dir", None):
         import os as _os, numpy as _np, torch as _t
         from PIL import Image as _Img
         from scene.cameras import MiniCam as _MiniCam
         _nvd = args.novelview_dir
         _recs = _np.load(_os.path.join(_nvd, "poses.npz"), allow_pickle=True)["records"]
-        _n_nrm = 0
+        _n_nrm = _n_dep = 0
         for _r in _recs:
             _r = _r.item() if hasattr(_r, "item") and not isinstance(_r, dict) else _r
             _i = int(_r["idx"])
@@ -119,10 +120,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 continue
             _wvt = _t.tensor(_np.asarray(_r["world_view_transform"]), dtype=_t.float32).cuda()
             _fpt = _t.tensor(_np.asarray(_r["full_proj_transform"]), dtype=_t.float32).cuda()
-            _res = max(int(getattr(args, "resolution", 1) or 1), 1)
-            _W = max(int(_r["width"]) // _res, 1)
-            _H = max(int(_r["height"]) // _res, 1)
-            _cam = _MiniCam(_W, _H, float(_r["FoVy"]), float(_r["FoVx"]),
+            _cam = _MiniCam(int(_r["width"]), int(_r["height"]), float(_r["FoVy"]), float(_r["FoVx"]),
                             0.01, 100.0, _wvt, _fpt)
             _g = _t.from_numpy(_np.asarray(_Img.open(_gp).convert("RGB"))).float().permute(2, 0, 1).cuda() / 255.0
             _w = _t.from_numpy(_np.asarray(_Img.open(_wp).convert("L"))).float().cuda() / 255.0
@@ -135,9 +133,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 _n = _t.from_numpy(_np.asarray(_Img.open(_npn).convert("RGB"))).float().permute(2, 0, 1).cuda()
                 _cam.gt_normal = _t.nn.functional.normalize(_n / 127.5 - 1.0, dim=0)
                 _n_nrm += 1
+            # [v3] 생성 뷰 depth (make_gen_points.py, 스케일 정렬됨. 0=무효)
+            _dpn = _os.path.join(_nvd, "depth_%04d.npy" % _i)
+            _cam.gt_depth_nv = None
+            if _NV_LAMBDA_D > 0 and _os.path.exists(_dpn):
+                _d = _t.from_numpy(_np.load(_dpn).astype(_np.float32))[None].cuda()
+                _cam.gt_depth_nv = _d
+                _n_dep += 1
             _NV_CAMS.append(_cam)
-        print("[NV] %d novel-view cams (lambda=%.3f every=%d, normal %d뷰 λ=%.2f) from %s"
-              % (len(_NV_CAMS), _NV_LAMBDA, _NV_EVERY, _n_nrm, _NV_LAMBDA_N, _nvd))
+        print("[NV] %d novel-view cams (lambda=%.3f every=%d, normal %d뷰 λ=%.2f, depth %d뷰 λ=%.2f) from %s"
+              % (len(_NV_CAMS), _NV_LAMBDA, _NV_EVERY, _n_nrm, _NV_LAMBDA_N, _n_dep, _NV_LAMBDA_D, _nvd))
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
@@ -259,6 +264,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 _cos = (_rn_c * _gn).sum(0, keepdim=True).abs()
                 _nl = ((1.0 - _cos) * _w).sum() / _w.sum().clamp_min(1.0)
                 total_loss = total_loss + _NV_LAMBDA_N * _nl
+            # [v3] 생성 뷰 depth 감독 — 생성 영역(weight>0 ∧ gt_depth>0)에서 렌더 depth L1
+            if _NV_LAMBDA_D > 0 and getattr(_nv, "gt_depth_nv", None) is not None and ("depth" in _pkg):
+                _rd = _pkg["depth"]
+                if _rd.dim() == 2: _rd = _rd[None]
+                _gd_nv = _nv.gt_depth_nv
+                if _gd_nv.shape[-2:] != _rd.shape[-2:]:
+                    _gd_nv = torch.nn.functional.interpolate(_gd_nv[None], _rd.shape[-2:], mode="nearest")[0]
+                _vm_nv = ((_gd_nv > 1e-3).float() * _w)
+                if _vm_nv.sum() > 0:
+                    _dl_nv = (torch.abs(_rd - _gd_nv) * _vm_nv).sum() / _vm_nv.sum().clamp_min(1.0)
+                    total_loss = total_loss + _NV_LAMBDA_D * _dl_nv
         total_loss.backward()
 
         iter_end.record()
@@ -427,6 +443,8 @@ if __name__ == "__main__":
                         help="렌더 depth < GT depth (free-space 위반) 벌점 배율")
     parser.add_argument("--nv_lambda_normal", type=float, default=0.0,
                         help=">0: novelview_dir 의 normal_%%04d.png 로 NV normal 감독")
+    parser.add_argument("--nv_lambda_depth", type=float, default=0.0,
+                        help=">0: novelview_dir 의 depth_%%04d.npy(make_gen_points, 스케일 정렬)로 NV depth 감독")
 
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
