@@ -446,6 +446,12 @@ def main():
     parser.add_argument("--empty_per_view", default=4096, type=int)
     parser.add_argument("--empty_alpha", default=0.1, type=float,
                         help="이 alpha 미만 픽셀을 빈 광선으로 간주. junk가 alpha를 깔면 0.3~0.5로 완화")
+    parser.add_argument("--tile", default=0, type=int,
+                        help="타일 marching 블록 크기(예: 128). 0=단일 볼륨. whole-scene 고해상도에 필수")
+    parser.add_argument("--extra_points", default="", type=str,
+                        help="생성 뷰 점군 ply(법선 포함) — unseen 표면 증거 주입 (make_gen_points.py)")
+    parser.add_argument("--prior_repeat", default=1.0, type=float,
+                        help="<1 이면 prior 점을 그 비율로 서브샘플(신뢰도 하향)")
     parser.add_argument("--carve_depth_dir", default="", type=str,
                         help="dump_scene_depth.py 출력 폴더. 전체 씬 200뷰 depth로 free-space carving (empty-ray보다 우선)")
     parser.add_argument("--offsurf_delta", default=0.01, type=float, help="정규화 좌표 기준 off-surface 오프셋")
@@ -557,6 +563,23 @@ def main():
         EOn, ED = EOn[keep_e], ED[keep_e]
         print(f"empty ray 필터: {int(keep_e.sum())}/{len(keep_e)} 유지 (bbox 관통 광선)")
 
+    # 1b-2) [prior] 생성 뷰 점군 주입 — See3D gen + 단안 depth 로 만든 unseen 표면 증거
+    #       (make_gen_points.py 출력 ply). 관측점과 함께 SDF 표면 항에 들어가되,
+    #       법선은 카메라 정렬 규약을 동일 적용. 신뢰도 차이는 --prior_repeat(<1 이면 서브샘플)로 반영.
+    if args.extra_points:
+        pp = o3d.io.read_point_cloud(os.path.expanduser(args.extra_points))
+        Pe = np.asarray(pp.points)
+        Ne = np.asarray(pp.normals) if pp.has_normals() else None
+        Ce = np.asarray(pp.colors) if pp.has_colors() else np.tile([0.6, 0.6, 0.6], (len(Pe), 1))
+        assert Ne is not None and len(Ne) == len(Pe), "extra_points 에 법선 필요 (make_gen_points.py 사용)"
+        if 0 < args.prior_repeat < 1.0:
+            sel = np.random.choice(len(Pe), max(int(len(Pe) * args.prior_repeat), 1), replace=False)
+            Pe, Ne, Ce = Pe[sel], Ne[sel], Ce[sel]
+        Oe = np.asarray(pp.covariances)[:, :, 0] if False else np.tile(center, (len(Pe), 1))
+        P = np.concatenate([P, Pe]); N = np.concatenate([N, Ne])
+        C = np.concatenate([C, Ce]); O = np.concatenate([O, Oe])
+        print(f"prior 점군 주입: {len(Pe)}점 (총 {len(P)})")
+
     # 1c) 전체 씬 depth 기반 carve 샘플 (있으면 empty-ray보다 우선)
     CV = None
     if args.carve_depth_dir:
@@ -567,27 +590,59 @@ def main():
     print("IGR SDF 학습 ...")
     net = train_sdf(Pn, N, On, EOn, ED, args, CV=CV)
 
-    # 3) 그리드 평가
+    # 3) 그리드 평가 + marching cubes — 타일 분할로 고해상도(whole-scene) 지원
     G = args.grid if args.grid > 0 else int(round(2 * scale / args.voxel_size))
     G = int(min(G, args.max_grid))
-    print(f"SDF 그리드 평가 (G={G}, voxel≈{2*scale/(G-1):.4f} world) + marching cubes ...")
-    lin = np.linspace(-1, 1, G, dtype=np.float32)
-    net.eval()
-    vol = np.empty((G, G, G), np.float32)
-    with torch.no_grad():
-        gx, gy = np.meshgrid(lin, lin, indexing="ij")
-        for k in range(G):
-            pts = np.stack([gx, gy, np.full_like(gx, lin[k])], -1).reshape(-1, 3)
-            s = net(torch.tensor(pts, dtype=torch.float32, device="cuda")).cpu().numpy().reshape(G, G)
-            vol[:, :, k] = s
-
-    # 4) 전체 볼륨 marching cubes → '메쉬 단계' 트리밍
-    #    (복셀 마스킹은 마스크 경계에 인위적 zero-crossing → 계단/큐브 아티팩트를 만들어 폐기.
-    #     대신 관측 점군에서 mask_dist 초과인 정점을 메쉬에서 제거 — 경계가 표면을 따라감)
     from skimage.measure import marching_cubes
-    verts, faces, _, _ = marching_cubes(vol, level=0.0, spacing=(2.0 / (G - 1),) * 3)
-    verts = verts - 1.0
-    verts = verts * scale + center
+    net.eval()
+    lin = np.linspace(-1, 1, G, dtype=np.float32)
+    step = 2.0 / (G - 1)
+
+    if args.tile <= 0 or G <= args.tile:
+        print(f"SDF 그리드 평가 (G={G}, voxel≈{2*scale/(G-1):.4f} world) + marching cubes ...")
+        vol = np.empty((G, G, G), np.float32)
+        with torch.no_grad():
+            gx, gy = np.meshgrid(lin, lin, indexing="ij")
+            for k in range(G):
+                pts = np.stack([gx, gy, np.full_like(gx, lin[k])], -1).reshape(-1, 3)
+                s = net(torch.tensor(pts, dtype=torch.float32, device="cuda")).cpu().numpy().reshape(G, G)
+                vol[:, :, k] = s
+        verts, faces, _, _ = marching_cubes(vol, level=0.0, spacing=(step,) * 3)
+        verts = (verts - 1.0) * scale + center
+    else:
+        # ── 타일 marching: G를 tile 크기 블록으로 쪼개 각각 marching 후 병합 ──
+        #    블록 경계는 1복셀 오버랩으로 이어붙여 이음새 없음. 메모리 O(tile^3).
+        T = int(args.tile)
+        nb = int(np.ceil((G - 1) / (T - 1)))
+        print(f"SDF 타일 marching (G={G}, voxel≈{2*scale/(G-1):.4f} world, "
+              f"tile={T}, blocks={nb}^3={nb**3}) ...")
+        vs_all, fs_all, voff = [], [], 0
+        with torch.no_grad():
+            for bi in range(nb):
+                i0 = bi * (T - 1); i1 = min(i0 + T, G)
+                for bj in range(nb):
+                    j0 = bj * (T - 1); j1 = min(j0 + T, G)
+                    for bk in range(nb):
+                        k0 = bk * (T - 1); k1 = min(k0 + T, G)
+                        xs, ys, zs = lin[i0:i1], lin[j0:j1], lin[k0:k1]
+                        if min(len(xs), len(ys), len(zs)) < 2:
+                            continue
+                        sub = np.empty((len(xs), len(ys), len(zs)), np.float32)
+                        gx, gy = np.meshgrid(xs, ys, indexing="ij")
+                        for kk, zv in enumerate(zs):
+                            pts = np.stack([gx, gy, np.full_like(gx, zv)], -1).reshape(-1, 3)
+                            sub[:, :, kk] = net(torch.tensor(pts, dtype=torch.float32, device="cuda")
+                                                ).cpu().numpy().reshape(len(xs), len(ys))
+                        if sub.min() > 0 or sub.max() < 0:      # zero-crossing 없는 블록 skip
+                            continue
+                        v, f, _, _ = marching_cubes(sub, level=0.0, spacing=(step,) * 3)
+                        v = v + np.array([xs[0], ys[0], zs[0]]) + 1.0   # 블록 원점 → [-1,1] 좌표
+                        vs_all.append((v - 1.0) * scale + center)
+                        fs_all.append(f + voff)
+                        voff += len(v)
+                print(f"  블록 {bi+1}/{nb} 행 완료 (누적 verts {voff})")
+        assert vs_all, "zero-crossing 블록 없음 — 학습/스케일 확인"
+        verts = np.concatenate(vs_all); faces = np.concatenate(fs_all)
 
     mesh = o3d.geometry.TriangleMesh()
     mesh.vertices = o3d.utility.Vector3dVector(verts)
