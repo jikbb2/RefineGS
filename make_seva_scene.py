@@ -58,6 +58,11 @@ def main():
     ap.add_argument("--radius_scale", type=float, default=2.2, help="객체 반경 대비 카메라 거리")
     ap.add_argument("--spread_deg", type=float, default=50.0,
                     help="unknown 평균 법선 주변으로 카메라를 퍼뜨릴 각도(원뿔 반각)")
+    ap.add_argument("--up_axis", type=int, default=2, help="월드 up 축(0=x,1=y,2=z)")
+    ap.add_argument("--cam_below", type=float, default=0.15,
+                    help="관측 카메라 최저 높이에서 이만큼까지만 내려갈 수 있음(바닥 관통 방지)")
+    ap.add_argument("--min_area_frac", type=float, default=0.15,
+                    help="입력 후보: 마스크 면적이 최대의 이 비율 이상인 프레임만")
     ap.add_argument("--out", required=True)
     ap.add_argument("--scene", default="")
     args = ap.parse_args()
@@ -78,9 +83,35 @@ def main():
     cams = {c["stem"]: c for c in read_colmap(args.colmap)}
     stems = [s for s in stems if s in cams]
     assert len(stems) >= 2, f"유효 프레임 부족: {len(stems)}"
-    sel = [stems[round(i * (len(stems) - 1) / max(args.n_input - 1, 1))] for i in range(min(args.n_input, len(stems)))]
-    sel = list(dict.fromkeys(sel))
-    print(f"입력 GT 프레임 {len(sel)}장 / 후보 {len(stems)}")
+
+    # [v2] 마스크 면적 기준 선별 — 객체가 크게 보이는 프레임 우선(참조 품질↑),
+    #      그중 시점 다양성을 위해 카메라 위치로 균등 서브샘플
+    areas = []
+    for s in stems:
+        mp = os.path.join(args.masks_root, args.gid, "masks", s + ".png")
+        a = 0
+        if os.path.exists(mp):
+            im = np.array(Image.open(mp))
+            al = im[..., 3] if (im.ndim == 3 and im.shape[2] == 4) else (
+                np.array(Image.open(mp).convert("L")))
+            a = int((al > (0 if al.max() <= 1 else 127)).sum())
+        areas.append(a)
+    areas = np.array(areas, float)
+    if areas.max() > 0:
+        cand = [s for s, a in zip(stems, areas) if a >= max(areas.max() * args.min_area_frac, 1)]
+        print(f"마스크 면적 필터: {len(cand)}/{len(stems)} (최대 면적의 {args.min_area_frac:.0%} 이상)")
+    else:
+        cand = stems
+    if len(cand) < args.n_input:
+        cand = stems
+    # 카메라 위치 기준 균등 선별(시점 다양성)
+    C = np.stack([cam_center(cams[s]["R"], cams[s]["t"]) for s in cand])
+    picked = [int(np.argmax(np.linalg.norm(C - C.mean(0), axis=1)))]
+    for _ in range(min(args.n_input, len(cand)) - 1):
+        d = np.min(np.linalg.norm(C[:, None] - C[picked][None], axis=-1), axis=1)
+        picked.append(int(np.argmax(d)))          # farthest-point sampling
+    sel = [cand[i] for i in picked]
+    print(f"입력 GT 프레임 {len(sel)}장 (면적 상위 + FPS 다양성) / 후보 {len(stems)}")
 
     c0 = cams[sel[0]]
     W, H = int(c0["W"]), int(c0["H"])
@@ -114,17 +145,29 @@ def main():
     rad = max(obj_r * args.radius_scale, 0.5)
     print(f"unknown centroid {np.round(ctr,3)}  r90 {obj_r:.2f}  방향 {np.round(nmean,3)}  카메라거리 {rad:.2f}")
 
-    # nmean 주변 원뿔에서 spiral 샘플
+    # [v2] 물리 제약: 바닥 위 최소 높이 + 방 bbox 내부 (바닥 관통 카메라 방지)
+    cam_pos_all = np.stack([cam_center(cams[s]["R"], cams[s]["t"]) for s in stems])
+    up_axis = args.up_axis
+    floor = float(np.percentile(cam_pos_all[:, up_axis], 2)) - args.cam_below   # 관측 카메라 최저 부근
+    room_lo, room_hi = cam_pos_all.min(0) - 0.5, cam_pos_all.max(0) + 0.5
+    print(f"물리 제약: {'xyz'[up_axis]} ≥ {floor:.2f} (바닥), 방 bbox {np.round(room_lo,1)}~{np.round(room_hi,1)}")
+
+    # nmean 주변 원뿔에서 spiral 샘플 (제약 위반 시 up 방향으로 밀어 올림)
     a = nmean
     tmp = np.array([0, 0, 1.0]) if abs(a[2]) < 0.9 else np.array([1.0, 0, 0])
     e1 = np.cross(a, tmp); e1 /= np.linalg.norm(e1) + 1e-9
     e2 = np.cross(a, e1)
+    n_fix = 0
     for i in range(args.n_target):
         f = i / max(args.n_target - 1, 1)
         th = np.deg2rad(args.spread_deg) * np.sqrt(f)           # 중심→바깥 나선
         ph = 2 * np.pi * 3.0 * f
         d = (np.cos(th) * a + np.sin(th) * (np.cos(ph) * e1 + np.sin(ph) * e2))
         pos = ctr + rad * d / (np.linalg.norm(d) + 1e-9)
+        if pos[up_axis] < floor:                                 # 바닥 아래 → 최소 높이로 승격
+            pos[up_axis] = floor
+            n_fix += 1
+        pos = np.clip(pos, room_lo, room_hi)                     # 방 밖 → 안으로
         c2w = look_at_c2w(pos, ctr)
         c2w[:3, :3] = c2w[:3, :3] @ CV2GL
         name = f"{idx:06d}.png"
@@ -138,7 +181,7 @@ def main():
         json.dump(dict(train_ids=train_ids, test_ids=test_ids), f, indent=1)
 
     print(f"\nSEVA 씬 생성: {root}")
-    print(f"  train {len(train_ids)} (GT) / test {len(test_ids)} (unknown 지향 궤적)")
+    print(f"  train {len(train_ids)} (GT) / test {len(test_ids)} (unknown 지향 궤적, 바닥 보정 {n_fix}개)")
     print(f"\n실행 예:\n  cd <seva_repo> && python demo.py --data_path {os.path.dirname(root)} "
           f"--data_items {scene} --task img2trajvid --num_inputs {len(train_ids)} "
           f"--cfg 3.0 --L_short 576 --use_traj_prior True --chunk_strategy interp")
