@@ -36,6 +36,13 @@ def main():
     ap.add_argument("--free_margin", type=float, default=0.04, help="depth 표면 앞 이 거리까지 free")
     ap.add_argument("--min_component", type=int, default=30, help="이보다 작은 unknown 덩어리 무시(복셀 수)")
     ap.add_argument("--max_pts", type=int, default=60000)
+    ap.add_argument("--other_meshes", nargs="*", default=[],
+                    help="다른 객체 메쉬 glob(예: 'output/.../refinegs_full/*/train/ours_*/fuse_post.ply'). "
+                         "이들에 더 가까운 복셀은 unknown 에서 제외(꽃병 등 타 객체 배제)")
+    ap.add_argument("--other_band", type=float, default=0.08,
+                    help="다른 객체 표면에서 이 거리(m) 이내면 그 객체 소관으로 간주")
+    ap.add_argument("--near_self", type=float, default=0.0,
+                    help=">0 이면 이 객체 표면에서 이 거리(m) 밖 복셀은 unknown 에서 제외(주변 잡음 차단)")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -85,8 +92,34 @@ def main():
             print(f"  view {fi}/{len(files)}: free {free.mean()*100:.1f}%")
     print(f"free 복셀 {free.sum():,} ({free.mean()*100:.1f}%)")
 
-    # 3) unknown = 나머지
-    unknown = ~(surface | free)
+    # 2b) 다른 객체(other_meshes) 근처는 이 객체의 refinement 대상 아님 → 제외
+    other = np.zeros(len(centers), bool)
+    if args.other_meshes:
+        import glob as _g
+        opaths = []
+        for pat in args.other_meshes:
+            opaths += [p for p in _g.glob(os.path.expanduser(pat))
+                       if os.path.abspath(p) != os.path.abspath(os.path.expanduser(args.tsdf))]
+        OV = []
+        for p in opaths:
+            om = o3d.io.read_triangle_mesh(p)
+            if len(om.vertices):
+                ov = np.asarray(om.vertices)
+                if np.all(ov.max(0) > lo) and np.all(ov.min(0) < hi):    # bbox 겹치는 것만
+                    OV.append(ov)
+        if OV:
+            OVa = np.concatenate(OV)
+            d_o, _ = cKDTree(OVa).query(centers, workers=-1)
+            d_self, _ = cKDTree(V).query(centers, workers=-1)
+            other = (d_o < args.other_band) & (d_o < d_self)   # 다른 객체에 더 가까운 복셀
+            print(f"다른 객체({len(OV)}개) 근처 제외: {other.sum():,} 복셀")
+
+    # 3) unknown = 나머지 (+ 이 객체 근방으로 제한 옵션)
+    unknown = ~(surface | free | other)
+    if args.near_self > 0:
+        far = d_surf > args.near_self
+        print(f"객체 표면 {args.near_self}m 밖 제외: {(unknown & far).sum():,} 복셀")
+        unknown &= ~far
     U3 = unknown.reshape(dims)
     print(f"unknown 복셀 {unknown.sum():,} ({unknown.mean()*100:.1f}%)  "
           f"= 볼륨 {unknown.sum()*vs**3:.4f} m³")
