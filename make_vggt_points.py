@@ -71,12 +71,15 @@ def main():
     # 배치 이미지 목록: 실측(train) 실제 파일 + 생성(test) samples
     samp = sorted(glob.glob(os.path.join(os.path.expanduser(args.samples), "*.png")))
     assert samp, f"생성 이미지 없음: {args.samples}"
-    img_paths, is_real = [], []
+    img_paths, is_real, real_stem = [], [], []
     for i in train_ids:
         img_paths.append(os.path.join(sdir, frames[i]["file_path"])); is_real.append(True)
+        real_stem.append(frames[i].get("src_stem"))     # make_seva_scene 이 기록한 원본 COLMAP stem
     for k, i in enumerate(test_ids[:len(samp)]):
-        img_paths.append(samp[k]); is_real.append(False)
+        img_paths.append(samp[k]); is_real.append(False); real_stem.append(None)
     is_real = np.array(is_real)
+    assert all(real_stem[j] is not None for j in range(len(is_real)) if is_real[j]), \
+        "transforms.json 에 src_stem 없음 — make_seva_scene v2(원본 stem 기록)로 씬 재생성 필요"
     print(f"VGGT 입력: 실측 {is_real.sum()} + 생성 {(~is_real).sum()} = {len(img_paths)}뷰")
 
     # ── VGGT 추론 ──
@@ -103,11 +106,9 @@ def main():
     for bi, real in enumerate(is_real):
         if not real:
             continue
-        stem = os.path.splitext(os.path.basename(frames[train_ids[np.sum(is_real[:bi+1])-1]]["file_path"]))[0] \
-            if False else os.path.splitext(os.path.basename(img_paths[bi]))[0]
-        # VGGT 카메라 중심(world→cam 역): C = -R^T t
-        R, t = extr[bi, :3, :3], extr[bi, :3, 3]
-        src.append(-R.T @ t)
+        stem = real_stem[bi]                              # 원본 COLMAP stem
+        R, t = extr[bi, :3, :3], extr[bi, :3, 3]          # VGGT world→cam
+        src.append(-R.T @ t)                              # VGGT 카메라 중심
         c = cams.get(stem)
         assert c is not None, f"COLMAP 에 실측 프레임 없음: {stem}"
         dst.append(cam_center(c["R"], c["t"]))

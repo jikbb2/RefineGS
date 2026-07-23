@@ -132,7 +132,8 @@ def main():
         Image.open(src).convert("RGB").save(os.path.join(img_dir, name))
         c2w = np.eye(4); c2w[:3, :3] = c["R"].T; c2w[:3, 3] = cam_center(c["R"], c["t"])
         c2w[:3, :3] = c2w[:3, :3] @ CV2GL                       # → OpenGL
-        frames.append(dict(file_path=f"images/{name}", transform_matrix=c2w.tolist()))
+        frames.append(dict(file_path=f"images/{name}", transform_matrix=c2w.tolist(),
+                           src_stem=s))                          # 원본 COLMAP stem 기록(정합용)
         train_ids.append(idx); idx += 1
 
     # ── 타깃 궤적: unknown 법선 방향에서 객체를 바라보게 ──
