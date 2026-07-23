@@ -63,6 +63,8 @@ def main():
                     help="관측 카메라 최저 높이에서 이만큼까지만 내려갈 수 있음(바닥 관통 방지)")
     ap.add_argument("--min_area_frac", type=float, default=0.15,
                     help="입력 후보: 마스크 면적이 최대의 이 비율 이상인 프레임만")
+    ap.add_argument("--square", action="store_true",
+                    help="입력·타깃을 정사각 center-crop 으로 통일 (VGGT pointmap 정합 / SEVA 프레이밍 일치)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--scene", default="")
     args = ap.parse_args()
@@ -116,6 +118,13 @@ def main():
     c0 = cams[sel[0]]
     W, H = int(c0["W"]), int(c0["H"])
     fx, fy, cx, cy = c0["fx"], c0["fy"], c0["cx"], c0["cy"]
+    # [v3] --square: 입력·타깃을 정사각으로 통일(VGGT 배치 shape 일치 → pointmap 정합 정확)
+    if args.square:
+        side = min(W, H)
+        x0, y0 = (W - side) // 2, (H - side) // 2
+        cx, cy = cx - x0, cy - y0
+        W = H = side
+        print(f"square 모드: {side}x{side} center-crop (cx,cy→{cx:.0f},{cy:.0f})")
 
     frames, train_ids, test_ids = [], [], []
     idx = 0
@@ -129,7 +138,12 @@ def main():
         if src is None:
             continue
         name = f"{idx:06d}.png"
-        Image.open(src).convert("RGB").save(os.path.join(img_dir, name))
+        im = Image.open(src).convert("RGB")
+        if args.square:
+            side = min(im.width, im.height)
+            x0, y0 = (im.width - side) // 2, (im.height - side) // 2
+            im = im.crop((x0, y0, x0 + side, y0 + side))
+        im.save(os.path.join(img_dir, name))
         c2w = np.eye(4); c2w[:3, :3] = c["R"].T; c2w[:3, 3] = cam_center(c["R"], c["t"])
         c2w[:3, :3] = c2w[:3, :3] @ CV2GL                       # → OpenGL
         frames.append(dict(file_path=f"images/{name}", transform_matrix=c2w.tolist(),
