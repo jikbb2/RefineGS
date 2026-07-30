@@ -130,6 +130,38 @@ def freespace_carve(G, cams, recon_mesh, margin=0.01):
     return carved
 
 
+def visual_hull_carve(G, cams, recon_mesh, margin=0.01):
+    """occlusion-aware 실루엣 carve: 관측 표면에 가려지지 않았는데 마스크 밖으로
+    투영되는 생성점 = 실루엣과 모순 = 할루시네이션 → 제거.
+    가려진(occluded) 곳은 판단 보류 → 테이블 아래 다리 등 미관측은 보존."""
+    scene = o3d.t.geometry.RaycastingScene()
+    scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(recon_mesh))
+    carved = np.zeros(len(G), bool)
+    for c, m in cams:
+        if m is None:
+            continue
+        R, t = c["R"], c["t"]; C = cam_center(R, t)
+        pc = (R @ G.T).T + t; z = pc[:, 2]
+        zz = np.where(z > 1e-6, z, 1e9)
+        u = (c["fx"] * pc[:, 0] / zz + c["cx"])
+        v = (c["fy"] * pc[:, 1] / zz + c["cy"])
+        infr = (z > 1e-6) & (u >= 0) & (u < c["W"]) & (v >= 0) & (v < c["H"])
+        # 관측 표면이 생성점보다 앞 → occluded(판단 보류)
+        d = G - C; dist = np.linalg.norm(d, axis=1)
+        dirn = d / (dist[:, None] + 1e-9)
+        rays = np.concatenate([np.broadcast_to(C.astype(np.float32), d.shape),
+                               dirn.astype(np.float32)], 1)
+        th = scene.cast_rays(o3d.core.Tensor(rays))["t_hit"].numpy()
+        occluded = np.isfinite(th) & (th < dist - margin)
+        # 마스크 안/밖
+        ui = np.clip(u, 0, c["W"] - 1).astype(int)
+        vi = np.clip(v, 0, c["H"] - 1).astype(int)
+        inside = np.zeros(len(G), bool)
+        inside[infr] = m[vi[infr], ui[infr]]
+        carved |= infr & ~occluded & ~inside          # 보이는데 실루엣 밖 → carve
+    return carved
+
+
 def render_compare(gen_aligned, cams, max_views=6):
     """정합 진단: known pose 에서 silhouette IoU · depth L1(overlap)."""
     scene = o3d.t.geometry.RaycastingScene()
@@ -217,10 +249,13 @@ def main():
     gdist, _ = dst_tree.query(G_world)
     graft = gdist > tau                                        # TSDF 미커버(미관측 후보)
     if cams is not None:
-        carved = freespace_carve(G_world, cams, recon, margin=args.carve_margin)
-        graft &= ~carved                                      # 관측-빈공간 floater 제거
-        print(f"[융합] graft τ={tau*1000:.1f}mm  carve 제거 {carved.sum()}  "
-              f"최종 이식 {graft.sum()}/{len(G_world)} ({graft.mean()*100:.0f}%)")
+        free = freespace_carve(G_world, cams, recon, margin=args.carve_margin)    # 빈공간 floater
+        vh = visual_hull_carve(G_world, cams, recon, margin=args.carve_margin)    # 실루엣 모순
+        remove = free | vh
+        graft &= ~remove
+        print(f"[융합] graft τ={tau*1000:.1f}mm  free-carve {free.sum()}  "
+              f"vhull-carve {vh.sum()}  최종 이식 {graft.sum()}/{len(G_world)} "
+              f"({graft.mean()*100:.0f}%)")
     else:
         print(f"[융합] graft τ={tau*1000:.1f}mm  이식 {graft.sum()} (carve 미적용)")
 
