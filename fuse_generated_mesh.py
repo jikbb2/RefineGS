@@ -130,6 +130,24 @@ def freespace_carve(G, cams, recon_mesh, margin=0.01):
     return carved
 
 
+def isolate_target(G, keep, recon_tree, eps=0.05, min_points=50, tau=0.12):
+    """문맥 생성 시 딸려온 다른 객체(소파 등) 제거: 생성점을 DBSCAN 클러스터링해
+    obj TSDF 에서 먼 클러스터(=다른 객체)를 버린다. 타깃은 관측 TSDF 에 인접."""
+    idx = np.where(keep)[0]
+    if len(idx) == 0:
+        return keep
+    pc = o3d.geometry.PointCloud()
+    pc.points = o3d.utility.Vector3dVector(G[idx])
+    lab = np.array(pc.cluster_dbscan(eps=eps, min_points=min_points))
+    out = keep.copy()
+    for L in set(lab.tolist()):
+        sel = lab == L
+        near = recon_tree.query(G[idx[sel]])[0].min() if sel.any() else 1e9
+        if L == -1 or near > tau:                       # 노이즈/원거리 클러스터 → 제거
+            out[idx[sel]] = False
+    return out
+
+
 def visual_hull_carve(G, cams, recon_mesh, margin=0.01):
     """occlusion-aware 실루엣 carve: 관측 표면에 가려지지 않았는데 마스크 밖으로
     투영되는 생성점 = 실루엣과 모순 = 할루시네이션 → 제거.
@@ -202,6 +220,10 @@ def main():
     ap.add_argument("--stems", default="")
     ap.add_argument("--images", default="")
     ap.add_argument("--carve_margin", type=float, default=0.01)
+    ap.add_argument("--isolate", action="store_true",
+                    help="문맥 생성 시 딸려온 다른 객체(소파 등) 클러스터 제거")
+    ap.add_argument("--iso_eps", type=float, default=0.05, help="DBSCAN eps(m)")
+    ap.add_argument("--iso_tau", type=float, default=0.12, help="타깃 TSDF 인접 임계(m)")
     args = ap.parse_args()
 
     recon = o3d.io.read_triangle_mesh(args.recon)
@@ -253,9 +275,14 @@ def main():
         vh = visual_hull_carve(G_world, cams, recon, margin=args.carve_margin)    # 실루엣 모순
         remove = free | vh
         graft &= ~remove
-        print(f"[융합] graft τ={tau*1000:.1f}mm  free-carve {free.sum()}  "
-              f"vhull-carve {vh.sum()}  최종 이식 {graft.sum()}/{len(G_world)} "
-              f"({graft.mean()*100:.0f}%)")
+        msg = (f"[융합] graft τ={tau*1000:.1f}mm  free-carve {free.sum()}  "
+               f"vhull-carve {vh.sum()}")
+        if args.isolate:
+            before = graft.sum()
+            graft = isolate_target(G_world, graft, dst_tree,
+                                   eps=args.iso_eps, tau=args.iso_tau)
+            msg += f"  isolate 제거 {before - graft.sum()}"
+        print(msg + f"  최종 이식 {graft.sum()}/{len(G_world)} ({graft.mean()*100:.0f}%)")
     else:
         print(f"[융합] graft τ={tau*1000:.1f}mm  이식 {graft.sum()} (carve 미적용)")
 

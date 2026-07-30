@@ -31,8 +31,8 @@ def main():
     ap.add_argument("--stems", default="")
     ap.add_argument("--n_views", type=int, default=6, help="조건 뷰 수(면적·각도 다양성)")
     ap.add_argument("--pad", type=float, default=0.08, help="bbox 여백 비율")
-    ap.add_argument("--bg", default="transparent", choices=["white", "transparent"],
-                    help="TRELLIS-2 는 RGBA alpha 를 마스크로 직접 사용 → transparent 권장")
+    ap.add_argument("--bg", default="transparent", choices=["white", "transparent", "context"],
+                    help="transparent=마스크만(문맥손실), context=주변 포함 RGB(품질↑, 사후 분리 필요)")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -99,7 +99,11 @@ def main():
         if args.bg == "transparent":
             rgba = np.dstack([crop, (mc * 255).astype(np.uint8)])
             Image.fromarray(rgba, "RGBA").save(os.path.join(outv, s + ".png"))
-        else:
+        elif args.bg == "context":
+            # 주변 문맥 유지(RGB, 마스킹 안 함) → TRELLIS rembg 가 벽 등 배경만 제거.
+            # region relation 단서 보존으로 생성 품질↑. 인접 객체는 사후 분리(fuse --isolate).
+            Image.fromarray(crop).save(os.path.join(outv, s + ".png"))
+        else:  # white
             out = crop.copy(); out[~mc] = 255
             Image.fromarray(out).save(os.path.join(outv, s + ".png"))
 
