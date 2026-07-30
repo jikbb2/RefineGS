@@ -282,7 +282,16 @@ def main():
                     help="등방 스케일(Sim3). 생성 비율이 정확하면 anisotropic overfit 방지")
     ap.add_argument("--refine", action="store_true",
                     help="render-and-compare 로 포즈 미세정합(평면 관측 yaw·수직 모호성 해소)")
+    ap.add_argument("--overwrite", action="store_true",
+                    help="기존 산출물 덮어쓰기. 미지정 시 기존 파일 있으면 타임스탬프 붙여 보존")
     args = ap.parse_args()
+
+    # 출력 경로 안전 처리(기존 산출물 보존)
+    out_path = os.path.expanduser(args.out)
+    if os.path.exists(out_path) and not args.overwrite:
+        import time
+        out_path = out_path[:-4] + "_" + time.strftime("%Y%m%d_%H%M%S") + ".ply"
+        print(f"[안전] 기존 파일 보존 → 새 경로: {out_path}")
 
     recon = o3d.io.read_triangle_mesh(args.recon)
     gen = o3d.io.read_triangle_mesh(args.gen)
@@ -362,10 +371,10 @@ def main():
         fused, depth=args.poisson_depth)
     mesh.remove_vertices_by_mask(np.asarray(dens) < np.quantile(np.asarray(dens), 0.02))
     mesh.compute_vertex_normals()
-    o3d.io.write_triangle_mesh(args.out, mesh)
-    print(f"→ 완결 메쉬: {args.out}  (정점 {len(mesh.vertices)})")
+    o3d.io.write_triangle_mesh(out_path, mesh)
+    print(f"→ 완결 메쉬: {out_path}  (정점 {len(mesh.vertices)})")
     if args.save_aligned:
-        p = args.out.replace(".ply", "_gen_aligned.ply")
+        p = out_path[:-4] + "_gen_aligned.ply"
         o3d.io.write_triangle_mesh(p, gen); print(f"→ 정합 생성메쉬: {p}")
 
 
