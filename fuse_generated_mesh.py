@@ -26,6 +26,9 @@ import os, glob, argparse
 import numpy as np
 import open3d as o3d
 from scipy.spatial import cKDTree
+from scipy.spatial.transform import Rotation
+from scipy.optimize import minimize
+import cv2
 
 try:
     from warp_gt_to_pose import read_colmap, cam_center
@@ -63,18 +66,22 @@ def up_align_R(gen_up, world_up):
     return np.eye(3) + vx + vx @ vx * (1 / (1 + c))
 
 
-def aniso_icp(G, dst_tree, R_pts, R, t, S, iters=40, trim=0.6):
-    """9-DoF: p' = R @ (S⊙p) + t. 강체와 축별 스케일을 교대로 갱신."""
+def aniso_icp(G, dst_tree, R_pts, R, t, S, iters=40, trim=0.6, isotropic=False):
+    """정합 ICP: p' = R @ (S⊙p) + t. isotropic=True 면 등방 Sim3(S 스칼라)."""
     for _ in range(iters):
         cur = (R @ (G * S).T).T + t
         dist, idx = dst_tree.query(cur)
         k = max(30, int(len(G) * trim))
         keep = np.argsort(dist)[:k]
         src, dstp = G[keep], R_pts[idx[keep]]
-        _, R, t = umeyama(src * S, dstp, with_scale=False)      # 강체(스케일 고정)
-        q = (R.T @ (dstp - t).T).T                               # 정준계 목표
-        S = (src * q).sum(0) / ((src * src).sum(0) + 1e-9)       # 축별 스케일
-        S = np.clip(S, 0.3 * np.mean(S), 3 * np.mean(S))
+        if isotropic:
+            s, R, t = umeyama(src, dstp, with_scale=True)        # 등방 Sim3
+            S = np.array([s, s, s])
+        else:
+            _, R, t = umeyama(src * S, dstp, with_scale=False)   # 강체(스케일 고정)
+            q = (R.T @ (dstp - t).T).T                           # 정준계 목표
+            S = (src * q).sum(0) / ((src * src).sum(0) + 1e-9)   # 축별 스케일
+            S = np.clip(S, 0.3 * np.mean(S), 3 * np.mean(S))
     cur = (R @ (G * S).T).T + t
     d, _ = dst_tree.query(cur)
     k = max(30, int(len(G) * trim))
@@ -84,6 +91,53 @@ def aniso_icp(G, dst_tree, R_pts, R, t, S, iters=40, trim=0.6):
 
 def apply9(P, R, t, S):
     return (R @ (P * S).T).T + t
+
+
+def refine_pose_rc(gen_canon_mesh, cams, R, t, S, isotropic=False,
+                   lr_w=192, max_views=6, maxiter=120):
+    """render-and-compare 포즈 미세정합: 여러 뷰 실루엣 IoU 최대화.
+    평면(상판) 관측의 yaw·수직 모호성을 실루엣으로 해소. 광선을 canonical 로
+    역변환해 고정 메쉬에 raycast(저해상도) → 빠른 미분자유 최적화."""
+    scene = o3d.t.geometry.RaycastingScene()
+    scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(gen_canon_mesh))
+    # 뷰별 저해상도 광선 원점/방향(world) + 다운스케일 마스크 사전계산
+    views = []
+    for c, m in [x for x in cams if x[1] is not None][:max_views]:
+        sc = lr_w / c["W"]; W = lr_w; H = int(round(c["H"] * sc))
+        fx, fy = c["fx"] * sc, c["fy"] * sc; cx, cy = c["cx"] * sc, c["cy"] * sc
+        Rc, tc = c["R"], c["t"]; C = cam_center(Rc, tc)
+        uu, vv = np.meshgrid(np.arange(W), np.arange(H))
+        dcam = np.stack([(uu - cx) / fx, (vv - cy) / fy, np.ones_like(uu, float)], -1).reshape(-1, 3)
+        dwn = (Rc.T @ dcam.T).T                                   # world 방향
+        md = cv2.resize(m.astype(np.uint8), (W, H), interpolation=cv2.INTER_NEAREST) > 0
+        views.append((C.astype(np.float64), dwn, md))
+
+    def unpack(x):
+        R_ = Rotation.from_rotvec(x[:3]).as_matrix(); t_ = x[3:6]
+        S_ = np.exp(x[6:7].repeat(3)) if isotropic else np.exp(x[6:9])
+        return R_, t_, S_
+
+    def loss(x):
+        R_, t_, S_ = unpack(x); Sinv = 1.0 / S_; Rt = R_.T
+        tot = 0.0
+        for C, dwn, md in views:
+            o_c = (Sinv * (Rt @ (C - t_)))                        # canonical 원점
+            d_c = (Sinv * (Rt @ dwn.T).T)                         # canonical 방향
+            rays = np.concatenate([np.broadcast_to(o_c.astype(np.float32), d_c.shape),
+                                   d_c.astype(np.float32)], 1)
+            th = scene.cast_rays(o3d.core.Tensor(rays))["t_hit"].numpy()
+            sil = np.isfinite(th).reshape(md.shape)
+            inter = (sil & md).sum(); union = (sil | md).sum()
+            tot += 1.0 - inter / max(union, 1)
+        return tot / len(views)
+
+    x0 = np.concatenate([Rotation.from_matrix(R).as_rotvec(), t,
+                         (np.log(S).mean(keepdims=True) if isotropic else np.log(S))])
+    iou0 = 1 - loss(x0)
+    res = minimize(loss, x0, method="Powell", options={"maxiter": maxiter, "xtol": 1e-4})
+    R_, t_, S_ = unpack(res.x); iou1 = 1 - res.fun
+    print(f"[정합] render-compare 최적화 IoU {iou0:.3f} → {iou1:.3f}")
+    return R_, t_, S_
 
 
 # ---------------- 카메라 유틸(carve / render-compare) ----------------
@@ -224,6 +278,10 @@ def main():
                     help="문맥 생성 시 딸려온 다른 객체(소파 등) 클러스터 제거")
     ap.add_argument("--iso_eps", type=float, default=0.05, help="DBSCAN eps(m)")
     ap.add_argument("--iso_tau", type=float, default=0.12, help="타깃 TSDF 인접 임계(m)")
+    ap.add_argument("--isotropic", action="store_true",
+                    help="등방 스케일(Sim3). 생성 비율이 정확하면 anisotropic overfit 방지")
+    ap.add_argument("--refine", action="store_true",
+                    help="render-and-compare 로 포즈 미세정합(평면 관측 yaw·수직 모호성 해소)")
     args = ap.parse_args()
 
     recon = o3d.io.read_triangle_mesh(args.recon)
@@ -237,7 +295,12 @@ def main():
     R_pts, G_pts = np.asarray(rp.points), np.asarray(gp.points)
     dst_tree = cKDTree(R_pts)
 
-    # --- 9-DoF 정합: up 정렬 + yaw 8-init ---
+    # 카메라 먼저 로드(RC 정합·carve 공용)
+    cams = None
+    if args.colmap and read_colmap is not None:
+        cams = load_cams(args.colmap, args.masks_root, args.gid, args.stems, args.images)
+
+    # --- 정합: up 정렬 + yaw 8-init + (an)isotropic ICP ---
     R0 = up_align_R(args.gen_up, args.world_up)
     best = None
     for yaw in range(0, 360, 45):
@@ -245,25 +308,27 @@ def main():
         gu = (Ry @ G_pts.T).T
         s0 = np.linalg.norm(R_pts.std(0)) / (np.linalg.norm(gu.std(0)) + 1e-9)
         S = np.array([s0, s0, s0]); t = R_pts.mean(0) - (Ry @ (G_pts * S).T).T.mean(0)
-        R, t, S, rmse = aniso_icp(G_pts, dst_tree, R_pts, Ry, t, S, iters=20, trim=0.5)
+        R, t, S, rmse = aniso_icp(G_pts, dst_tree, R_pts, Ry, t, S,
+                                  iters=20, trim=0.5, isotropic=args.isotropic)
         if best is None or rmse < best[-1]:
             best = (R, t, S, rmse)
     R, t, S, _ = best
-    R, t, S, rmse = aniso_icp(G_pts, dst_tree, R_pts, R, t, S, iters=50, trim=0.6)
-    print(f"[정합] 9-DoF  scale=({S[0]:.3f},{S[1]:.3f},{S[2]:.3f})  "
-          f"trimmed-RMSE={rmse*1000:.1f}mm")
+    R, t, S, rmse = aniso_icp(G_pts, dst_tree, R_pts, R, t, S,
+                              iters=50, trim=0.6, isotropic=args.isotropic)
+    print(f"[정합] {'iso' if args.isotropic else '9-DoF'}  "
+          f"scale=({S[0]:.3f},{S[1]:.3f},{S[2]:.3f})  trimmed-RMSE={rmse*1000:.1f}mm")
+
+    # render-and-compare 미세정합(평면 관측 모호성 해소) — 변환 전 canonical 메쉬 사용
+    if args.refine and cams is not None:
+        R, t, S = refine_pose_rc(gen, cams, R, t, S, isotropic=args.isotropic)
 
     gv = np.asarray(gen.vertices)
     gen.vertices = o3d.utility.Vector3dVector(apply9(gv, R, t, S))
     gen.compute_vertex_normals()
     G_world = apply9(G_pts, R, t, S)
 
-    # --- 카메라 기반 진단 + carve(선택) ---
-    cams = None
-    if args.colmap and read_colmap is not None:
-        cams = load_cams(args.colmap, args.masks_root, args.gid, args.stems, args.images)
-        iou = render_compare(gen, cams)
-        print(f"[진단] render-compare silhouette IoU={iou:.3f} (1.0에 가까울수록 정합 우수)")
+    if cams is not None:
+        print(f"[진단] 최종 silhouette IoU={render_compare(gen, cams):.3f}")
 
     # --- 융합: 미관측 이식(거리) ∩ free-space carve 통과 ---
     med = np.median(dst_tree.query(R_pts[np.random.choice(len(R_pts), 2000)], k=2)[0][:, 1])
