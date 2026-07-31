@@ -285,11 +285,19 @@ def main():
     ap.add_argument("--overwrite", action="store_true",
                     help="기존 산출물 덮어쓰기. 미지정 시 기존 파일 있으면 타임스탬프 붙여 보존")
     ap.add_argument("--export_points", default="",
-                    help="미관측 prior 점군(법선 포함) PLY 경로. augment_init_ply 입력용")
+                    help="carve 통과 미관측 prior 점군(구멍 가능) PLY 경로")
+    ap.add_argument("--dense_points", default="",
+                    help="정합된 생성 메쉬 전체를 carve 없이 dense 샘플한 점군 PLY 경로")
+    ap.add_argument("--dense_n", type=int, default=300000, help="dense 샘플 점 수")
+    ap.add_argument("--dense_graft_only", action="store_true",
+                    help="dense 점군에서 관측 표면 근접점 제거(이중 표면 방지, 구멍은 안 냄)")
+    ap.add_argument("--dense_snap", action="store_true",
+                    help="관측 band 내 생성점을 제거 대신 관측 표면으로 거리가중 끌어당김(seam 완화)")
+    ap.add_argument("--snap_band", type=float, default=0.0, help="스냅/제거 band(m). 0=자동(TSDF간격×3)")
     ap.add_argument("--no_mesh", action="store_true", help="Poisson 미리보기 메쉬 생략")
     args = ap.parse_args()
-    if not args.out and not args.export_points:
-        ap.error("--out(메쉬) 또는 --export_points(점군) 중 하나는 필요합니다")
+    if not (args.out or args.export_points or args.dense_points):
+        ap.error("--out / --export_points / --dense_points 중 하나는 필요합니다")
     if args.out and args.no_mesh:
         args.out = ""                                    # no_mesh 면 메쉬 경로 무시
 
@@ -346,6 +354,36 @@ def main():
     if cams is not None:
         print(f"[진단] 최종 silhouette IoU={render_compare(gen, cams):.3f}")
 
+    # dense 점군: 정합된 생성 메쉬 전체를 carve 없이 조밀 샘플(train→SDF prior)
+    if args.dense_points:
+        dpc = gen.sample_points_uniformly(number_of_points=args.dense_n)
+        D = np.asarray(dpc.points)
+        if args.dense_snap or args.dense_graft_only:
+            med = np.median(dst_tree.query(
+                R_pts[np.random.choice(len(R_pts), 2000)], k=2)[0][:, 1])
+            band = args.snap_band if args.snap_band > 0 else med * 3
+            d, idx = dst_tree.query(D)
+            if args.dense_snap:                          # band 내 → 관측으로 거리가중 스냅
+                w = np.clip(1 - d / band, 0, 1)[:, None]
+                D = D + w * (R_pts[idx] - D)
+                dpc.points = o3d.utility.Vector3dVector(D)
+                print(f"[dense] band {band*1000:.0f}mm 내 {(d < band).sum()}점 관측으로 끌어당김")
+            else:                                        # 근접점 제거(구멍 X)
+                keep = d > band
+                dpc = dpc.select_by_index(np.where(keep)[0])
+                print(f"[dense] 관측근접 제거 {(~keep).sum()} → {len(dpc.points)}점")
+        dpc.estimate_normals(o3d.geometry.KDTreeSearchParamKNN(knn=30))
+        dpc.orient_normals_consistent_tangent_plane(30)
+        dp = os.path.expanduser(args.dense_points)
+        os.makedirs(os.path.dirname(dp) or ".", exist_ok=True)
+        o3d.io.write_point_cloud(dp, dpc)
+        print(f"→ dense 생성 점군: {dp}  ({len(dpc.points)}점, 법선 포함, carve 없음)")
+
+    # dense 만 요청되면 carve/융합 생략
+    need_fusion = bool(args.export_points) or (out_path and not args.no_mesh)
+    if not need_fusion:
+        return
+
     # --- 융합: 미관측 이식(거리) ∩ free-space carve 통과 ---
     med = np.median(dst_tree.query(R_pts[np.random.choice(len(R_pts), 2000)], k=2)[0][:, 1])
     tau = args.graft_dist if args.graft_dist > 0 else med * 3
@@ -376,11 +414,13 @@ def main():
     # 미관측 prior 점군 export (augment_init_ply → train 최적화용)
     if args.export_points:
         pp = os.path.expanduser(args.export_points)
+        os.makedirs(os.path.dirname(pp) or ".", exist_ok=True)
         o3d.io.write_point_cloud(pp, gp_w)
         print(f"→ 미관측 prior 점군: {pp}  ({len(gp_w.points)}점, 법선 포함)  "
               f"augment_init_ply 입력용")
 
     if not args.no_mesh and out_path:
+        os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
         fused = rp + gp_w
         mesh, dens = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
             fused, depth=args.poisson_depth)
