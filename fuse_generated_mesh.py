@@ -284,6 +284,9 @@ def main():
                     help="render-and-compare 로 포즈 미세정합(평면 관측 yaw·수직 모호성 해소)")
     ap.add_argument("--overwrite", action="store_true",
                     help="기존 산출물 덮어쓰기. 미지정 시 기존 파일 있으면 타임스탬프 붙여 보존")
+    ap.add_argument("--export_points", default="",
+                    help="미관측 prior 점군(법선 포함) PLY 경로. augment_init_ply 입력용")
+    ap.add_argument("--no_mesh", action="store_true", help="Poisson 미리보기 메쉬 생략")
     args = ap.parse_args()
 
     # 출력 경로 안전 처리(기존 산출물 보존)
@@ -366,13 +369,21 @@ def main():
         pc.estimate_normals(o3d.geometry.KDTreeSearchParamKNN(knn=30))
         pc.orient_normals_consistent_tangent_plane(30)
 
-    fused = rp + gp_w
-    mesh, dens = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
-        fused, depth=args.poisson_depth)
-    mesh.remove_vertices_by_mask(np.asarray(dens) < np.quantile(np.asarray(dens), 0.02))
-    mesh.compute_vertex_normals()
-    o3d.io.write_triangle_mesh(out_path, mesh)
-    print(f"→ 완결 메쉬: {out_path}  (정점 {len(mesh.vertices)})")
+    # 미관측 prior 점군 export (augment_init_ply → train 최적화용)
+    if args.export_points:
+        pp = os.path.expanduser(args.export_points)
+        o3d.io.write_point_cloud(pp, gp_w)
+        print(f"→ 미관측 prior 점군: {pp}  ({len(gp_w.points)}점, 법선 포함)  "
+              f"augment_init_ply 입력용")
+
+    if not args.no_mesh:
+        fused = rp + gp_w
+        mesh, dens = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+            fused, depth=args.poisson_depth)
+        mesh.remove_vertices_by_mask(np.asarray(dens) < np.quantile(np.asarray(dens), 0.02))
+        mesh.compute_vertex_normals()
+        o3d.io.write_triangle_mesh(out_path, mesh)
+        print(f"→ 완결 메쉬(미리보기): {out_path}  (정점 {len(mesh.vertices)})")
     if args.save_aligned:
         p = out_path[:-4] + "_gen_aligned.ply"
         o3d.io.write_triangle_mesh(p, gen); print(f"→ 정합 생성메쉬: {p}")
