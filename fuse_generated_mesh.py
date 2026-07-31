@@ -260,7 +260,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--recon", required=True)
     ap.add_argument("--gen", required=True)
-    ap.add_argument("--out", required=True)
+    ap.add_argument("--out", default="", help="Poisson 미리보기 메쉬 경로(메쉬 낼 때만)")
     ap.add_argument("--gen_up", default="y", choices=["x", "y", "z"])
     ap.add_argument("--world_up", default="z", choices=["x", "y", "z"])
     ap.add_argument("--n_sample", type=int, default=60000)
@@ -288,10 +288,14 @@ def main():
                     help="미관측 prior 점군(법선 포함) PLY 경로. augment_init_ply 입력용")
     ap.add_argument("--no_mesh", action="store_true", help="Poisson 미리보기 메쉬 생략")
     args = ap.parse_args()
+    if not args.out and not args.export_points:
+        ap.error("--out(메쉬) 또는 --export_points(점군) 중 하나는 필요합니다")
+    if args.out and args.no_mesh:
+        args.out = ""                                    # no_mesh 면 메쉬 경로 무시
 
     # 출력 경로 안전 처리(기존 산출물 보존)
-    out_path = os.path.expanduser(args.out)
-    if os.path.exists(out_path) and not args.overwrite:
+    out_path = os.path.expanduser(args.out) if args.out else None
+    if out_path and os.path.exists(out_path) and not args.overwrite:
         import time
         out_path = out_path[:-4] + "_" + time.strftime("%Y%m%d_%H%M%S") + ".ply"
         print(f"[안전] 기존 파일 보존 → 새 경로: {out_path}")
@@ -376,7 +380,7 @@ def main():
         print(f"→ 미관측 prior 점군: {pp}  ({len(gp_w.points)}점, 법선 포함)  "
               f"augment_init_ply 입력용")
 
-    if not args.no_mesh:
+    if not args.no_mesh and out_path:
         fused = rp + gp_w
         mesh, dens = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
             fused, depth=args.poisson_depth)
@@ -385,7 +389,8 @@ def main():
         o3d.io.write_triangle_mesh(out_path, mesh)
         print(f"→ 완결 메쉬(미리보기): {out_path}  (정점 {len(mesh.vertices)})")
     if args.save_aligned:
-        p = out_path[:-4] + "_gen_aligned.ply"
+        base = out_path or os.path.expanduser(args.export_points)
+        p = base[:-4] + "_gen_aligned.ply"
         o3d.io.write_triangle_mesh(p, gen); print(f"→ 정합 생성메쉬: {p}")
 
 
