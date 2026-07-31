@@ -342,7 +342,7 @@ def collect_oriented_points(scene, gaussians, pipe, background, args, mask_dir=N
     return P, N, C, O, EO, ED
 
 
-def train_sdf(P, N, O, EO, ED, args, CV=None):
+def train_sdf(P, N, O, W, EO, ED, args, CV=None):
     """정규화된 oriented point cloud에 IGR SDF 피팅.
     O = 점별 관측 카메라 중심(정규화 좌표) — 표면 근처 free-space carving.
     EO/ED = 빈 광선(alpha≈0 픽셀)의 카메라 중심/방향 — empty-ray carving.
@@ -351,6 +351,7 @@ def train_sdf(P, N, O, EO, ED, args, CV=None):
     Pt = torch.tensor(P, dtype=torch.float32, device=dev)
     Nt = torch.tensor(N, dtype=torch.float32, device=dev)
     Ot = torch.tensor(O, dtype=torch.float32, device=dev)
+    Wt = torch.tensor(W, dtype=torch.float32, device=dev) if W is not None else None
     EOt = torch.tensor(EO, dtype=torch.float32, device=dev) if EO is not None and len(EO) else None
     EDt = torch.tensor(ED, dtype=torch.float32, device=dev) if ED is not None and len(ED) else None
     CVt = torch.tensor(CV, dtype=torch.float32, device=dev) if CV is not None and len(CV) else None
@@ -363,13 +364,18 @@ def train_sdf(P, N, O, EO, ED, args, CV=None):
         nrm = Nt[bi]
         sdf = net(pts)
         g = grad(sdf, pts)
-        l_man = sdf.abs().mean()
-        l_nrm = (1 - torch.nn.functional.cosine_similarity(g, nrm, dim=-1)).mean()
-
-        # signed off-surface: p+δn -> +δ(바깥), p-δn -> -δ(안쪽). 부호장 안정화(스펀지 방지).
-        pp = (Pt[bi] + delta * nrm)
-        pm = (Pt[bi] - delta * nrm)
-        l_sign = (net(pp) - delta).abs().mean() + (net(pm) + delta).abs().mean()
+        if Wt is not None:
+            w = Wt[bi]; wsum = w.sum().clamp(min=1e-8)
+            l_man = (sdf.abs().squeeze(-1) * w).sum() / wsum
+            l_nrm = ((1 - torch.nn.functional.cosine_similarity(g, nrm, dim=-1)) * w).sum() / wsum
+            pp = Pt[bi] + delta * nrm; pm = Pt[bi] - delta * nrm
+            l_sign = (((net(pp) - delta).abs().squeeze(-1) * w).sum()
+                      + ((net(pm) + delta).abs().squeeze(-1) * w).sum()) / wsum
+        else:
+            l_man = sdf.abs().mean()
+            l_nrm = (1 - torch.nn.functional.cosine_similarity(g, nrm, dim=-1)).mean()
+            pp = Pt[bi] + delta * nrm; pm = Pt[bi] - delta * nrm
+            l_sign = (net(pp) - delta).abs().mean() + (net(pm) + delta).abs().mean()
 
         # free-space carving (표면 근처): 관측점 p에서 카메라 방향으로 s∈[2δ, free_range] 후퇴한
         # 점은 빈 공간 → SDF ≥ 0. (bbox 안 표면 근처를 집중 샘플 — 멀리 카메라 쪽은 정보 없음)
@@ -452,6 +458,8 @@ def main():
                         help="생성 뷰 점군 ply(법선 포함) — unseen 표면 증거 주입 (make_gen_points.py)")
     parser.add_argument("--prior_repeat", default=1.0, type=float,
                         help="<1 이면 prior 점을 그 비율로 서브샘플(신뢰도 하향)")
+    parser.add_argument("--prior_weight", default=1.0, type=float,
+                        help="extra_points(prior) 표면 손실 가중치(<1: seen 이 지배하는 soft prior)")
     parser.add_argument("--carve_depth_dir", default="", type=str,
                         help="dump_scene_depth.py 출력 폴더. 전체 씬 200뷰 depth로 free-space carving (empty-ray보다 우선)")
     parser.add_argument("--offsurf_delta", default=0.01, type=float, help="정규화 좌표 기준 off-surface 오프셋")
@@ -579,6 +587,13 @@ def main():
         P = np.concatenate([P, Pe]); N = np.concatenate([N, Ne])
         C = np.concatenate([C, Ce]); O = np.concatenate([O, Oe])
         print(f"prior 점군 주입: {len(Pe)}점 (총 {len(P)})")
+        n_extra = len(Pe)
+    else:
+        n_extra = 0
+    Wp = np.ones(len(P), np.float32)
+    if n_extra and args.prior_weight != 1.0:
+        Wp[len(P) - n_extra:] = args.prior_weight
+        print(f"prior 가중치 {args.prior_weight}: seen {len(P)-n_extra} : prior {n_extra}")
 
     # 1c) 전체 씬 depth 기반 carve 샘플 (있으면 empty-ray보다 우선)
     CV = None
@@ -588,7 +603,7 @@ def main():
 
     # 2) SDF 학습
     print("IGR SDF 학습 ...")
-    net = train_sdf(Pn, N, On, EOn, ED, args, CV=CV)
+    net = train_sdf(Pn, N, On, EOn, ED, args, CV=CV, W=Wp)
 
     # 3) 그리드 평가 + marching cubes — 타일 분할로 고해상도(whole-scene) 지원
     G = args.grid if args.grid > 0 else int(round(2 * scale / args.voxel_size))
