@@ -342,7 +342,7 @@ def collect_oriented_points(scene, gaussians, pipe, background, args, mask_dir=N
     return P, N, C, O, EO, ED
 
 
-def train_sdf(P, N, O, W, EO, ED, args, CV=None):
+def train_sdf(P, N, O, EO, ED, args, CV=None, W=None):
     """정규화된 oriented point cloud에 IGR SDF 피팅.
     O = 점별 관측 카메라 중심(정규화 좌표) — 표면 근처 free-space carving.
     EO/ED = 빈 광선(alpha≈0 픽셀)의 카메라 중심/방향 — empty-ray carving.
