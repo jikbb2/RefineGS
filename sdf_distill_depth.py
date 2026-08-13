@@ -317,7 +317,9 @@ def collect_oriented_points(scene, gaussians, pipe, background, args, mask_dir=N
         O_all.append(cam_center[None].expand(len(pts_w), 3).cpu())  # 점별 관측 카메라 중심
 
         # 빈 광선 수집: alpha≈0 픽셀 = "이 광선 위엔 아무것도 없음"이 관측된 것
-        if args.empty_per_view > 0:
+        # [FIX Step4-C] 실제 학습 뷰(use_mask=True)에서만 수집. extra/novel 뷰의 alpha≈0 은
+        # "모델에 기하가 없음"이지 "빈 공간이 관측됨"이 아님 — 생성 다리를 carve로 지우는 원인.
+        if args.empty_per_view > 0 and use_mask:
             em = alpha < args.empty_alpha
             eidx = em.nonzero(as_tuple=False)
             if len(eidx) > 0:
@@ -342,11 +344,15 @@ def collect_oriented_points(scene, gaussians, pipe, background, args, mask_dir=N
     return P, N, C, O, EO, ED
 
 
-def train_sdf(P, N, O, EO, ED, args, CV=None, W=None):
+def train_sdf(P, N, O, EO, ED, args, CV=None, W=None, OBS=None, PV=None, PS=None):
     """정규화된 oriented point cloud에 IGR SDF 피팅.
     O = 점별 관측 카메라 중심(정규화 좌표) — 표면 근처 free-space carving.
     EO/ED = 빈 광선(alpha≈0 픽셀)의 카메라 중심/방향 — empty-ray carving.
-    CV = 전체 씬 depth 기반 free-space 샘플 풀(carve_depth_dir) — 있으면 empty-ray 대신 사용."""
+    CV = 전체 씬 depth 기반 free-space 샘플 풀(carve_depth_dir) — 있으면 empty-ray 대신 사용.
+    OBS = [FIX Step4-B] 점별 '관측점' 마스크(bool). l_free 는 관측점에서만 —
+          prior 점의 가짜 원점(O=center)이 객체 내부를 carve하던 버그 제거.
+    PV/PS = [Step2] prior mesh 볼륨 샘플 좌표 / target SDF(정규화). truncated L1 회귀 —
+            얇은 다리 양쪽 빈 공간이 양수로 명시 감독되어 팽창을 원리적으로 차단."""
     dev = "cuda"
     Pt = torch.tensor(P, dtype=torch.float32, device=dev)
     Nt = torch.tensor(N, dtype=torch.float32, device=dev)
@@ -355,6 +361,13 @@ def train_sdf(P, N, O, EO, ED, args, CV=None, W=None):
     EOt = torch.tensor(EO, dtype=torch.float32, device=dev) if EO is not None and len(EO) else None
     EDt = torch.tensor(ED, dtype=torch.float32, device=dev) if ED is not None and len(ED) else None
     CVt = torch.tensor(CV, dtype=torch.float32, device=dev) if CV is not None and len(CV) else None
+    obs_idx = None
+    if OBS is not None:
+        obs_idx = torch.tensor(np.nonzero(OBS)[0], dtype=torch.long, device=dev)
+        if len(obs_idx) == len(Pt):
+            obs_idx = None                       # 전부 관측점이면 게이팅 불필요
+    PVt = torch.tensor(PV, dtype=torch.float32, device=dev) if PV is not None and len(PV) else None
+    PSt = torch.tensor(PS, dtype=torch.float32, device=dev) if PVt is not None else None
     net = SDFNet(pe_L=args.pe_L).to(dev)
     opt = torch.optim.Adam(net.parameters(), lr=args.lr)
     delta = args.offsurf_delta
@@ -379,14 +392,18 @@ def train_sdf(P, N, O, EO, ED, args, CV=None, W=None):
 
         # free-space carving (표면 근처): 관측점 p에서 카메라 방향으로 s∈[2δ, free_range] 후퇴한
         # 점은 빈 공간 → SDF ≥ 0. (bbox 안 표면 근처를 집중 샘플 — 멀리 카메라 쪽은 정보 없음)
+        # [FIX Step4-B] 관측점만 사용(obs_idx). prior 점은 O=center 가짜 원점이라
+        # 객체 내부를 '빈 공간'으로 carve → l_sign 과 충돌 → 표면 뒤틀림의 원인이었음.
         l_free = torch.tensor(0.0, device=dev)
         if args.w_free > 0:
-            dirv = Pt[bi] - Ot[bi]
+            bf = (obs_idx[torch.randint(0, len(obs_idx), (args.batch,), device=dev)]
+                  if obs_idx is not None else bi)
+            dirv = Pt[bf] - Ot[bf]
             dist = dirv.norm(dim=-1, keepdim=True).clamp(min=1e-6)
             dirn = dirv / dist
-            s = torch.rand(args.batch, 1, device=dev) * (args.free_range - 2 * delta) + 2 * delta
+            s = torch.rand(len(bf), 1, device=dev) * (args.free_range - 2 * delta) + 2 * delta
             s = torch.minimum(s, dist * 0.95)
-            xf = Pt[bi] - dirn * s
+            xf = Pt[bf] - dirn * s
             l_free = torch.relu(-net(xf)).mean()
 
         # empty-ray carving: 렌더 alpha≈0 픽셀의 광선은 '아무것도 없음'이 관측된 것 →
@@ -405,6 +422,13 @@ def train_sdf(P, N, O, EO, ED, args, CV=None, W=None):
             xe = o + dn * t
             l_empty = torch.relu(-net(xe)).mean()                         # 음수(내부)만 벌점
 
+        # [Step2] prior mesh 볼륨 SDF distillation — truncated L1 회귀.
+        # 표면점만 주입하던 기존 방식과 달리 다리 '양쪽' 빈 공간이 명시적으로 양수 감독됨.
+        l_prior = torch.tensor(0.0, device=dev)
+        if PVt is not None and args.w_prior_sdf > 0:
+            bp = torch.randint(0, len(PVt), (args.batch,), device=dev)
+            l_prior = (net(PVt[bp]).squeeze(-1) - PSt[bp]).abs().mean()
+
         # eikonal: 표면 근처 + 균등 랜덤
         rp = torch.cat([Pt[torch.randint(0, len(Pt), (args.batch,), device=dev)]
                         + 0.02 * torch.randn(args.batch, 3, device=dev),
@@ -413,12 +437,14 @@ def train_sdf(P, N, O, EO, ED, args, CV=None, W=None):
         l_eik = ((ge.norm(dim=-1) - 1) ** 2).mean()
 
         loss = (l_man + args.w_normal * l_nrm + args.w_sign * l_sign
-                + args.w_eik * l_eik + args.w_free * l_free + args.w_empty * l_empty)
+                + args.w_eik * l_eik + args.w_free * l_free + args.w_empty * l_empty
+                + args.w_prior_sdf * l_prior)
         opt.zero_grad(); loss.backward(); opt.step()
         if it % 500 == 0:
             print(f"[{it}] man {l_man.item():.4f} nrm {l_nrm.item():.4f} "
                   f"sign {l_sign.item():.4f} eik {l_eik.item():.4f} "
-                  f"free {l_free.item():.4f} empty {l_empty.item():.4f}")
+                  f"free {l_free.item():.4f} empty {l_empty.item():.4f} "
+                  f"prior {l_prior.item():.4f}")
     return net
 
 
@@ -460,6 +486,21 @@ def main():
                         help="<1 이면 prior 점을 그 비율로 서브샘플(신뢰도 하향)")
     parser.add_argument("--prior_weight", default=1.0, type=float,
                         help="extra_points(prior) 표면 손실 가중치(<1: seen 이 지배하는 soft prior)")
+    parser.add_argument("--prior_mesh", default="", type=str,
+                        help="[Step2] 정합된 watertight 생성 메쉬(fuse_generated_mesh --save_aligned "
+                             "출력 *_gen_aligned.ply). 표면점+볼륨 SDF distillation — extra_points 상위호환")
+    parser.add_argument("--w_prior_sdf", default=0.5, type=float,
+                        help="볼륨 SDF distillation 손실 가중치(0=off)")
+    parser.add_argument("--prior_surf_n", default=150000, type=int,
+                        help="prior mesh 표면 샘플 수")
+    parser.add_argument("--prior_band", default=0.08, type=float,
+                        help="볼륨 셸 샘플 half-width (world m). 다리 최소 두께의 2~3배 권장")
+    parser.add_argument("--prior_trunc", default=0.05, type=float,
+                        help="target SDF truncation (world m)")
+    parser.add_argument("--prior_unseen_dist", default=0.03, type=float,
+                        help="[Step1] 관측점에서 이 거리(m) 이내의 prior 샘플 제거 — 관측이 항상 승리")
+    parser.add_argument("--prior_gate", default=0.02, type=float,
+                        help="[Step4] carve/empty 샘플이 prior mesh 표면 s<=gate(m) 이내면 제외")
     parser.add_argument("--carve_depth_dir", default="", type=str,
                         help="dump_scene_depth.py 출력 폴더. 전체 씬 200뷰 depth로 free-space carving (empty-ray보다 우선)")
     parser.add_argument("--offsurf_delta", default=0.01, type=float, help="정규화 좌표 기준 off-surface 오프셋")
@@ -559,8 +600,8 @@ def main():
     center = (lo + hi) / 2
     scale = np.abs(P - center).max() * 1.1
     print(f"robust bbox: outlier {n_drop}점 제거, scale={scale:.3f} world (bbox {np.round(hi-lo,3)})")
-    Pn = (P - center) / scale
-    On = (O - center) / scale
+    # [FIX] Pn/On 은 prior 주입 '후'에 계산 (기존엔 여기서 계산해 stale Pn 이 train 에 들어가
+    # prior 점이 표면 손실에 전혀 반영되지 않던 치명 버그 — 다리 무감독→팽창의 직접 원인)
     EOn = (EO - center) / scale if len(EO) else EO   # 방향(ED)은 정규화 불변
     if len(EOn):
         t0 = -(EOn * ED).sum(-1)
@@ -571,9 +612,11 @@ def main():
         EOn, ED = EOn[keep_e], ED[keep_e]
         print(f"empty ray 필터: {int(keep_e.sum())}/{len(keep_e)} 유지 (bbox 관통 광선)")
 
-    # 1b-2) [prior] 생성 뷰 점군 주입 — See3D gen + 단안 depth 로 만든 unseen 표면 증거
-    #       (make_gen_points.py 출력 ply). 관측점과 함께 SDF 표면 항에 들어가되,
-    #       법선은 카메라 정렬 규약을 동일 적용. 신뢰도 차이는 --prior_repeat(<1 이면 서브샘플)로 반영.
+    n_obs = len(P)
+    OBS = np.ones(n_obs, bool)          # True=관측점. prior 점은 False → l_free 제외
+
+    # 1b-2) [prior·점군 경로] 생성 뷰 점군 주입 (make_gen_points.py / fuse --export_points).
+    #       [FIX Step4-B] OBS=False 로 표시 — 가짜 원점(O=center) free-carve 버그 제거.
     if args.extra_points:
         pp = o3d.io.read_point_cloud(os.path.expanduser(args.extra_points))
         Pe = np.asarray(pp.points)
@@ -583,13 +626,71 @@ def main():
         if 0 < args.prior_repeat < 1.0:
             sel = np.random.choice(len(Pe), max(int(len(Pe) * args.prior_repeat), 1), replace=False)
             Pe, Ne, Ce = Pe[sel], Ne[sel], Ce[sel]
-        Oe = np.asarray(pp.covariances)[:, :, 0] if False else np.tile(center, (len(Pe), 1))
         P = np.concatenate([P, Pe]); N = np.concatenate([N, Ne])
-        C = np.concatenate([C, Ce]); O = np.concatenate([O, Oe])
+        C = np.concatenate([C, Ce]); O = np.concatenate([O, np.tile(center, (len(Pe), 1))])
+        OBS = np.concatenate([OBS, np.zeros(len(Pe), bool)])
         print(f"prior 점군 주입: {len(Pe)}점 (총 {len(P)})")
         n_extra = len(Pe)
     else:
         n_extra = 0
+
+    # 1b-3) [prior·메쉬 경로, Step2] 정합된 watertight 생성 메쉬
+    #       (fuse_generated_mesh --save_aligned 출력 *_gen_aligned.ply).
+    #       표면 샘플(face normal, unseen 게이트) + 볼륨 셸 샘플의 target SDF 회귀.
+    PV = PS = None
+    rs_prior = None
+    _sd = None
+    if args.prior_mesh:
+        import open3d.core as o3c
+        from scipy.spatial import cKDTree as _KDp
+        gm = o3d.io.read_triangle_mesh(os.path.expanduser(args.prior_mesh))
+        assert len(gm.vertices), f"prior mesh 로드 실패: {args.prior_mesh}"
+        wt = gm.is_watertight()
+        print(f"[prior] mesh verts {len(gm.vertices)} watertight={wt}"
+              + ("" if wt else "  ⚠ signed distance 부호 불안정 가능 — 생성 원본(glb) 정합본 권장"))
+        rs_prior = o3d.t.geometry.RaycastingScene()
+        rs_prior.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(gm))
+
+        def _sd(q):     # world 좌표 signed distance (양수=밖)
+            return rs_prior.compute_signed_distance(
+                o3c.Tensor(q.astype(np.float32))).numpy().astype(np.float64)
+
+        obs_tree_w = _KDp(P[:n_obs])
+        band, trunc = args.prior_band, args.prior_trunc
+        # 표면 샘플 — face normal 사용(생성 mesh vertex normal 오염 회피) + 부호 검증
+        sp = gm.sample_points_uniformly(args.prior_surf_n, use_triangle_normal=True)
+        Ps_w = np.asarray(sp.points); Ns_w = np.asarray(sp.normals).copy()
+        flip = _sd(Ps_w + 0.5 * band * Ns_w) < 0     # p+εn 이 내부면 법선 뒤집힘
+        Ns_w[flip] = -Ns_w[flip]
+        print(f"[prior] 표면 법선 부호 flip {int(flip.sum())}/{len(Ns_w)}")
+        # [Step1] unseen 게이트: 관측점 τ 이내 표면 샘플 제거 — 관측이 항상 승리(이중 표면 방지)
+        du, _ = obs_tree_w.query(Ps_w, workers=-1)
+        ku = du > args.prior_unseen_dist
+        Cs = (np.asarray(sp.colors)[ku] if len(sp.colors) == len(ku)
+              else np.tile([0.6, 0.6, 0.6], (int(ku.sum()), 1)))
+        Ps_w, Ns_w = Ps_w[ku], Ns_w[ku]
+        print(f"[prior] unseen 표면 샘플 {len(Ps_w)}/{len(ku)} (τ={args.prior_unseen_dist}m)")
+        P = np.concatenate([P, Ps_w]); N = np.concatenate([N, Ns_w])
+        C = np.concatenate([C, Cs]);  O = np.concatenate([O, np.tile(center, (len(Ps_w), 1))])
+        OBS = np.concatenate([OBS, np.zeros(len(Ps_w), bool)])
+        n_extra += len(Ps_w)
+        # [Step2] 볼륨 셸 샘플: 표면 ±band 가우시안 오프셋 → target SDF(truncated) 회귀 데이터
+        rng = np.random.default_rng(0)
+        X = np.concatenate([Ps_w + rng.standard_normal(Ps_w.shape) * band * f
+                            for f in (0.25, 1.0)])
+        sd_x = _sd(X)
+        dxo, _ = obs_tree_w.query(X, workers=-1)
+        kx = dxo > args.prior_unseen_dist            # 관측 근방 샘플 제외(관측 항이 담당)
+        Xn_ = (X[kx] - center) / scale
+        kin = np.all(np.abs(Xn_) < 1.0, axis=1)      # 정규화 큐브 내부만
+        PV = Xn_[kin].astype(np.float64)
+        PS = (np.clip(sd_x[kx][kin], -trunc, trunc) / scale).astype(np.float64)
+        print(f"[prior] 볼륨 distill 샘플 {len(PV)} (band={band}m trunc={trunc}m)")
+
+    # 정규화 좌표 — prior 주입 '후' 계산 ([FIX] stale Pn 버그 수정의 핵심)
+    Pn = (P - center) / scale
+    On = (O - center) / scale
+
     Wp = np.ones(len(P), np.float32)
     if n_extra and args.prior_weight != 1.0:
         Wp[len(P) - n_extra:] = args.prior_weight
@@ -601,9 +702,31 @@ def main():
         CV = load_carve_points(args.carve_depth_dir, center, scale)
         print(f"carve 샘플 {len(CV)}개 (전체 씬 depth, bbox 내부)")
 
+    # 1d) [FIX Step4-D] carve/empty 샘플이 prior mesh 근방(s<=prior_gate)이면 제외 —
+    #     'SDF>=0 강제'와 'l_prior 음수 회귀'가 같은 voxel에서 싸우는 것을 차단.
+    if _sd is not None:
+        gate = args.prior_gate
+        if CV is not None and len(CV):
+            keep_cv = _sd(CV * scale + center) > gate
+            print(f"[prior] carve 게이트: {int(keep_cv.sum())}/{len(CV)} 유지 (s<={gate}m 제거)")
+            CV = CV[keep_cv]
+        if len(EOn):
+            # empty ray 를 chord 상 '고정 샘플'로 변환 → prior 근방 제외 → CV 병합, chord 경로 비활성
+            K = 4
+            t0 = -(EOn * ED).sum(-1, keepdims=True)
+            cp = EOn + ED * t0
+            half = np.sqrt(np.clip(1.44 - (cp * cp).sum(-1, keepdims=True), 0.0, None))
+            ts = np.clip(t0 + (np.random.rand(len(EOn), K) * 2 - 1) * half, 0.05, None)
+            Xe = (EOn[:, None, :] + ED[:, None, :] * ts[..., None]).reshape(-1, 3)
+            Xe = Xe[np.all(np.abs(Xe) < 1.2, axis=1)]
+            Xe = Xe[_sd(Xe * scale + center) > gate]
+            CV = Xe if (CV is None or not len(CV)) else np.concatenate([CV, Xe])
+            EOn = np.zeros((0, 3)); ED = np.zeros((0, 3))
+            print(f"[prior] empty-ray → 고정 샘플 {len(Xe)} (게이트 적용, chord 경로 비활성)")
+
     # 2) SDF 학습
     print("IGR SDF 학습 ...")
-    net = train_sdf(Pn, N, On, EOn, ED, args, CV=CV, W=Wp)
+    net = train_sdf(Pn, N, On, EOn, ED, args, CV=CV, W=Wp, OBS=OBS, PV=PV, PS=PS)
 
     # 3) 그리드 평가 + marching cubes — 타일 분할로 고해상도(whole-scene) 지원
     G = args.grid if args.grid > 0 else int(round(2 * scale / args.voxel_size))
