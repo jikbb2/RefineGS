@@ -256,6 +256,34 @@ def render_compare(gen_aligned, cams, max_views=6):
     return float(np.mean(ious)) if ious else float("nan")
 
 
+def load_gen_with_color(path):
+    """생성 메쉬 로드 + 텍스처를 정점색으로 베이킹(trimesh). 반환 (o3d_mesh, trimesh|None).
+    o3d 는 텍스처를 정점색으로 안 옮기므로, trimesh 의 to_color 로 UV 텍스처를 정점색으로 굽는다.
+    trimesh 객체는 텍스처 보존 export(.glb/.obj)용으로 함께 반환."""
+    p = os.path.expanduser(path)
+    try:
+        import trimesh
+        tm = trimesh.load(p, process=False, force="mesh")
+        V = np.asarray(tm.vertices, np.float64)
+        F = np.asarray(tm.faces, np.int32)
+        m = o3d.geometry.TriangleMesh(o3d.utility.Vector3dVector(V),
+                                      o3d.utility.Vector3iVector(F))
+        try:
+            vc = np.asarray(tm.visual.to_color().vertex_colors)[:, :3].astype(np.float64) / 255.0
+            if len(vc) == len(V):
+                m.vertex_colors = o3d.utility.Vector3dVector(vc)
+                print(f"[색] 텍스처→정점색 베이킹 완료 ({len(V)}정점)")
+        except Exception as e:
+            print(f"[색] 텍스처 베이킹 실패({e}) — 색 없이 진행")
+        m.compute_vertex_normals()
+        return m, tm
+    except Exception as e:
+        print(f"[색] trimesh 로드 실패({e}) — o3d 로드(텍스처 무시)")
+        m = o3d.io.read_triangle_mesh(p)
+        m.compute_vertex_normals()
+        return m, None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--recon", required=True)
@@ -309,9 +337,9 @@ def main():
         print(f"[안전] 기존 파일 보존 → 새 경로: {out_path}")
 
     recon = o3d.io.read_triangle_mesh(args.recon)
-    gen = o3d.io.read_triangle_mesh(args.gen)
+    gen, gen_tm = load_gen_with_color(args.gen)          # 텍스처→정점색 베이킹
     assert len(recon.vertices) and len(gen.vertices), "메쉬 로드 실패"
-    recon.compute_vertex_normals(); gen.compute_vertex_normals()
+    recon.compute_vertex_normals()
 
     rp = (recon.sample_points_poisson_disk(args.n_sample) if len(recon.triangles)
           else recon.sample_points_uniformly(args.n_sample))
@@ -429,9 +457,17 @@ def main():
         o3d.io.write_triangle_mesh(out_path, mesh)
         print(f"→ 완결 메쉬(미리보기): {out_path}  (정점 {len(mesh.vertices)})")
     if args.save_aligned:
-        base = out_path or os.path.expanduser(args.export_points)
-        p = base[:-4] + "_gen_aligned.ply"
-        o3d.io.write_triangle_mesh(p, gen); print(f"→ 정합 생성메쉬: {p}")
+        base = (out_path or os.path.expanduser(args.export_points)
+                or os.path.expanduser(args.dense_points))
+        if gen_tm is not None:                            # 텍스처 보존 .glb 로 저장
+            p = base[:-4] + "_gen_aligned.glb"
+            tm2 = gen_tm.copy()
+            tm2.vertices = apply9(np.asarray(gen_tm.vertices), R, t, S)
+            tm2.export(p)
+            print(f"→ 정합 생성메쉬(텍스처 유지): {p}")
+        else:
+            p = base[:-4] + "_gen_aligned.ply"
+            o3d.io.write_triangle_mesh(p, gen); print(f"→ 정합 생성메쉬: {p}")
 
 
 if __name__ == "__main__":
