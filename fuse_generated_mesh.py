@@ -37,6 +37,58 @@ except Exception:
     read_colmap = None
 
 
+# ---------------- 밴드 워프: 부위별(상판/하판) 비율 보정 ----------------
+def band_warp(gen, R_pts, up=2, band_h=0.05, min_pts=200):
+    """[의미적 정합] 수평 슬래브(상판·하판) 두 밴드에서 각각 관측(TSDF)과의
+    in-plane 스케일+이동을 추정하고, up 축을 따라 선형 보간해 적용하는
+    2-노드 embedded deformation. 전역 9-DoF 가 못 잡는 '부위별 비율 차이'
+    (생성 하판 ≠ recon 하판 크기)를 보정. 다리는 두 앵커 사이에서 부드럽게 따라옴."""
+    V = np.asarray(gen.vertices).copy()
+    Nv = np.asarray(gen.vertex_normals)
+    inplane = [i for i in range(3) if i != up]
+    slab = np.abs(Nv[:, up]) > 0.8                       # 수평면 정점(상판/하판 후보)
+    if slab.sum() < min_pts:
+        print("[band] 수평면 정점 부족 — warp skip"); return gen
+    u = V[slab][:, up]
+    u_bot, u_top = np.percentile(u, 5), np.percentile(u, 95)
+    if u_top - u_bot < band_h * 2:
+        print("[band] 상/하판 분리 불가(단일 슬래브) — warp skip"); return gen
+    params = []
+    for name, u0 in (("하판", u_bot), ("상판", u_top)):
+        sel = slab & (np.abs(V[:, up] - u0) < band_h)
+        Pg = V[sel]
+        Rb = R_pts[np.abs(R_pts[:, up] - u0) < band_h * 2]      # 같은 높이의 관측 밴드
+        if len(Pg) < min_pts or len(Rb) < min_pts:
+            params.append(None); continue
+        # footprint(percentile bbox) 정합 — NN 대응은 '작은 판이 큰 판 안쪽'일 때
+        # identity 로 수렴해 스케일을 못 잡음. 밴드는 면이므로 범위 자체를 맞춘다.
+        lo_g, hi_g = np.percentile(Pg, 2, axis=0), np.percentile(Pg, 98, axis=0)
+        lo_r, hi_r = np.percentile(Rb, 2, axis=0), np.percentile(Rb, 98, axis=0)
+        cg, cr = (lo_g + hi_g) / 2, (lo_r + hi_r) / 2
+        s2 = np.ones(3)
+        for ax in inplane:
+            s2[ax] = (hi_r - lo_r)[ax] / max((hi_g - lo_g)[ax], 1e-6)
+        # 관측 밴드가 '부분 관측'이면 축소로 오판할 수 있음 → clip 하한으로 완충
+        s2 = np.clip(s2, 0.75, 1.4); s2[up] = 1.0
+        params.append((cg, cr, s2))
+        print(f"[band] {name} u={u0:+.3f} gen {len(Pg)}점/recon {len(Rb)}점  "
+              f"scale={np.round(s2, 3)}  du={cr[up] - cg[up]:+.3f}m")
+    if all(p is None for p in params):
+        print("[band] 대응 밴드 없음 — warp skip"); return gen
+    if params[0] is None: params[0] = params[1]
+    if params[1] is None: params[1] = params[0]
+
+    def bmap(p, prm):
+        cg, cr, s2 = prm
+        return cr + s2 * (p - cg)                               # 밴드 앵커 기준 affine
+
+    w = np.clip((V[:, up] - u_bot) / max(u_top - u_bot, 1e-6), 0, 1)[:, None]
+    V2 = (1 - w) * bmap(V, params[0]) + w * bmap(V, params[1])  # up 축 선형 보간
+    gen.vertices = o3d.utility.Vector3dVector(V2)
+    gen.compute_vertex_normals()
+    return gen
+
+
 # ---------------- Sim3 / 9-DoF ----------------
 def umeyama(src, dst, with_scale=True):
     mu_s, mu_d = src.mean(0), dst.mean(0)
@@ -323,6 +375,10 @@ def main():
                     help="관측 band 내 생성점을 제거 대신 관측 표면으로 거리가중 끌어당김(seam 완화)")
     ap.add_argument("--snap_band", type=float, default=0.0, help="스냅/제거 band(m). 0=자동(TSDF간격×3)")
     ap.add_argument("--no_mesh", action="store_true", help="Poisson 미리보기 메쉬 생략")
+    ap.add_argument("--band_warp", action="store_true",
+                    help="[의미적 정합] 상판·하판 밴드별 관측 대응 warp — 부위별 비율 차이 보정")
+    ap.add_argument("--band_h", type=float, default=0.05,
+                    help="밴드 두께 절반(m). 상판/하판 두께 수준으로")
     args = ap.parse_args()
     if not (args.out or args.export_points or args.dense_points):
         ap.error("--out / --export_points / --dense_points 중 하나는 필요합니다")
@@ -377,7 +433,17 @@ def main():
     gv = np.asarray(gen.vertices)
     gen.vertices = o3d.utility.Vector3dVector(apply9(gv, R, t, S))
     gen.compute_vertex_normals()
-    G_world = apply9(G_pts, R, t, S)
+
+    # [의미적 정합] 밴드 워프: 상판·하판 각각 관측과 in-plane 스케일/이동을 맞추고
+    # up 축으로 보간(2-노드 embedded deformation). 전역 9-DoF 가 못 잡는
+    # '생성 하판 ≠ recon 하판 크기' 류의 부위별 비율 차이를 보정.
+    if args.band_warp:
+        up_i = {"x": 0, "y": 1, "z": 2}[args.world_up]
+        gen = band_warp(gen, R_pts, up=up_i, band_h=args.band_h)
+        gp = gen.sample_points_uniformly(args.n_sample)   # warp 반영 재샘플(정점색 포함)
+        G_world = np.asarray(gp.points)
+    else:
+        G_world = apply9(G_pts, R, t, S)
 
     if cams is not None:
         print(f"[진단] 최종 silhouette IoU={render_compare(gen, cams):.3f}")
@@ -462,9 +528,10 @@ def main():
         if gen_tm is not None:                            # 텍스처 보존 .glb 로 저장
             p = base[:-4] + "_gen_aligned.glb"
             tm2 = gen_tm.copy()
-            tm2.vertices = apply9(np.asarray(gen_tm.vertices), R, t, S)
+            # gen 은 9-DoF + (선택) band_warp 까지 반영된 정점 — 동일 순서라 그대로 이식
+            tm2.vertices = np.asarray(gen.vertices)
             tm2.export(p)
-            print(f"→ 정합 생성메쉬(텍스처 유지): {p}")
+            print(f"→ 정합 생성메쉬(텍스처 유지, warp 반영): {p}")
         else:
             p = base[:-4] + "_gen_aligned.ply"
             o3d.io.write_triangle_mesh(p, gen); print(f"→ 정합 생성메쉬: {p}")
