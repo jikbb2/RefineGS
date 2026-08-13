@@ -643,8 +643,25 @@ def main():
     if args.prior_mesh:
         import open3d.core as o3c
         from scipy.spatial import cKDTree as _KDp
-        gm = o3d.io.read_triangle_mesh(os.path.expanduser(args.prior_mesh))
+        pm_path = os.path.expanduser(args.prior_mesh)
+        gm = o3d.io.read_triangle_mesh(pm_path)
         assert len(gm.vertices), f"prior mesh 로드 실패: {args.prior_mesh}"
+        # glb 등 UV 텍스처 입력이면 vertex color 로 bake (없으면 샘플 점이 흰색이 됨).
+        # ※ "more than 1 material" Open3D 경고는 RaycastingScene 변환 시 재질을 버린다는
+        #   의미일 뿐 — SDF(geometry) 계산에는 무해.
+        if not (gm.has_vertex_colors() and len(gm.vertex_colors) == len(gm.vertices)):
+            try:
+                import trimesh
+                tm = trimesh.load(pm_path, process=False, force="mesh")
+                vc = np.asarray(tm.visual.to_color().vertex_colors)[:, :3] / 255.0
+                if len(vc) == len(tm.vertices):
+                    gm = o3d.geometry.TriangleMesh(
+                        o3d.utility.Vector3dVector(np.asarray(tm.vertices, np.float64)),
+                        o3d.utility.Vector3iVector(np.asarray(tm.faces, np.int32)))
+                    gm.vertex_colors = o3d.utility.Vector3dVector(np.clip(vc, 0, 1))
+                    print(f"[prior] 텍스처→정점색 bake ({len(vc)} verts)")
+            except Exception as e:
+                print(f"[prior] 색 bake 실패({e}) — 회색 유지")
         wt = gm.is_watertight()
         print(f"[prior] mesh verts {len(gm.vertices)} watertight={wt}"
               + ("" if wt else "  ⚠ signed distance 부호 불안정 가능 — 생성 원본(glb) 정합본 권장"))
@@ -804,19 +821,26 @@ def main():
 
     # 5) safe_post_process_mesh(num_cluster) — TSDF 경로와 동일 로직(클램프 추가)
 
-    out = args.out
+    out = os.path.expanduser(args.out)
     if not out:
         train_dir = os.path.join(args.model_path, "train", f"ours_{scene.loaded_iter}")
         os.makedirs(train_dir, exist_ok=True)
         out = os.path.join(train_dir, "sdf_fuse.ply")
+    # [FIX] Open3D 는 확장자로 포맷 판별 → 확장자 없음/미지원이면 "unknown file extension"
+    # 경고만 내고 조용히 실패. 자동 교정 + 저장 성공 여부 검증(실패 시 즉시 중단).
+    if os.path.splitext(out)[1].lower() not in (".ply", ".obj", ".stl", ".off", ".gltf", ".glb"):
+        print(f"[경고] 출력 확장자 없음/미지원 ('{out}') → '.ply' 부착")
+        out = out + ".ply"
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
-    o3d.io.write_triangle_mesh(out, mesh)
-    print(f"mesh saved at {out}  verts {len(verts)} faces {len(faces)}")
+    ok = o3d.io.write_triangle_mesh(out, mesh)
+    assert ok, f"[중단] 메쉬 저장 실패: {os.path.abspath(out)}"
+    print(f"mesh saved at {os.path.abspath(out)}  verts {len(verts)} faces {len(faces)}")
 
     mesh_post = safe_post_process_mesh(mesh, cluster_to_keep=args.num_cluster)
-    out_post = out.replace(".ply", "_post.ply")
-    o3d.io.write_triangle_mesh(out_post, mesh_post)
-    print(f"mesh post processed saved at {out_post}")
+    out_post = os.path.splitext(out)[0] + "_post.ply"
+    ok = o3d.io.write_triangle_mesh(out_post, mesh_post)
+    assert ok, f"[중단] post 메쉬 저장 실패: {os.path.abspath(out_post)}"
+    print(f"mesh post processed saved at {os.path.abspath(out_post)}")
 
 
 if __name__ == "__main__":
