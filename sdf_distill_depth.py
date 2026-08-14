@@ -469,6 +469,62 @@ def train_sdf(P, N, O, EO, ED, args, CV=None, W=None, OBS=None, PV=None, PS=None
     return net
 
 
+def grid_fuse_tsdf(VB, sd_fn, center, scale, args):
+    """[grid-fuse] MLP 없는 결정적 SDF 융합 — 모순을 '평균'이 아닌 '우선순위'로 해소:
+        관측 TSDF > 관측된 빈 공간(occlusion-aware carve, +trunc) > 생성 SDF(미관측만).
+    MLP 보간 병리(부풀림·스펀지)가 구조적으로 없음. 품질은 정합·생성 품질에만 의존.
+    occlusion-aware: 관측 표면 '뒤'(다리 영역 등)는 판단 보류 → 생성이 채움."""
+    from skimage.measure import marching_cubes
+    from scipy import ndimage
+    trunc = args.prior_trunc
+    margin = args.prior_carve_margin
+    G = args.grid if args.grid > 0 else int(round(2 * scale / args.voxel_size))
+    G = int(min(G, args.max_grid))
+    print(f"[grid-fuse] G={G} voxel≈{2*scale/(G-1):.4f}m trunc={trunc}m views={len(VB)}")
+    lin = np.linspace(-1, 1, G, dtype=np.float32)
+    Fo = np.zeros((G, G, G), np.float32)      # 관측 TSDF 가중합
+    Wo = np.zeros((G, G, G), np.float32)      # 관측 가중치(뷰 수)
+    FR = np.zeros((G, G, G), bool)            # 관측된 빈 공간(실루엣 밖 & 비가림)
+    SG = np.empty((G, G, G), np.float32)      # 생성 SDF (truncated)
+    for k0 in range(0, G, 8):
+        k1 = min(k0 + 8, G)
+        gx, gy, gz = np.meshgrid(lin, lin, lin[k0:k1], indexing="ij")
+        Xw = np.stack([gx, gy, gz], -1).reshape(-1, 3).astype(np.float64) * scale + center
+        SG[:, :, k0:k1] = np.clip(sd_fn(Xw), -trunc, trunc).reshape(G, G, k1 - k0)
+        f = np.zeros(len(Xw), np.float32); w = np.zeros(len(Xw), np.float32)
+        fr = np.zeros(len(Xw), bool)
+        for b in VB:
+            Xc = Xw @ b["R"].T + b["t"]; z = Xc[:, 2]; zz = np.maximum(z, 1e-6)
+            u = b["fx"] * Xc[:, 0] / zz + b["cx"]
+            v = b["fy"] * Xc[:, 1] / zz + b["cy"]
+            infr = (z > 0.05) & (u >= 0) & (u < b["W"]) & (v >= 0) & (v < b["H"])
+            ui = np.clip(u, 0, b["W"] - 1).astype(int)
+            vi = np.clip(v, 0, b["H"] - 1).astype(int)
+            di = b["depth"][vi, ui]; mi = b["mask"][vi, ui]
+            sdf = di - z                                   # 양수 = 관측 표면 앞(밖)
+            hit = infr & mi & (di > 0) & (sdf > -trunc)    # 표면 뒤 trunc 초과는 미적용(occlusion)
+            f[hit] += np.clip(sdf[hit], -trunc, trunc); w[hit] += 1
+            fr |= infr & (~mi) & ((di <= 0) | (z < di - margin))   # 실루엣 밖 & 비가림
+        sh = (G, G, k1 - k0)
+        Fo[:, :, k0:k1] += f.reshape(sh); Wo[:, :, k0:k1] += w.reshape(sh)
+        FR[:, :, k0:k1] |= fr.reshape(sh)
+        if (k0 // 8) % 8 == 0:
+            print(f"  [grid-fuse] slab {k0}/{G}")
+    Fobs = Fo / np.maximum(Wo, 1e-6)
+    alpha = np.clip(Wo / args.grid_wcap, 0, 1)             # 관측 신뢰도(뷰 수 기반)
+    base = np.where(FR, trunc, SG)                         # 빈공간=+trunc, 미관측=생성
+    F = alpha * Fobs + (1 - alpha) * base                  # 우선순위 블렌드
+    if args.grid_smooth > 0:
+        F = ndimage.gaussian_filter(F, sigma=args.grid_smooth)
+    print(f"[grid-fuse] 관측복셀 {(Wo > 0).mean()*100:.1f}%  "
+          f"free {(FR & (Wo == 0)).mean()*100:.1f}%  "
+          f"생성 내부(미관측) {((SG < 0) & (Wo == 0) & ~FR).mean()*100:.2f}%")
+    step = 2.0 / (G - 1)
+    verts, faces, _, _ = marching_cubes(F, level=0.0, spacing=(step,) * 3)
+    verts = (verts - 1.0) * scale + center
+    return verts, faces
+
+
 def main():
     parser = ArgumentParser(description="Depth-based SDF distillation (TSDF replacement)")
     model = ModelParams(parser, sentinel=True)
@@ -528,6 +584,13 @@ def main():
                         help="prior 할루시네이션 carve 에 쓸 균등 간격 뷰 수(0=off)")
     parser.add_argument("--prior_carve_margin", default=0.015, type=float,
                         help="carve depth 여유(m) — 관측 표면보다 이만큼 앞이면 freespace 위반")
+    parser.add_argument("--grid_fuse", action="store_true",
+                        help="MLP 대신 결정적 grid TSDF 융합(관측>carve>생성 우선순위). "
+                             "--prior_mesh 필수, --prior_carve_views 120+ 권장. 부풀림·스펀지 원천 차단")
+    parser.add_argument("--grid_wcap", default=5.0, type=float,
+                        help="관측 신뢰도 포화 뷰 수 — 이 이상 관측된 복셀은 관측 TSDF 100%")
+    parser.add_argument("--grid_smooth", default=0.7, type=float,
+                        help="융합 grid 가우시안 스무딩 sigma(voxel). 0=off")
     parser.add_argument("--carve_depth_dir", default="", type=str,
                         help="dump_scene_depth.py 출력 폴더. 전체 씬 200뷰 depth로 free-space carving (empty-ray보다 우선)")
     parser.add_argument("--offsurf_delta", default=0.01, type=float, help="정규화 좌표 기준 off-surface 오프셋")
@@ -801,19 +864,28 @@ def main():
             EOn = np.zeros((0, 3)); ED = np.zeros((0, 3))
             print(f"[prior] empty-ray → 고정 샘플 {len(Xe)} (게이트 적용, chord 경로 비활성)")
 
-    # 2) SDF 학습
-    print("IGR SDF 학습 ...")
-    net = train_sdf(Pn, N, On, EOn, ED, args, CV=CV, W=Wp, OBS=OBS, PV=PV, PS=PS)
+    # 2) SDF 생성 — grid_fuse(결정적 융합, MLP 없음) 또는 IGR MLP 학습
+    net = None
+    if args.grid_fuse:
+        assert _sd is not None, "--grid_fuse 는 --prior_mesh 필요"
+        assert VB, "--grid_fuse 는 뷰 버퍼 필요 (--prior_carve_views > 0, mask_dir 필수)"
+        verts, faces = grid_fuse_tsdf(VB, _sd, center, scale, args)
+    else:
+        print("IGR SDF 학습 ...")
+        net = train_sdf(Pn, N, On, EOn, ED, args, CV=CV, W=Wp, OBS=OBS, PV=PV, PS=PS)
 
     # 3) 그리드 평가 + marching cubes — 타일 분할로 고해상도(whole-scene) 지원
     G = args.grid if args.grid > 0 else int(round(2 * scale / args.voxel_size))
     G = int(min(G, args.max_grid))
     from skimage.measure import marching_cubes
-    net.eval()
+    if net is not None:
+        net.eval()
     lin = np.linspace(-1, 1, G, dtype=np.float32)
     step = 2.0 / (G - 1)
 
-    if args.tile <= 0 or G <= args.tile:
+    if net is None:
+        pass                                    # grid_fuse 경로: verts/faces 이미 생성됨
+    elif args.tile <= 0 or G <= args.tile:
         print(f"SDF 그리드 평가 (G={G}, voxel≈{2*scale/(G-1):.4f} world) + marching cubes ...")
         vol = np.empty((G, G, G), np.float32)
         with torch.no_grad():
