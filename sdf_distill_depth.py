@@ -267,9 +267,15 @@ def collect_oriented_points(scene, gaussians, pipe, background, args, mask_dir=N
         views += [(c, False) for c in extra_cams]
     P_all, N_all, C_all, O_all = [], [], [], []
     EO_all, ED_all = [], []
+    VB = []          # [prior carve] 뷰 버퍼(다운스케일 depth+mask) — prior 샘플 visual-hull/freespace 검증용
+    n_tr = sum(1 for _, u in views if u)
+    n_carve_views = getattr(args, "prior_carve_views", 0)
+    keep_every = max(1, n_tr // max(n_carve_views, 1)) if n_carve_views > 0 else 0
+    ti = 0
     n_masked_views = 0
     n_skipped = 0
     for cam, use_mask in views:
+        m_obj = None
         pkg = render(cam, gaussians, pipe, background)
         depth = pkg["surf_depth"][0]                      # [H,W]
         alpha = pkg["rend_alpha"][0]                      # [H,W]
@@ -293,10 +299,25 @@ def collect_oriented_points(scene, gaussians, pipe, background, args, mask_dir=N
             m = load_view_mask(mask_dir, cam.image_name, H, W)
             if m is not None:
                 valid &= m
+                m_obj = m
                 n_masked_views += 1
             elif require_mask:
                 n_skipped += 1
                 continue          # 마스크 없는 학습 뷰 제외 (씬 전체 점 유입 방지)
+
+        # [prior carve] 균등 간격 뷰의 depth+mask 버퍼 저장 (다운스케일 4x)
+        if use_mask and keep_every and m_obj is not None:
+            ti += 1
+            if ti % keep_every == 0:
+                ds = 4
+                dbuf = torch.where(alpha > args.alpha_thr, depth,
+                                   torch.zeros_like(depth))[::ds, ::ds].cpu().numpy()
+                mbuf = m_obj[::ds, ::ds].cpu().numpy()
+                w2c = extrinsic.cpu().numpy()
+                VB.append({"R": w2c[:3, :3], "t": w2c[:3, 3],
+                           "fx": fx / ds, "fy": fy / ds, "cx": cx / ds, "cy": cy / ds,
+                           "W": dbuf.shape[1], "H": dbuf.shape[0],
+                           "depth": dbuf, "mask": mbuf})
         if not use_mask and extra_masks is not None and cam.image_name in extra_masks:
             valid &= extra_masks[cam.image_name]   # extra 포즈: label-buffer 객체 마스크
         pts_w = pts_w[valid]
@@ -340,8 +361,8 @@ def collect_oriented_points(scene, gaussians, pipe, background, args, mask_dir=N
     O = torch.cat(O_all).numpy().astype(np.float64)
     EO = torch.cat(EO_all).numpy().astype(np.float64) if EO_all else np.zeros((0, 3))
     ED = torch.cat(ED_all).numpy().astype(np.float64) if ED_all else np.zeros((0, 3))
-    print(f"빈 광선(empty ray) {len(EO)}개 수집")
-    return P, N, C, O, EO, ED
+    print(f"빈 광선(empty ray) {len(EO)}개 수집, prior-carve 뷰 버퍼 {len(VB)}개")
+    return P, N, C, O, EO, ED, VB
 
 
 def train_sdf(P, N, O, EO, ED, args, CV=None, W=None, OBS=None, PV=None, PS=None):
@@ -501,6 +522,12 @@ def main():
                         help="[Step1] 관측점에서 이 거리(m) 이내의 prior 샘플 제거 — 관측이 항상 승리")
     parser.add_argument("--prior_gate", default=0.02, type=float,
                         help="[Step4] carve/empty 샘플이 prior mesh 표면 s<=gate(m) 이내면 제외")
+    parser.add_argument("--prior_uniform_n", default=200000, type=int,
+                        help="uniform far-field 볼륨 샘플 수 — 셸 밖 unseen 공간 부풀림 차단")
+    parser.add_argument("--prior_carve_views", default=40, type=int,
+                        help="prior 할루시네이션 carve 에 쓸 균등 간격 뷰 수(0=off)")
+    parser.add_argument("--prior_carve_margin", default=0.015, type=float,
+                        help="carve depth 여유(m) — 관측 표면보다 이만큼 앞이면 freespace 위반")
     parser.add_argument("--carve_depth_dir", default="", type=str,
                         help="dump_scene_depth.py 출력 폴더. 전체 씬 200뷰 depth로 free-space carving (empty-ray보다 우선)")
     parser.add_argument("--offsurf_delta", default=0.01, type=float, help="정규화 좌표 기준 off-surface 오프셋")
@@ -565,11 +592,11 @@ def main():
         print(f"extra 객체 마스크 생성: {len(extra_masks)}뷰 (평균 커버 {cov*100:.1f}%)")
 
     print("뷰별 depth back-project + 법선 정렬 ...")
-    P, N, C, O, EO, ED = collect_oriented_points(scene, gaussians, pipe, background, args,
-                                                 mask_dir=mask_dir,
-                                                 require_mask=args.require_mask,
-                                                 extra_cams=extra_cams,
-                                                 extra_masks=extra_masks)
+    P, N, C, O, EO, ED, VB = collect_oriented_points(scene, gaussians, pipe, background, args,
+                                                     mask_dir=mask_dir,
+                                                     require_mask=args.require_mask,
+                                                     extra_cams=extra_cams,
+                                                     extra_masks=extra_masks)
     print(f"표면점 {len(P)} (관측 back-projected)")
     if len(P) < 1000:
         raise SystemExit(f"[중단] 유효 표면점 {len(P)}개 — 마스크 값 규약 또는 alpha_thr 확인 필요. "
@@ -680,29 +707,62 @@ def main():
         flip = _sd(Ps_w + 0.5 * band * Ns_w) < 0     # p+εn 이 내부면 법선 뒤집힘
         Ns_w[flip] = -Ns_w[flip]
         print(f"[prior] 표면 법선 부호 flip {int(flip.sum())}/{len(Ns_w)}")
+        # [할루시네이션 carve] 렌더 depth+mask 뷰 버퍼(VB)로 prior 샘플 검증.
+        #   freespace 위반: 마스크 안인데 관측 표면보다 '앞'에 뜸 (상판 위 덩어리 등)
+        #   silhouette 위반: 마스크 밖 픽셀에 비가림 상태로 투영 (꼬리 등)
+        def _carve_viol(Xw, margin=args.prior_carve_margin):
+            viol = np.zeros(len(Xw), bool)
+            for b in VB:
+                Xc = Xw @ b["R"].T + b["t"]
+                z = Xc[:, 2]
+                zz = np.maximum(z, 1e-6)
+                u = b["fx"] * Xc[:, 0] / zz + b["cx"]
+                v = b["fy"] * Xc[:, 1] / zz + b["cy"]
+                infr = (z > 0.05) & (u >= 0) & (u < b["W"]) & (v >= 0) & (v < b["H"])
+                ui = np.clip(u, 0, b["W"] - 1).astype(int)
+                vi = np.clip(v, 0, b["H"] - 1).astype(int)
+                di = b["depth"][vi, ui]; mi = b["mask"][vi, ui]
+                front = (di > 0) & (z < di - margin)             # 관측 표면보다 앞
+                sil = (~mi) & ((di <= 0) | front)                # 실루엣 밖 & 비가림
+                viol |= infr & ((mi & front) | sil)
+            return viol
+
         # [Step1] unseen 게이트: 관측점 τ 이내 표면 샘플 제거 — 관측이 항상 승리(이중 표면 방지)
         du, _ = obs_tree_w.query(Ps_w, workers=-1)
         ku = du > args.prior_unseen_dist
         Cs = (np.asarray(sp.colors)[ku] if len(sp.colors) == len(ku)
               else np.tile([0.6, 0.6, 0.6], (int(ku.sum()), 1)))
         Ps_w, Ns_w = Ps_w[ku], Ns_w[ku]
-        print(f"[prior] unseen 표면 샘플 {len(Ps_w)}/{len(ku)} (τ={args.prior_unseen_dist}m)")
+        # 표면 샘플 carve — 관측과 모순되는 생성 표면(할루시네이션) 제거
+        vv = _carve_viol(Ps_w)
+        Ps_w, Ns_w, Cs = Ps_w[~vv], Ns_w[~vv], Cs[~vv]
+        print(f"[prior] unseen 표면 샘플 {len(Ps_w)}/{len(ku)} "
+              f"(τ={args.prior_unseen_dist}m, carve 제거 {int(vv.sum())})")
         P = np.concatenate([P, Ps_w]); N = np.concatenate([N, Ns_w])
         C = np.concatenate([C, Cs]);  O = np.concatenate([O, np.tile(center, (len(Ps_w), 1))])
         OBS = np.concatenate([OBS, np.zeros(len(Ps_w), bool)])
         n_extra += len(Ps_w)
-        # [Step2] 볼륨 셸 샘플: 표면 ±band 가우시안 오프셋 → target SDF(truncated) 회귀 데이터
+        # [Step2] 볼륨 샘플 = 셸(표면 ±band) + uniform far-field.
+        #   셸: 얇은 구조 '양쪽' 근접 빈 공간을 양수로 감독.
+        #   uniform: 셸 밖 unseen ROI 전체를 truncated SDF 로 감독 —
+        #            셸 사이 무감독 공간에서 생기던 잔여 부풀림 차단.
         rng = np.random.default_rng(0)
-        X = np.concatenate([Ps_w + rng.standard_normal(Ps_w.shape) * band * f
-                            for f in (0.25, 1.0)])
+        Xs = [Ps_w + rng.standard_normal(Ps_w.shape) * band * f for f in (0.25, 1.0)]
+        Xu = rng.uniform(-1, 1, (args.prior_uniform_n, 3)) * scale + center
+        X = np.concatenate(Xs + [Xu])
         sd_x = _sd(X)
+        tgt = np.clip(sd_x, -trunc, trunc)
+        # carve 위반 볼륨 샘플: 제거 대신 target=+trunc 강제(관측된 빈 공간 = 확실한 '밖')
+        vx = _carve_viol(X)
+        tgt[vx] = trunc
         dxo, _ = obs_tree_w.query(X, workers=-1)
         kx = dxo > args.prior_unseen_dist            # 관측 근방 샘플 제외(관측 항이 담당)
         Xn_ = (X[kx] - center) / scale
         kin = np.all(np.abs(Xn_) < 1.0, axis=1)      # 정규화 큐브 내부만
         PV = Xn_[kin].astype(np.float64)
-        PS = (np.clip(sd_x[kx][kin], -trunc, trunc) / scale).astype(np.float64)
-        print(f"[prior] 볼륨 distill 샘플 {len(PV)} (band={band}m trunc={trunc}m)")
+        PS = (tgt[kx][kin] / scale).astype(np.float64)
+        print(f"[prior] 볼륨 distill 샘플 {len(PV)} (셸 {len(X)-len(Xu)} + uniform {len(Xu)}, "
+              f"carve override {int(vx.sum())}, band={band}m trunc={trunc}m)")
 
     # 정규화 좌표 — prior 주입 '후' 계산 ([FIX] stale Pn 버그 수정의 핵심)
     Pn = (P - center) / scale
