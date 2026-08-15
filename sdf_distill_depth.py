@@ -254,6 +254,27 @@ def load_view_mask(mask_dir, image_name, H, W):
     return None
 
 
+def load_gt_depth(depth_dir, image_name, H, W, scale):
+    """GT(데이터셋) depth 로드 — '씬 전체 기하' 기준 free-space carve 용.
+    렌더 depth(다리 없는 가우시안)와 달리 실제 occlusion 을 반영 → 다리 절단 방지.
+    stem 매칭: frame000918 → depth000918.png / frame000918.png / frame000918.npy"""
+    from PIL import Image
+    stem = os.path.splitext(image_name)[0]
+    for c in (stem.replace("frame", "depth"), stem, stem + "_depth"):
+        for ext in (".png", ".npy"):
+            p = os.path.join(os.path.expanduser(depth_dir), c + ext)
+            if not os.path.exists(p):
+                continue
+            if ext == ".npy":
+                a = np.load(p).astype(np.float32)
+            else:
+                a = np.array(Image.open(p)).astype(np.float32) / scale
+            if a.shape != (H, W):
+                a = np.array(Image.fromarray(a).resize((W, H), Image.NEAREST))
+            return a
+    return None
+
+
 @torch.no_grad()
 def collect_oriented_points(scene, gaussians, pipe, background, args, mask_dir=None,
                             require_mask=False, extra_cams=None, extra_masks=None):
@@ -305,19 +326,25 @@ def collect_oriented_points(scene, gaussians, pipe, background, args, mask_dir=N
                 n_skipped += 1
                 continue          # 마스크 없는 학습 뷰 제외 (씬 전체 점 유입 방지)
 
-        # [prior carve] 균등 간격 뷰의 depth+mask 버퍼 저장 (다운스케일 4x)
+        # [prior carve] 균등 간격 뷰의 depth+mask 버퍼 저장
         if use_mask and keep_every and m_obj is not None:
             ti += 1
             if ti % keep_every == 0:
-                ds = 4
+                ds = max(1, int(getattr(args, "prior_carve_ds", 2)))
                 dbuf = torch.where(alpha > args.alpha_thr, depth,
                                    torch.zeros_like(depth))[::ds, ::ds].cpu().numpy()
                 mbuf = m_obj[::ds, ::ds].cpu().numpy()
                 w2c = extrinsic.cpu().numpy()
-                VB.append({"R": w2c[:3, :3], "t": w2c[:3, 3],
-                           "fx": fx / ds, "fy": fy / ds, "cx": cx / ds, "cy": cy / ds,
-                           "W": dbuf.shape[1], "H": dbuf.shape[0],
-                           "depth": dbuf, "mask": mbuf})
+                b = {"R": w2c[:3, :3], "t": w2c[:3, 3],
+                     "fx": fx / ds, "fy": fy / ds, "cx": cx / ds, "cy": cy / ds,
+                     "W": dbuf.shape[1], "H": dbuf.shape[0],
+                     "depth": dbuf, "mask": mbuf}
+                if getattr(args, "gt_depth_dir", ""):
+                    dg = load_gt_depth(args.gt_depth_dir, cam.image_name, H, W,
+                                       args.gt_depth_scale)
+                    if dg is not None:
+                        b["dgt"] = dg[::ds, ::ds]
+                VB.append(b)
         if not use_mask and extra_masks is not None and cam.image_name in extra_masks:
             valid &= extra_masks[cam.image_name]   # extra 포즈: label-buffer 객체 마스크
         pts_w = pts_w[valid]
@@ -481,10 +508,15 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args):
     G = args.grid if args.grid > 0 else int(round(2 * scale / args.voxel_size))
     G = int(min(G, args.max_grid))
     print(f"[grid-fuse] G={G} voxel≈{2*scale/(G-1):.4f}m trunc={trunc}m views={len(VB)}")
+    n_gt = sum(1 for b in VB if "dgt" in b)
+    print(f"[grid-fuse] GT depth 버퍼 {n_gt}/{len(VB)}뷰"
+          + ("" if n_gt else "  ⚠ GT depth 없음 — (구)실루엣 carve 사용, 다리 절단 위험"))
     lin = np.linspace(-1, 1, G, dtype=np.float32)
     Fo = np.zeros((G, G, G), np.float32)      # 관측 TSDF 가중합
     Wo = np.zeros((G, G, G), np.float32)      # 관측 가중치(뷰 수)
-    FR = np.zeros((G, G, G), bool)            # 관측된 빈 공간(실루엣 밖 & 비가림)
+    FR = np.zeros((G, G, G), bool)            # 관측된 빈 공간
+    VOb = np.zeros((G, G, G), np.uint16)      # 씬 표면 근방 'obj6' 투표
+    VOt = np.zeros((G, G, G), np.uint16)      # 씬 표면 근방 '타 객체' 투표
     SG = np.empty((G, G, G), np.float32)      # 생성 SDF (truncated)
     for k0 in range(0, G, 8):
         k1 = min(k0 + 8, G)
@@ -493,6 +525,7 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args):
         SG[:, :, k0:k1] = np.clip(sd_fn(Xw), -trunc, trunc).reshape(G, G, k1 - k0)
         f = np.zeros(len(Xw), np.float32); w = np.zeros(len(Xw), np.float32)
         fr = np.zeros(len(Xw), bool)
+        vo = np.zeros(len(Xw), np.uint16); vt = np.zeros(len(Xw), np.uint16)
         for b in VB:
             Xc = Xw @ b["R"].T + b["t"]; z = Xc[:, 2]; zz = np.maximum(z, 1e-6)
             u = b["fx"] * Xc[:, 0] / zz + b["cx"]
@@ -504,21 +537,37 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args):
             sdf = di - z                                   # 양수 = 관측 표면 앞(밖)
             hit = infr & mi & (di > 0) & (sdf > -trunc)    # 표면 뒤 trunc 초과는 미적용(occlusion)
             f[hit] += np.clip(sdf[hit], -trunc, trunc); w[hit] += 1
-            fr |= infr & (~mi) & ((di <= 0) | (z < di - margin))   # 실루엣 밖 & 비가림
+            dg = b.get("dgt")
+            if dg is not None:
+                # [GT-depth carve] 마스크 무관, 실제 씬 기하 기준:
+                #   z < d_gt - margin → 실제 관측된 빈 공간(다리는 z≈d_gt 라 안전)
+                #   씬 표면 근방      → obj6/타 객체 소속 투표(마스크 노이즈에 강건)
+                dgt = dg[vi, ui]
+                vgt = infr & (dgt > 0.01)
+                fr |= vgt & (z < dgt - margin)
+                near = vgt & (np.abs(z - dgt) < 2 * margin)
+                vo += (near & mi).astype(np.uint16)
+                vt += (near & ~mi).astype(np.uint16)
+            else:
+                # (구) 실루엣 carve — GT depth 없을 때만. 렌더 depth 는 다리가 없어
+                # occlusion 판단이 불완전하므로 다리 절단 위험 있음.
+                fr |= infr & (~mi) & ((di <= 0) | (z < di - margin))
         sh = (G, G, k1 - k0)
         Fo[:, :, k0:k1] += f.reshape(sh); Wo[:, :, k0:k1] += w.reshape(sh)
         FR[:, :, k0:k1] |= fr.reshape(sh)
+        VOb[:, :, k0:k1] += vo.reshape(sh); VOt[:, :, k0:k1] += vt.reshape(sh)
         if (k0 // 8) % 8 == 0:
             print(f"  [grid-fuse] slab {k0}/{G}")
     Fobs = Fo / np.maximum(Wo, 1e-6)
     alpha = np.clip(Wo / args.grid_wcap, 0, 1)             # 관측 신뢰도(뷰 수 기반)
-    base = np.where(FR, trunc, SG)                         # 빈공간=+trunc, 미관측=생성
+    OTH = VOt > VOb                                        # 타 객체 표면(과반 투표) → obj6 밖
+    base = np.where(FR | OTH, trunc, SG)                   # 빈공간/타객체=+trunc, 미관측=생성
     F = alpha * Fobs + (1 - alpha) * base                  # 우선순위 블렌드
     if args.grid_smooth > 0:
         F = ndimage.gaussian_filter(F, sigma=args.grid_smooth)
     print(f"[grid-fuse] 관측복셀 {(Wo > 0).mean()*100:.1f}%  "
-          f"free {(FR & (Wo == 0)).mean()*100:.1f}%  "
-          f"생성 내부(미관측) {((SG < 0) & (Wo == 0) & ~FR).mean()*100:.2f}%")
+          f"free {(FR & (Wo == 0)).mean()*100:.1f}%  타객체 {OTH.mean()*100:.2f}%  "
+          f"생성 내부(미관측) {((SG < 0) & (Wo == 0) & ~FR & ~OTH).mean()*100:.2f}%")
     step = 2.0 / (G - 1)
     verts, faces, _, _ = marching_cubes(F, level=0.0, spacing=(step,) * 3)
     verts = (verts - 1.0) * scale + center
@@ -591,6 +640,13 @@ def main():
                         help="관측 신뢰도 포화 뷰 수 — 이 이상 관측된 복셀은 관측 TSDF 100%")
     parser.add_argument("--grid_smooth", default=0.7, type=float,
                         help="융합 grid 가우시안 스무딩 sigma(voxel). 0=off")
+    parser.add_argument("--gt_depth_dir", default="", type=str,
+                        help="GT depth 폴더(nice-slam results 등). 지정 시 carve 를 마스크가 아닌 "
+                             "'실제 씬 depth' 기준으로 수행 — 다리 절단·경계 거침 해결")
+    parser.add_argument("--gt_depth_scale", default=6553.5, type=float,
+                        help="GT depth PNG 스케일(픽셀값/스케일=미터). Replica nice-slam=6553.5")
+    parser.add_argument("--prior_carve_ds", default=2, type=int,
+                        help="뷰 버퍼 다운스케일(작을수록 경계 정밀, 메모리↑)")
     parser.add_argument("--carve_depth_dir", default="", type=str,
                         help="dump_scene_depth.py 출력 폴더. 전체 씬 200뷰 depth로 free-space carving (empty-ray보다 우선)")
     parser.add_argument("--offsurf_delta", default=0.01, type=float, help="정규화 좌표 기준 off-surface 오프셋")
