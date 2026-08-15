@@ -496,7 +496,7 @@ def train_sdf(P, N, O, EO, ED, args, CV=None, W=None, OBS=None, PV=None, PS=None
     return net
 
 
-def grid_fuse_tsdf(VB, sd_fn, center, scale, args):
+def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
     """[grid-fuse] MLP 없는 결정적 SDF 융합 — 모순을 '평균'이 아닌 '우선순위'로 해소:
         관측 TSDF > 관측된 빈 공간(occlusion-aware carve, +trunc) > 생성 SDF(미관측만).
     MLP 보간 병리(부풀림·스펀지)가 구조적으로 없음. 품질은 정합·생성 품질에만 의존.
@@ -511,10 +511,19 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args):
     n_gt = sum(1 for b in VB if "dgt" in b)
     print(f"[grid-fuse] GT depth 버퍼 {n_gt}/{len(VB)}뷰"
           + ("" if n_gt else "  ⚠ GT depth 없음 — (구)실루엣 carve 사용, 다리 절단 위험"))
+    # [경계 번짐 가드] GT depth 불연속(실루엣 경계) 픽셀은 free 투표 무효 —
+    # nearest 리사이즈로 먼 배경 depth 가 경계에 새어들어 얇은 구조를 갉는 것 방지.
+    for b in VB:
+        dg = b.get("dgt")
+        if dg is not None and "dgt_ok" not in b:
+            gy_, gx_ = np.gradient(dg.astype(np.float32))
+            edge = (np.abs(gx_) + np.abs(gy_)) > args.gt_edge_thr
+            edge = ndimage.binary_dilation(edge, iterations=1)
+            b["dgt_ok"] = (dg > 0.01) & ~edge
     lin = np.linspace(-1, 1, G, dtype=np.float32)
     Fo = np.zeros((G, G, G), np.float32)      # 관측 TSDF 가중합
     Wo = np.zeros((G, G, G), np.float32)      # 관측 가중치(뷰 수)
-    FR = np.zeros((G, G, G), bool)            # 관측된 빈 공간
+    FRc = np.zeros((G, G, G), np.uint16)      # 관측된 빈 공간 '투표 수'(합의제)
     VOb = np.zeros((G, G, G), np.uint16)      # 씬 표면 근방 'obj6' 투표
     VOt = np.zeros((G, G, G), np.uint16)      # 씬 표면 근방 '타 객체' 투표
     SG = np.empty((G, G, G), np.float32)      # 생성 SDF (truncated)
@@ -524,7 +533,7 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args):
         Xw = np.stack([gx, gy, gz], -1).reshape(-1, 3).astype(np.float64) * scale + center
         SG[:, :, k0:k1] = np.clip(sd_fn(Xw), -trunc, trunc).reshape(G, G, k1 - k0)
         f = np.zeros(len(Xw), np.float32); w = np.zeros(len(Xw), np.float32)
-        fr = np.zeros(len(Xw), bool)
+        fr = np.zeros(len(Xw), np.uint16)
         vo = np.zeros(len(Xw), np.uint16); vt = np.zeros(len(Xw), np.uint16)
         for b in VB:
             Xc = Xw @ b["R"].T + b["t"]; z = Xc[:, 2]; zz = np.maximum(z, 1e-6)
@@ -540,37 +549,60 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args):
             dg = b.get("dgt")
             if dg is not None:
                 # [GT-depth carve] 마스크 무관, 실제 씬 기하 기준:
-                #   z < d_gt - margin → 실제 관측된 빈 공간(다리는 z≈d_gt 라 안전)
+                #   z < d_gt - margin → 관측된 빈 공간 '투표'(합의제, 경계 픽셀 제외)
                 #   씬 표면 근방      → obj6/타 객체 소속 투표(마스크 노이즈에 강건)
                 dgt = dg[vi, ui]
-                vgt = infr & (dgt > 0.01)
-                fr |= vgt & (z < dgt - margin)
+                vgt = infr & b["dgt_ok"][vi, ui]
+                fr += (vgt & (z < dgt - margin)).astype(np.uint16)
                 near = vgt & (np.abs(z - dgt) < 2 * margin)
                 vo += (near & mi).astype(np.uint16)
                 vt += (near & ~mi).astype(np.uint16)
             else:
                 # (구) 실루엣 carve — GT depth 없을 때만. 렌더 depth 는 다리가 없어
                 # occlusion 판단이 불완전하므로 다리 절단 위험 있음.
-                fr |= infr & (~mi) & ((di <= 0) | (z < di - margin))
+                fr += (infr & (~mi) & ((di <= 0) | (z < di - margin))).astype(np.uint16)
         sh = (G, G, k1 - k0)
         Fo[:, :, k0:k1] += f.reshape(sh); Wo[:, :, k0:k1] += w.reshape(sh)
-        FR[:, :, k0:k1] |= fr.reshape(sh)
+        FRc[:, :, k0:k1] += fr.reshape(sh)
         VOb[:, :, k0:k1] += vo.reshape(sh); VOt[:, :, k0:k1] += vt.reshape(sh)
         if (k0 // 8) % 8 == 0:
             print(f"  [grid-fuse] slab {k0}/{G}")
     Fobs = Fo / np.maximum(Wo, 1e-6)
     alpha = np.clip(Wo / args.grid_wcap, 0, 1)             # 관측 신뢰도(뷰 수 기반)
+    FREE = FRc >= args.free_min_views                      # 합의제: N뷰 이상이 '빈 공간' 투표
     OTH = VOt > VOb                                        # 타 객체 표면(과반 투표) → obj6 밖
-    base = np.where(FR | OTH, trunc, SG)                   # 빈공간/타객체=+trunc, 미관측=생성
+    base = np.where(FREE | OTH, trunc, SG)                 # 빈공간/타객체=+trunc, 미관측=생성
     F = alpha * Fobs + (1 - alpha) * base                  # 우선순위 블렌드
     if args.grid_smooth > 0:
         F = ndimage.gaussian_filter(F, sigma=args.grid_smooth)
     print(f"[grid-fuse] 관측복셀 {(Wo > 0).mean()*100:.1f}%  "
-          f"free {(FR & (Wo == 0)).mean()*100:.1f}%  타객체 {OTH.mean()*100:.2f}%  "
-          f"생성 내부(미관측) {((SG < 0) & (Wo == 0) & ~FR & ~OTH).mean()*100:.2f}%")
+          f"free {(FREE & (Wo == 0)).mean()*100:.1f}% (합의 {args.free_min_views}뷰, "
+          f"1뷰라도 {((FRc > 0) & (Wo == 0)).mean()*100:.1f}%)  타객체 {OTH.mean()*100:.2f}%  "
+          f"생성 내부(미관측) {((SG < 0) & (Wo == 0) & ~FREE & ~OTH).mean()*100:.2f}%")
     step = 2.0 / (G - 1)
     verts, faces, _, _ = marching_cubes(F, level=0.0, spacing=(step,) * 3)
     verts = (verts - 1.0) * scale + center
+
+    # [debug] 생성 표면 샘플의 분류 시각화 — 다리가 왜 잘리는지 눈으로 판별:
+    # 초록=unknown(생성 유지), 파랑=관측 지배, 노랑=타객체, 빨강=free-carve
+    if debug_pts is not None and getattr(args, "debug_class_ply", ""):
+        idx = np.clip(np.round(((debug_pts - center) / scale + 1) / step), 0, G - 1).astype(int)
+        i, j, k = idx[:, 0], idx[:, 1], idx[:, 2]
+        cls = np.zeros(len(debug_pts), int)
+        cls[FREE[i, j, k]] = 3
+        cls[OTH[i, j, k] & ~FREE[i, j, k]] = 2
+        cls[alpha[i, j, k] > 0.5] = 1
+        pal = np.array([[0.1, 0.8, 0.1], [0.2, 0.4, 1.0], [1.0, 0.8, 0.1], [1.0, 0.15, 0.15]])
+        pc = o3d.geometry.PointCloud()
+        pc.points = o3d.utility.Vector3dVector(debug_pts)
+        pc.colors = o3d.utility.Vector3dVector(pal[cls])
+        dp = os.path.expanduser(args.debug_class_ply)
+        os.makedirs(os.path.dirname(dp) or ".", exist_ok=True)
+        o3d.io.write_point_cloud(dp, pc)
+        print(f"[debug] 분류 점군: {dp}  keep {(cls == 0).mean()*100:.0f}%  "
+              f"obs {(cls == 1).mean()*100:.0f}%  oth {(cls == 2).mean()*100:.0f}%  "
+              f"free {(cls == 3).mean()*100:.0f}%  "
+              f"(초록=유지, 파랑=관측, 노랑=타객체, 빨강=carve)")
     return verts, faces
 
 
@@ -647,6 +679,13 @@ def main():
                         help="GT depth PNG 스케일(픽셀값/스케일=미터). Replica nice-slam=6553.5")
     parser.add_argument("--prior_carve_ds", default=2, type=int,
                         help="뷰 버퍼 다운스케일(작을수록 경계 정밀, 메모리↑)")
+    parser.add_argument("--free_min_views", default=3, type=int,
+                        help="free 판정 최소 합의 뷰 수 — 1이면 OR(공격적), 3+ 권장. "
+                             "얇은 구조가 depth 경계 노이즈로 갉히는 것 방지")
+    parser.add_argument("--gt_edge_thr", default=0.1, type=float,
+                        help="GT depth 불연속 경계 임계(m) — 경계 픽셀 free 투표 무효화")
+    parser.add_argument("--debug_class_ply", default="", type=str,
+                        help="생성 표면 샘플 분류 점군 저장 경로 — 잘림 원인 시각 진단용")
     parser.add_argument("--carve_depth_dir", default="", type=str,
                         help="dump_scene_depth.py 출력 폴더. 전체 씬 200뷰 depth로 free-space carving (empty-ray보다 우선)")
     parser.add_argument("--offsurf_delta", default=0.01, type=float, help="정규화 좌표 기준 off-surface 오프셋")
@@ -786,6 +825,7 @@ def main():
     PV = PS = None
     rs_prior = None
     _sd = None
+    prior_dbg = None
     if args.prior_mesh:
         import open3d.core as o3c
         from scipy.spatial import cKDTree as _KDp
@@ -823,6 +863,7 @@ def main():
         # 표면 샘플 — face normal 사용(생성 mesh vertex normal 오염 회피) + 부호 검증
         sp = gm.sample_points_uniformly(args.prior_surf_n, use_triangle_normal=True)
         Ps_w = np.asarray(sp.points); Ns_w = np.asarray(sp.normals).copy()
+        prior_dbg = Ps_w.copy()                      # [debug] 분류 시각화용(게이트 전 원본)
         flip = _sd(Ps_w + 0.5 * band * Ns_w) < 0     # p+εn 이 내부면 법선 뒤집힘
         Ns_w[flip] = -Ns_w[flip]
         print(f"[prior] 표면 법선 부호 flip {int(flip.sum())}/{len(Ns_w)}")
@@ -925,7 +966,7 @@ def main():
     if args.grid_fuse:
         assert _sd is not None, "--grid_fuse 는 --prior_mesh 필요"
         assert VB, "--grid_fuse 는 뷰 버퍼 필요 (--prior_carve_views > 0, mask_dir 필수)"
-        verts, faces = grid_fuse_tsdf(VB, _sd, center, scale, args)
+        verts, faces = grid_fuse_tsdf(VB, _sd, center, scale, args, debug_pts=prior_dbg)
     else:
         print("IGR SDF 학습 ...")
         net = train_sdf(Pn, N, On, EOn, ED, args, CV=CV, W=Wp, OBS=OBS, PV=PV, PS=PS)
