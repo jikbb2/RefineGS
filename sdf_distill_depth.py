@@ -599,12 +599,18 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
         outside = np.isin(lab, bl[bl > 0]) & openv
         inside = openv & ~outside
         flood = np.where(inside, -UD, UD)
-        # (2) 오프셋 셸 UD-δ: 제로 두께 시트(얇은 다리 패널 등)도 두께 2δ 의
-        #     닫힌 볼륨이 됨 — 부피가 없는 생성 기하를 살리는 안전망.
-        delta = max(1.5 * vox, args.shell_delta)
-        out = np.minimum(flood, UD - delta).astype(np.float32)   # 볼륨 합집합
+        # (2) '적응형' 오프셋 셸 UD-δ(x): 제로 두께 시트도 두께 2δ 볼륨이 되되,
+        #     δ 는 관측 표면 거리로 조절 — 관측 근처(테이블 테두리)는 δ_min 으로
+        #     부풀음·이중표면 방지, 깊은 미관측(다리)은 δ_max 로 도톰하게.
+        dmin = max(1.5 * vox, args.shell_delta_min)
+        dmax = max(dmin, args.shell_delta)
+        Dobs = ndimage.distance_transform_edt(~(alpha > 0.25)).astype(np.float32) * vox
+        dmap = np.clip(dmin + (dmax - dmin) * (Dobs / max(args.shell_ramp, 1e-6)),
+                       dmin, dmax)
+        out = np.minimum(flood, UD - dmap).astype(np.float32)    # 볼륨 합집합
         print(f"[sign-fix] flood 내부 {inside.mean()*100:.2f}%  최종 SG<0 {(out < 0).mean()*100:.2f}%  "
-              f"(수정 전 {(SGv < 0).mean()*100:.2f}%, δ={delta*1000:.0f}mm)")
+              f"(수정 전 {(SGv < 0).mean()*100:.2f}%, δ {dmin*1000:.0f}→{dmax*1000:.0f}mm "
+              f"ramp {args.shell_ramp}m)")
         return out
 
     need_sign_fix = getattr(args, "grid_sign_fix", False) or not getattr(args, "prior_watertight", True)
@@ -810,8 +816,12 @@ def main():
                         help='진단용 world 박스 "x0,y0,z0,x1,y1,z1" — 내부 복셀 분류 통계 출력')
     parser.add_argument("--grid_sign_fix", action="store_true",
                         help="생성 SDF 부호를 flood-fill 로 강제 복원(watertight=False 면 자동)")
-    parser.add_argument("--shell_delta", default=0.012, type=float,
-                        help="sign-fix 오프셋 셸 반두께(m) — 제로 두께 시트가 2δ 두께 볼륨이 됨")
+    parser.add_argument("--shell_delta", default=0.02, type=float,
+                        help="오프셋 셸 최대 반두께 δ_max(m) — 깊은 미관측 영역(다리)에 적용")
+    parser.add_argument("--shell_delta_min", default=0.006, type=float,
+                        help="오프셋 셸 최소 반두께 δ_min(m) — 관측 표면 인접부(테두리)에 적용")
+    parser.add_argument("--shell_ramp", default=0.10, type=float,
+                        help="δ_min→δ_max 전이 거리(m, 관측 표면으로부터)")
     parser.add_argument("--carve_depth_dir", default="", type=str,
                         help="dump_scene_depth.py 출력 폴더. 전체 씬 200뷰 depth로 free-space carving (empty-ray보다 우선)")
     parser.add_argument("--offsurf_delta", default=0.01, type=float, help="정규화 좌표 기준 off-surface 오프셋")
