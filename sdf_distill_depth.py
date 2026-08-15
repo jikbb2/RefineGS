@@ -511,6 +511,16 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
     n_gt = sum(1 for b in VB if "dgt" in b)
     print(f"[grid-fuse] GT depth 버퍼 {n_gt}/{len(VB)}뷰"
           + ("" if n_gt else "  ⚠ GT depth 없음 — (구)실루엣 carve 사용, 다리 절단 위험"))
+    # [gt-check] GT depth ↔ 렌더 depth 정합 검증 — 값이 크면(수 cm↑) 스케일/프레임
+    # 매칭 오류이며 free 판정 전체가 무효. 0 에 가까워야 정상.
+    for b in VB[:5]:
+        dg = b.get("dgt")
+        if dg is not None:
+            mm = b["mask"] & (b["depth"] > 0) & (dg > 0.01)
+            if mm.sum() > 100:
+                d = (dg - b["depth"])[mm]
+                print(f"[gt-check] median(dgt-render)={np.median(d):+.4f}m  "
+                      f"|d|중앙값={np.median(np.abs(d)):.4f}m  (마스크 {int(mm.sum())}px)")
     # [경계 번짐 가드] GT depth 불연속(실루엣 경계) 픽셀은 free 투표 무효 —
     # nearest 리사이즈로 먼 배경 depth 가 경계에 새어들어 얇은 구조를 갉는 것 방지.
     for b in VB:
@@ -626,6 +636,21 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
     F = alpha * Fobs + (1 - alpha) * base                  # 우선순위 블렌드
     if args.grid_smooth > 0:
         F = ndimage.gaussian_filter(F, sigma=args.grid_smooth)
+
+    # [probe] 지정 박스(world 좌표) 안의 복셀 분류 통계 — "다리가 왜 없는가"를 국소 계측.
+    # 사용: --probe_box "x0,y0,z0,x1,y1,z1" (사라진 다리 주변, 뷰어에서 좌표 읽기)
+    if getattr(args, "probe_box", ""):
+        v = [float(x) for x in args.probe_box.split(",")]
+        lo_n = (((np.array(v[:3]) - center) / scale) + 1) / step
+        hi_n = (((np.array(v[3:]) - center) / scale) + 1) / step
+        i0, j0, k0p = np.clip(np.floor(np.minimum(lo_n, hi_n)), 0, G - 1).astype(int)
+        i1, j1, k1p = np.clip(np.ceil(np.maximum(lo_n, hi_n)), 0, G - 1).astype(int)
+        sub = np.s_[i0:i1 + 1, j0:j1 + 1, k0p:k1p + 1]
+        nvox = FREE[sub].size
+        print(f"[probe] {v} ({nvox}복셀): FREE {FREE[sub].mean()*100:.0f}%  "
+              f"FRc>0 {(FRc[sub] > 0).mean()*100:.0f}%  obs {(alpha[sub] > 0.5).mean()*100:.0f}%  "
+              f"OTH {OTH[sub].mean()*100:.0f}%  SG<0 {(SG[sub] < 0).mean()*100:.0f}%  "
+              f"최종 F<0 {(F[sub] < 0).mean()*100:.0f}%")
     print(f"[grid-fuse] 관측복셀 {(Wo > 0).mean()*100:.1f}%  "
           f"free {(FREE & (Wo == 0)).mean()*100:.1f}% (합의 {args.free_min_views}뷰, "
           f"1뷰라도 {((FRc > 0) & (Wo == 0)).mean()*100:.1f}%)  타객체 {OTH.mean()*100:.2f}%  "
@@ -742,6 +767,8 @@ def main():
                              "9-DoF 재최적화(관측 앵커 유지) — 생성-실측 형상 차이 흡수")
     parser.add_argument("--carve_align_w", default=1.0, type=float,
                         help="carve-align 관측 앵커 가중치(클수록 상판 정렬 엄격)")
+    parser.add_argument("--probe_box", default="", type=str,
+                        help='진단용 world 박스 "x0,y0,z0,x1,y1,z1" — 내부 복셀 분류 통계 출력')
     parser.add_argument("--carve_depth_dir", default="", type=str,
                         help="dump_scene_depth.py 출력 폴더. 전체 씬 200뷰 depth로 free-space carving (empty-ray보다 우선)")
     parser.add_argument("--offsurf_delta", default=0.01, type=float, help="정규화 좌표 기준 off-surface 오프셋")
