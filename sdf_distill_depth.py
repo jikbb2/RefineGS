@@ -571,6 +571,57 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
     alpha = np.clip(Wo / args.grid_wcap, 0, 1)             # 관측 신뢰도(뷰 수 기반)
     FREE = FRc >= args.free_min_views                      # 합의제: N뷰 이상이 '빈 공간' 투표
     OTH = VOt > VOb                                        # 타 객체 표면(과반 투표) → obj6 밖
+    step = 2.0 / (G - 1)
+
+    # [carve-align] 정합 보정: 생성이 관측된 free 공간을 피해 unknown(미관측 그림자,
+    # 실제 unseen 기하가 존재할 수 있는 유일한 영역) 속으로 들어가도록 9-DoF 재최적화.
+    # 앵커: 관측 지배 영역에 붙은 생성 표면(상판)은 관측 TSDF zero-set 에 유지.
+    if getattr(args, "carve_align", False) and debug_pts is not None:
+        from scipy.optimize import minimize as _pmin
+        from scipy.spatial.transform import Rotation as _Rot
+        freef = np.minimum(FRc.astype(np.float32) / max(args.free_min_views, 1), 1.0)
+        pn_all = ((debug_pts - center) / scale).astype(np.float64)
+        sel = np.random.default_rng(1).choice(len(pn_all), min(20000, len(pn_all)), replace=False)
+        pn = pn_all[sel]
+
+        def _interp(vol, q):
+            idx = np.clip(np.round((q + 1) / step), 0, G - 1).astype(int)
+            return vol[idx[:, 0], idx[:, 1], idx[:, 2]]
+
+        anch = _interp(alpha, pn) > 0.5
+        c0 = pn.mean(0)
+
+        def _unpack(x):
+            return _Rot.from_rotvec(x[:3]).as_matrix(), x[3:6], np.exp(x[6:9])
+
+        def _loss(x):
+            R_, t_, s_ = _unpack(x)
+            q = ((pn - c0) * s_) @ R_.T + c0 + t_
+            L_free = _interp(freef, q).mean()                       # free 점유 벌점
+            if anch.any():
+                qa = q[anch]
+                ai = _interp(alpha, qa) > 0.25
+                fo = np.abs(_interp(Fobs, qa))
+                L_anch = float(np.where(ai, fo, trunc).mean()) / trunc   # 관측 이탈 벌점
+            else:
+                L_anch = 0.0
+            return L_free + args.carve_align_w * L_anch + 0.05 * float(np.abs(x).sum())
+
+        x0 = np.zeros(9); l0 = _loss(x0)
+        res = _pmin(_loss, x0, method="Powell", options={"maxiter": 250, "xtol": 1e-4})
+        R_, t_, s_ = _unpack(res.x)
+        print(f"[carve-align] loss {l0:.4f}→{res.fun:.4f}  dt={np.round(res.x[3:6]*scale, 3)}m  "
+              f"scale={np.round(s_, 3)}  rot={np.rad2deg(np.linalg.norm(res.x[:3])):.1f}°")
+        sm = float(s_.mean())
+        for k0 in range(0, G, 8):                          # 보정 반영해 생성 SDF 재계산
+            k1 = min(k0 + 8, G)
+            gx, gy, gz = np.meshgrid(lin, lin, lin[k0:k1], indexing="ij")
+            Xn = np.stack([gx, gy, gz], -1).reshape(-1, 3).astype(np.float64)
+            q = ((Xn - c0 - res.x[3:6]) @ R_) / s_ + c0
+            SG[:, :, k0:k1] = np.clip(sd_fn(q * scale + center) * sm,
+                                      -trunc, trunc).reshape(G, G, k1 - k0)
+        debug_pts = (((pn_all - c0) * s_) @ R_.T + c0 + res.x[3:6]) * scale + center
+
     base = np.where(FREE | OTH, trunc, SG)                 # 빈공간/타객체=+trunc, 미관측=생성
     F = alpha * Fobs + (1 - alpha) * base                  # 우선순위 블렌드
     if args.grid_smooth > 0:
@@ -686,6 +737,11 @@ def main():
                         help="GT depth 불연속 경계 임계(m) — 경계 픽셀 free 투표 무효화")
     parser.add_argument("--debug_class_ply", default="", type=str,
                         help="생성 표면 샘플 분류 점군 저장 경로 — 잘림 원인 시각 진단용")
+    parser.add_argument("--carve_align", action="store_true",
+                        help="[정합 보정] 생성이 free 공간을 피해 unknown 영역으로 들어가도록 "
+                             "9-DoF 재최적화(관측 앵커 유지) — 생성-실측 형상 차이 흡수")
+    parser.add_argument("--carve_align_w", default=1.0, type=float,
+                        help="carve-align 관측 앵커 가중치(클수록 상판 정렬 엄격)")
     parser.add_argument("--carve_depth_dir", default="", type=str,
                         help="dump_scene_depth.py 출력 폴더. 전체 씬 200뷰 depth로 free-space carving (empty-ray보다 우선)")
     parser.add_argument("--offsurf_delta", default=0.01, type=float, help="정규화 좌표 기준 off-surface 오프셋")
