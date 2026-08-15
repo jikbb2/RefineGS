@@ -583,6 +583,28 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
     OTH = VOt > VOb                                        # 타 객체 표면(과반 투표) → obj6 밖
     step = 2.0 / (G - 1)
 
+    # [sign-fix] non-watertight 생성 mesh(multi-material glb 등)는 winding-number 부호가
+    # 깨져 내부가 음수가 아님 → 표면은 분류상 keep 인데 marching cubes 에 안 나오는 원인.
+    # |SG| 를 unsigned 로 보고, 표면 셸을 경계로 그리드 외곽 flood-fill = 밖, 나머지 = 안.
+    def _fix_sign(SGv):
+        vox = 2 * scale / (G - 1)
+        UD = np.abs(SGv)
+        shell = UD <= 1.5 * vox
+        openv = ~shell
+        lab, _ = ndimage.label(openv)
+        bl = np.unique(np.concatenate([lab[0].ravel(), lab[-1].ravel(),
+                                       lab[:, 0].ravel(), lab[:, -1].ravel(),
+                                       lab[:, :, 0].ravel(), lab[:, :, -1].ravel()]))
+        outside = np.isin(lab, bl[bl > 0]) & openv
+        inside = openv & ~outside
+        out = np.where(inside, -UD, UD).astype(np.float32)
+        print(f"[sign-fix] 내부 복셀 {inside.mean()*100:.2f}%  (수정 전 SG<0 {(SGv < 0).mean()*100:.2f}%)")
+        return out
+
+    need_sign_fix = getattr(args, "grid_sign_fix", False) or not getattr(args, "prior_watertight", True)
+    if need_sign_fix:
+        SG = _fix_sign(SG)
+
     # [carve-align] 정합 보정: 생성이 관측된 free 공간을 피해 unknown(미관측 그림자,
     # 실제 unseen 기하가 존재할 수 있는 유일한 영역) 속으로 들어가도록 9-DoF 재최적화.
     # 앵커: 관측 지배 영역에 붙은 생성 표면(상판)은 관측 TSDF zero-set 에 유지.
@@ -630,6 +652,8 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
             q = ((Xn - c0 - res.x[3:6]) @ R_) / s_ + c0
             SG[:, :, k0:k1] = np.clip(sd_fn(q * scale + center) * sm,
                                       -trunc, trunc).reshape(G, G, k1 - k0)
+        if need_sign_fix:
+            SG = _fix_sign(SG)                             # 재계산된 SG 도 부호 복원
         debug_pts = (((pn_all - c0) * s_) @ R_.T + c0 + res.x[3:6]) * scale + center
 
     base = np.where(FREE | OTH, trunc, SG)                 # 빈공간/타객체=+trunc, 미관측=생성
@@ -640,7 +664,16 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
     # [probe] 지정 박스(world 좌표) 안의 복셀 분류 통계 — "다리가 왜 없는가"를 국소 계측.
     # 사용: --probe_box "x0,y0,z0,x1,y1,z1" (사라진 다리 주변, 뷰어에서 좌표 읽기)
     if getattr(args, "probe_box", ""):
-        v = [float(x) for x in args.probe_box.split(",")]
+        try:
+            v = [float(x) for x in args.probe_box.split(",")]
+            assert len(v) == 6
+        except (ValueError, AssertionError):
+            print(f"[probe] ⚠ 잘못된 형식: '{args.probe_box}' — 숫자 6개 필요 "
+                  f'(예: --probe_box "1.2,-0.5,0.0,1.5,-0.2,0.6"). probe 생략.')
+            v = None
+    else:
+        v = None
+    if v is not None:
         lo_n = (((np.array(v[:3]) - center) / scale) + 1) / step
         hi_n = (((np.array(v[3:]) - center) / scale) + 1) / step
         i0, j0, k0p = np.clip(np.floor(np.minimum(lo_n, hi_n)), 0, G - 1).astype(int)
@@ -769,6 +802,8 @@ def main():
                         help="carve-align 관측 앵커 가중치(클수록 상판 정렬 엄격)")
     parser.add_argument("--probe_box", default="", type=str,
                         help='진단용 world 박스 "x0,y0,z0,x1,y1,z1" — 내부 복셀 분류 통계 출력')
+    parser.add_argument("--grid_sign_fix", action="store_true",
+                        help="생성 SDF 부호를 flood-fill 로 강제 복원(watertight=False 면 자동)")
     parser.add_argument("--carve_depth_dir", default="", type=str,
                         help="dump_scene_depth.py 출력 폴더. 전체 씬 200뷰 depth로 free-space carving (empty-ray보다 우선)")
     parser.add_argument("--offsurf_delta", default=0.01, type=float, help="정규화 좌표 기준 off-surface 오프셋")
@@ -932,8 +967,9 @@ def main():
             except Exception as e:
                 print(f"[prior] 색 bake 실패({e}) — 회색 유지")
         wt = gm.is_watertight()
+        args.prior_watertight = bool(wt)
         print(f"[prior] mesh verts {len(gm.vertices)} watertight={wt}"
-              + ("" if wt else "  ⚠ signed distance 부호 불안정 가능 — 생성 원본(glb) 정합본 권장"))
+              + ("" if wt else "  ⚠ signed distance 부호 불안정 — grid_fuse 에서 sign-fix 자동 적용"))
         rs_prior = o3d.t.geometry.RaycastingScene()
         rs_prior.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(gm))
 
