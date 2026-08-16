@@ -9,6 +9,9 @@
 set -uo pipefail
 shopt -s nullglob
 
+# MIG NVML assert(메모리 압박) 완화
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+
 ROOT=${ROOT:-/home/elicer/RefineGS}
 SCENE=${SCENE:-replica_room0_v2}
 OUT=${OUT:-${ROOT}/output/${SCENE}/refinegs_full}
@@ -85,7 +88,7 @@ PY
 
   echo "=== [${gid}] sdf_distill (--prior_mesh) ==="
   python sdf_distill_depth.py -m "${MDIR%/}" --iteration ${ITER} \
-    --mask_dir auto --require_mask --mask_dist 0 \
+    --data_device cpu --mask_dir auto --require_mask --mask_dist 0 \
     --prior_mesh "${ALIGNED}" ${SDF_FLAGS} \
     --gt_depth_dir "${GTD}" --probe_box "${BOX}" \
     --out "${MDIR}train/ours_${ITER}/fused_prior.ply" \
