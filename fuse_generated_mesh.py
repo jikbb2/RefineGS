@@ -110,12 +110,51 @@ def rot_axis(axis, deg):
 
 def up_align_R(gen_up, world_up):
     e = {"x": [1, 0, 0], "y": [0, 1, 0], "z": [0, 0, 1]}
-    a = np.array(e[gen_up], float); b = np.array(e[world_up], float)
+    return rot_from_to(np.array(e[gen_up], float), np.array(e[world_up], float))
+
+
+def rot_from_to(a, b):
+    """단위벡터 a→b 회전행렬 (Rodrigues)."""
+    a = a / np.linalg.norm(a); b = b / np.linalg.norm(b)
     v = np.cross(a, b); c = a @ b
     if np.linalg.norm(v) < 1e-8:
-        return np.eye(3) if c > 0 else np.diag([1, -1, -1.0])
+        if c > 0:
+            return np.eye(3)
+        ax = np.array([1., 0, 0]) if abs(a[0]) < 0.9 else np.array([0, 1., 0])
+        v = np.cross(a, ax); v /= np.linalg.norm(v)
+        return Rotation.from_rotvec(np.pi * v).as_matrix()
     vx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
     return np.eye(3) + vx + vx @ vx * (1 / (1 + c))
+
+
+def build_lr_views(cams, lr_w=160, max_views=8):
+    """저해상도 실루엣 뷰 사전계산 (다중 초기화 후보 IoU 평가용)."""
+    views = []
+    for c, m in [x for x in cams if x[1] is not None][:max_views]:
+        sc = lr_w / c["W"]; W = lr_w; H = int(round(c["H"] * sc))
+        fx, fy = c["fx"] * sc, c["fy"] * sc; cx, cy = c["cx"] * sc, c["cy"] * sc
+        Rc, tc = c["R"], c["t"]; C = cam_center(Rc, tc)
+        uu, vv = np.meshgrid(np.arange(W), np.arange(H))
+        dcam = np.stack([(uu - cx) / fx, (vv - cy) / fy,
+                         np.ones_like(uu, float)], -1).reshape(-1, 3)
+        dwn = (Rc.T @ dcam.T).T
+        md = cv2.resize(m.astype(np.uint8), (W, H), interpolation=cv2.INTER_NEAREST) > 0
+        views.append((C.astype(np.float64), dwn, md))
+    return views
+
+
+def sil_iou(scene, views, R, t, S):
+    """canonical 메쉬 raycast 로 pose (R,t,S) 의 다중 뷰 실루엣 IoU."""
+    Sinv = 1.0 / S; Rt = R.T; tot = 0.0
+    for C, dwn, md in views:
+        o_c = Sinv * (Rt @ (C - t))
+        d_c = Sinv * (Rt @ dwn.T).T
+        rays = np.concatenate([np.broadcast_to(o_c.astype(np.float32), d_c.shape),
+                               d_c.astype(np.float32)], 1)
+        th = scene.cast_rays(o3d.core.Tensor(rays))["t_hit"].numpy()
+        sil = np.isfinite(th).reshape(md.shape)
+        tot += (sil & md).sum() / max((sil | md).sum(), 1)
+    return tot / len(views)
 
 
 def aniso_icp(G, dst_tree, R_pts, R, t, S, iters=40, trim=0.6, isotropic=False):
@@ -377,6 +416,12 @@ def main():
     ap.add_argument("--no_mesh", action="store_true", help="Poisson 미리보기 메쉬 생략")
     ap.add_argument("--band_warp", action="store_true",
                     help="[의미적 정합] 상판·하판 밴드별 관측 대응 warp — 부위별 비율 차이 보정")
+    ap.add_argument("--init_all_up", action="store_true",
+                    help="정합 초기화를 up 축 6방향(±x,±y,±z)×yaw 로 확장 — 생성 canonical "
+                         "방향이 제각각인 배치에서 권장")
+    ap.add_argument("--min_iou", type=float, default=0.45,
+                    help="최종 실루엣 IoU 게이트 — 미달 시 산출물 없이 종료(코드 3), "
+                         "배치가 해당 객체를 prior 없이 skip")
     ap.add_argument("--band_h", type=float, default=0.05,
                     help="밴드 두께 절반(m). 상판/하판 두께 수준으로")
     args = ap.parse_args()
@@ -408,19 +453,38 @@ def main():
     if args.colmap and read_colmap is not None:
         cams = load_cams(args.colmap, args.masks_root, args.gid, args.stems, args.images)
 
-    # --- 정합: up 정렬 + yaw 8-init + (an)isotropic ICP ---
-    R0 = up_align_R(args.gen_up, args.world_up)
+    # --- 정합: 다중 초기화(up 후보 × yaw) + '실루엣 IoU' 선택 + (an)isotropic ICP ---
+    # RMSE 선택은 partial recon 에서 '생성을 관측 조각에 쑤셔넣는' 퇴화 해를 선호 →
+    # 일반화 실패의 원인. 후보 평가를 다중 뷰 실루엣 IoU 로 교체(카메라 없으면 RMSE 폴백).
+    scene_rc, lr_views = None, None
+    if cams is not None:
+        scene_rc = o3d.t.geometry.RaycastingScene()
+        scene_rc.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(gen))
+        lr_views = build_lr_views(cams, lr_w=160, max_views=8)
+    e_ax = {"x": [1, 0, 0], "y": [0, 1, 0], "z": [0, 0, 1]}
+    wu = np.array(e_ax[args.world_up], float)
+    if args.init_all_up:
+        up_cands = [s * np.array(v, float) for v in e_ax.values() for s in (1, -1)]
+    else:
+        gu_v = np.array(e_ax[args.gen_up], float)
+        up_cands = [gu_v, -gu_v]
+    Gs = G_pts[np.random.choice(len(G_pts), min(15000, len(G_pts)), replace=False)]
     best = None
-    for yaw in range(0, 360, 45):
-        Ry = rot_axis(args.world_up, yaw) @ R0
-        gu = (Ry @ G_pts.T).T
-        s0 = np.linalg.norm(R_pts.std(0)) / (np.linalg.norm(gu.std(0)) + 1e-9)
-        S = np.array([s0, s0, s0]); t = R_pts.mean(0) - (Ry @ (G_pts * S).T).T.mean(0)
-        R, t, S, rmse = aniso_icp(G_pts, dst_tree, R_pts, Ry, t, S,
-                                  iters=20, trim=0.5, isotropic=args.isotropic)
-        if best is None or rmse < best[-1]:
-            best = (R, t, S, rmse)
-    R, t, S, _ = best
+    for uv in up_cands:
+        R0 = rot_from_to(uv, wu)
+        for yaw in range(0, 360, 45):
+            Ry = rot_axis(args.world_up, yaw) @ R0
+            gu = (Ry @ Gs.T).T
+            s0 = np.linalg.norm(R_pts.std(0)) / (np.linalg.norm(gu.std(0)) + 1e-9)
+            S = np.array([s0, s0, s0]); t = R_pts.mean(0) - (Ry @ (Gs * S).T).T.mean(0)
+            R, t, S, rmse = aniso_icp(Gs, dst_tree, R_pts, Ry, t, S,
+                                      iters=15, trim=0.5, isotropic=args.isotropic)
+            score = sil_iou(scene_rc, lr_views, R, t, S) if lr_views else -rmse
+            if best is None or score > best[0]:
+                best = (score, R, t, S)
+    score0, R, t, S = best
+    print(f"[정합] 다중초기화 {len(up_cands)}×8 후보 → best "
+          f"{'IoU' if lr_views else '-RMSE'}={score0:.3f}")
     R, t, S, rmse = aniso_icp(G_pts, dst_tree, R_pts, R, t, S,
                               iters=50, trim=0.6, isotropic=args.isotropic)
     print(f"[정합] {'iso' if args.isotropic else '9-DoF'}  "
@@ -446,7 +510,13 @@ def main():
         G_world = apply9(G_pts, R, t, S)
 
     if cams is not None:
-        print(f"[진단] 최종 silhouette IoU={render_compare(gen, cams):.3f}")
+        iou_f = render_compare(gen, cams)
+        print(f"[진단] 최종 silhouette IoU={iou_f:.3f}")
+        # [게이트] 정합 실패 객체는 prior 를 쓰지 않는 게 낫다 — 잘못된 융합 방지.
+        if iou_f < args.min_iou:
+            print(f"[정합실패] IoU {iou_f:.3f} < min_iou {args.min_iou} — "
+                  f"이 객체는 prior 없이 진행 권장. 산출물 저장 안 함(종료 코드 3).")
+            raise SystemExit(3)
 
     # dense 점군: 정합된 생성 메쉬 전체를 carve 없이 조밀 샘플(train→SDF prior)
     if args.dense_points:
