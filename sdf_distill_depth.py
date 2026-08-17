@@ -673,6 +673,20 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
     if args.grid_smooth > 0:
         F = ndimage.gaussian_filter(F, sigma=args.grid_smooth)
 
+    # [keep-connected] 최종 음수 볼륨 중 '이 객체의 관측 복셀과 연결된' 성분만 유지.
+    # 통짜 생성(여러 객체 포함) prior 가 타 객체의 가려진 공간(unknown)에 남기는
+    # 잔해를 구조적으로 차단 — 다리는 상판/하판을 통해 관측부와 연결되므로 보존.
+    if getattr(args, "keep_connected", False):
+        neg = F < 0
+        lab, ncomp = ndimage.label(neg)
+        seeds = np.unique(lab[neg & (alpha > 0.5)])
+        seeds = seeds[seeds > 0]
+        keepm = np.isin(lab, seeds)
+        removed = int(neg.sum() - keepm.sum())
+        F = np.where(neg & ~keepm, trunc, F)
+        print(f"[keep-connected] 음수성분 {ncomp}개 → 관측 연결 {len(seeds)}개 유지, "
+              f"{removed}복셀({removed/max(neg.sum(),1)*100:.1f}%) 제거")
+
     # [probe] 지정 박스(world 좌표) 안의 복셀 분류 통계 — "다리가 왜 없는가"를 국소 계측.
     # 사용: --probe_box "x0,y0,z0,x1,y1,z1" (사라진 다리 주변, 뷰어에서 좌표 읽기)
     if getattr(args, "probe_box", ""):
@@ -822,6 +836,9 @@ def main():
                         help="오프셋 셸 최소 반두께 δ_min(m) — 관측 표면 인접부(테두리)에 적용")
     parser.add_argument("--shell_ramp", default=0.10, type=float,
                         help="δ_min→δ_max 전이 거리(m, 관측 표면으로부터)")
+    parser.add_argument("--keep_connected", action="store_true",
+                        help="최종 음수 볼륨 중 관측 복셀과 연결된 성분만 유지 — "
+                             "통짜 생성 prior 의 타 객체 잔해 제거(배치에서 권장)")
     parser.add_argument("--carve_depth_dir", default="", type=str,
                         help="dump_scene_depth.py 출력 폴더. 전체 씬 200뷰 depth로 free-space carving (empty-ray보다 우선)")
     parser.add_argument("--offsurf_delta", default=0.01, type=float, help="정규화 좌표 기준 off-surface 오프셋")
