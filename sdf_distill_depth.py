@@ -579,6 +579,10 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
             print(f"  [grid-fuse] slab {k0}/{G}")
     Fobs = Fo / np.maximum(Wo, 1e-6)
     alpha = np.clip(Wo / args.grid_wcap, 0, 1)             # 관측 신뢰도(뷰 수 기반)
+    # [seam] 관측/생성 전이를 부드럽게 — alpha 를 흐리면 경계에 blend band 가 생겨
+    # '끊긴 듯한' 계단이 사라진다(F 를 나중에 흐리는 것과 달리 단차를 만들지 않음).
+    if getattr(args, "alpha_smooth", 0) > 0:
+        alpha = ndimage.gaussian_filter(alpha, sigma=args.alpha_smooth)
     FREE = FRc >= args.free_min_views                      # 합의제: N뷰 이상이 '빈 공간' 투표
     OTH = VOt > VOb                                        # 타 객체 표면(과반 투표) → obj6 밖
     step = 2.0 / (G - 1)
@@ -670,6 +674,25 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
 
     base = np.where(FREE | OTH, trunc, SG)                 # 빈공간/타객체=+trunc, 미관측=생성
     F = alpha * Fobs + (1 - alpha) * base                  # 우선순위 블렌드
+
+    # [opening] 미관측 영역의 '뾰족한 돌출' 제거. 소파 뒷면처럼 어떤 카메라도 관통해
+    # 보지 못한 곳은 carve 제약이 없어 생성 스파이크가 그대로 남는다. erosion→dilation
+    # 은 구조요소보다 얇은 돌기만 지우고 굵은 몸통·다리는 보존한다(관측 영역은 미적용).
+    # 반경은 '미터'로 지정 — 셸 팽창(2δ) 때문에 실제 돌기 두께 T 는 T+2δ 로 부푼다.
+    # opening 반경 r 은 (T/2 + δ) 보다 커야 지워지므로 δ 를 자동 반영한다.
+    if getattr(args, "unseen_open", 0) > 0:
+        vox = 2 * scale / (G - 1)
+        k = max(1, int(round(args.unseen_open / vox)))
+        neg = F < 0
+        st = ndimage.generate_binary_structure(3, 1)
+        op = ndimage.binary_dilation(
+            ndimage.binary_erosion(neg, st, iterations=k), st, iterations=k)
+        rm = neg & ~op & (alpha < 0.5)
+        F = np.where(rm, trunc, F)
+        print(f"[opening] 미관측 뾰족 구조 제거 {int(rm.sum())}복셀 "
+              f"(r={args.unseen_open*1000:.0f}mm → k={k}복셀, "
+              f"두께 {2*args.unseen_open*1000:.0f}mm 이하 돌기)")
+
     if args.grid_smooth > 0:
         F = ndimage.gaussian_filter(F, sigma=args.grid_smooth)
 
@@ -836,6 +859,17 @@ def main():
                         help="오프셋 셸 최소 반두께 δ_min(m) — 관측 표면 인접부(테두리)에 적용")
     parser.add_argument("--shell_ramp", default=0.10, type=float,
                         help="δ_min→δ_max 전이 거리(m, 관측 표면으로부터)")
+    parser.add_argument("--alpha_smooth", default=1.0, type=float,
+                        help="[seam] 관측 신뢰도 alpha 가우시안 sigma(voxel) — 관측/생성 "
+                             "전이대를 만들어 접합부 계단 제거. 0=off")
+    parser.add_argument("--unseen_open", default=0.015, type=float,
+                        help="[스파이크] 미관측 영역 모폴로지 opening 반경(m). 두께 2r 이하 "
+                             "돌기만 제거(굵은 구조 보존). 셸 팽창 2δ 를 감안해 δ 보다 크게. 0=off")
+    parser.add_argument("--no_color_match", action="store_true",
+                        help="생성 색을 관측 색 통계에 맞추는 보정 비활성")
+    parser.add_argument("--color_blend_ramp", default=0.05, type=float,
+                        help="접합부 색 블렌드 거리(m) — 관측면에서 이 거리까지 관측색으로 "
+                             "가중 혼합. 0=off")
     parser.add_argument("--keep_connected", action="store_true",
                         help="최종 음수 볼륨 중 관측 복셀과 연결된 성분만 유지 — "
                              "통짜 생성 prior 의 타 객체 잔해 제거(배치에서 권장)")
@@ -1196,10 +1230,28 @@ def main():
         mesh.remove_degenerate_triangles()
         print(f"거리 트리밍(d>{args.mask_dist}): {int(far.sum())}/{len(verts)} 정점 제거")
 
-    # 색: 최근접 관측점 (트리밍 후 정점 기준)
+    # 색: [1] 생성 색을 관측 색 통계에 정합(톤 차이 제거)
+    #     [2] 접합부에서 관측색↔생성색 거리 가중 블렌드(하드 컷 제거)
     verts2 = np.asarray(mesh.vertices)
-    _, ni = tree.query(verts2, workers=-1)
-    mesh.vertex_colors = o3d.utility.Vector3dVector(np.clip(C[ni], 0, 1))
+    Cw = np.clip(C, 0, 1).copy()
+    n_obs = int(OBS.sum()); n_pri = int((~OBS).sum())
+    if (not args.no_color_match) and n_obs > 100 and n_pri > 100:
+        mo, so = Cw[OBS].mean(0), Cw[OBS].std(0) + 1e-6
+        mp, sp = Cw[~OBS].mean(0), Cw[~OBS].std(0) + 1e-6
+        Cw[~OBS] = np.clip((Cw[~OBS] - mp) / sp * so + mo, 0, 1)
+        print(f"[색] 생성 색 통계 정합: mean {np.round(mp,3)} → {np.round(mo,3)}")
+    if args.color_blend_ramp > 0 and n_obs > 100 and n_pri > 0:
+        t_obs = cKDTree(P[OBS]); Cobs = Cw[OBS]
+        d_o, i_o = t_obs.query(verts2, workers=-1)
+        _, i_a = tree.query(verts2, workers=-1)
+        w = np.clip(1.0 - d_o / args.color_blend_ramp, 0, 1)[:, None]
+        col = w * Cobs[i_o] + (1 - w) * Cw[i_a]
+        print(f"[색] 접합부 블렌드 ramp {args.color_blend_ramp*1000:.0f}mm "
+              f"(전이 정점 {int(((w > 0) & (w < 1)).sum())}/{len(verts2)})")
+    else:
+        _, ni = tree.query(verts2, workers=-1)
+        col = Cw[ni]
+    mesh.vertex_colors = o3d.utility.Vector3dVector(np.clip(col, 0, 1))
     mesh.compute_vertex_normals()
 
     # 5) safe_post_process_mesh(num_cluster) — TSDF 경로와 동일 로직(클램프 추가)
