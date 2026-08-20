@@ -61,6 +61,80 @@ def load_gt_depth(depth_dir, stem, scale):
     return None
 
 
+def load_mesh_labeled(path):
+    """PLY → (V, T, L). L=면별 object_id(없으면 None).
+
+    Replica mesh_semantic.ply 는 face 에 object_id 속성 + 다각형(quad) 면이라
+    Open3D RPly 가 헤더 파싱에 실패한다 → plyfile 로 직접 읽고 fan-triangulate.
+    """
+    path = os.path.expanduser(path)
+    try:
+        from plyfile import PlyData
+    except ImportError:
+        PlyData = None
+        print("[mesh] plyfile 미설치 — object_id 추출 불가. pip install plyfile")
+    if PlyData is not None:
+        try:
+            p = PlyData.read(path)
+            v = p["vertex"].data
+            V = np.stack([v["x"], v["y"], v["z"]], -1).astype(np.float64)
+            fe = p["face"].data
+            names = fe.dtype.names
+            key = "vertex_indices" if "vertex_indices" in names else "vertex_index"
+            polys = fe[key]
+            oid = fe["object_id"].astype(np.int64) if "object_id" in names else None
+            lens = np.fromiter((len(x) for x in polys), int, len(polys))
+            tris, labs = [], []
+            for L_ in np.unique(lens):                 # 면 크기별 벡터화 fan 삼각분할
+                sel = np.where(lens == L_)[0]
+                arr = np.stack([np.asarray(polys[i]) for i in sel]).astype(np.int64)
+                for k in range(1, int(L_) - 1):
+                    tris.append(arr[:, [0, k, k + 1]])
+                    if oid is not None:
+                        labs.append(oid[sel])
+            T = np.vstack(tris)
+            Lb = np.concatenate(labs) if oid is not None else None
+            print(f"[mesh] {os.path.basename(path)}: verts {len(V)}, tris {len(T)}"
+                  + (f", object_id {len(np.unique(Lb))}종" if Lb is not None else ""))
+            return V, T, Lb
+        except Exception as e:
+            print(f"[mesh] plyfile 로드 실패({e}) — Open3D 폴백")
+    m = o3d.io.read_triangle_mesh(path)
+    assert len(m.triangles), f"메쉬 로드 실패(삼각형 없음): {path}"
+    return (np.asarray(m.vertices), np.asarray(m.triangles).astype(np.int64), None)
+
+
+def sample_tris(V, T, n, seed=0):
+    """면적 가중 균등 샘플 → (점, 소속 삼각형 인덱스). 라벨을 함께 끌고 가려고 자체 구현."""
+    rng = np.random.default_rng(seed)
+    e1 = V[T[:, 1]] - V[T[:, 0]]; e2 = V[T[:, 2]] - V[T[:, 0]]
+    area = 0.5 * np.linalg.norm(np.cross(e1, e2), axis=1)
+    tot = area.sum()
+    assert tot > 0, "면적 0 메쉬"
+    idx = rng.choice(len(T), n, p=area / tot)
+    r1 = np.sqrt(rng.random(n)); r2 = rng.random(n)
+    P = ((1 - r1)[:, None] * V[T[idx, 0]]
+         + (r1 * (1 - r2))[:, None] * V[T[idx, 1]]
+         + (r1 * r2)[:, None] * V[T[idx, 2]])
+    return P, idx
+
+
+def auto_match_label(V, T, L, ref_pts, n=300000):
+    """recon 점군과 가장 잘 겹치는 object_id 를 투표로 선택(GT 객체 추출)."""
+    P, idx = sample_tris(V, T, min(n, 20 * len(T) + 1000))
+    lab = L[idx]
+    d, j = cKDTree(P).query(ref_pts, workers=-1)
+    keep = d < max(np.percentile(d, 80), 1e-6)        # 먼 점(오정합) 제외
+    vals, cnt = np.unique(lab[j][keep], return_counts=True)
+    best = int(vals[cnt.argmax()]); conf = cnt.max() / max(keep.sum(), 1)
+    top = np.argsort(-cnt)[:3]
+    print(f"[auto-match] object_id={best} (득표 {conf*100:.1f}%)  "
+          f"상위: {[(int(vals[i]), int(cnt[i])) for i in top]}")
+    if conf < 0.5:
+        print("  ⚠ 득표율 낮음 — --gt_label 로 직접 지정 권장")
+    return best
+
+
 def raycast_depth(scene, cam, ds):
     """GT 씬 메쉬를 카메라 포즈에서 ray casting → z-depth (권장 가시성 oracle).
 
@@ -100,8 +174,9 @@ def load_mask(masks_root, gid, stem):
     return a > 127
 
 
-def build_views(args):
-    """카메라 + GT depth(+마스크) 뷰 버퍼. 다운스케일로 메모리/속도 확보."""
+def build_views(args, scene_mesh=None):
+    """카메라 + 가시성 depth(+마스크) 뷰 버퍼. 다운스케일로 메모리/속도 확보.
+    scene_mesh: gt_mesh 오라클용 '씬 전체' o3d 메쉬."""
     assert read_colmap is not None, "warp_gt_to_pose 임포트 실패 — repo 루트에서 실행하세요"
     cams = {c["stem"]: c for c in read_colmap(args.colmap)}
     if args.stems and os.path.exists(os.path.expanduser(args.stems)):
@@ -116,15 +191,10 @@ def build_views(args):
     ds = max(1, args.ds)
     rc_scene = None
     if args.vis_source == "gt_mesh":
-        sp = os.path.expanduser(args.gt_scene_mesh or args.gt_mesh)
-        sm = o3d.io.read_triangle_mesh(sp)
-        assert len(sm.triangles), f"씬 메쉬 로드 실패(삼각형 없음): {sp}"
+        assert scene_mesh is not None, "gt_mesh 오라클에는 씬 메쉬가 필요합니다"
         rc_scene = o3d.t.geometry.RaycastingScene()
-        rc_scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(sm))
-        print(f"[oracle] GT 메쉬 raycasting — {os.path.basename(sp)} "
-              f"(tri {len(sm.triangles)})" +
-              ("" if args.gt_scene_mesh else "  ⚠ 객체 메쉬 사용 중 — 타 객체에 의한 "
-                                            "가림이 반영되지 않음. --gt_scene_mesh 권장"))
+        rc_scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(scene_mesh))
+        print(f"[oracle] GT 씬 메쉬 raycasting (tri {len(scene_mesh.triangles)})")
     else:
         print("[oracle] GT depth 맵 (--vis_source gt_depth)")
 
@@ -226,7 +296,11 @@ def report(name, R, G, gs, gf, thresholds, views, args):
 
 def main():
     ap = argparse.ArgumentParser(description="seen/unseen 분리 평가")
-    ap.add_argument("--gt_mesh", required=True, help="해당 객체의 GT 메쉬(추출본)")
+    ap.add_argument("--gt_mesh", required=True,
+                    help="GT 메쉬. Replica mesh_semantic.ply 를 그대로 주면 object_id 로 "
+                         "대상 객체를 자동 추출(--gt_label 로 직접 지정 가능)")
+    ap.add_argument("--gt_label", type=int, default=-1,
+                    help="추출할 object_id (-1=recon 과 겹침 투표로 자동 매칭)")
     ap.add_argument("--recon", required=True, help="비교 A (보통 fuse_post.ply)")
     ap.add_argument("--recon2", default="", help="비교 B (보통 fused_prior.ply)")
     ap.add_argument("--colmap", required=True)
@@ -237,8 +311,8 @@ def main():
                     help="가시성 oracle. gt_mesh=GT 씬 메쉬 raycasting(권장, depth 파일 불요) "
                          "/ gt_depth=depth 맵 파일")
     ap.add_argument("--gt_scene_mesh", default="",
-                    help="[gt_mesh] occlusion 판정용 '씬 전체' GT 메쉬(예: mesh_semantic.ply). "
-                         "미지정 시 --gt_mesh 사용(타 객체 가림 미반영)")
+                    help="[gt_mesh] occlusion 판정용 '씬 전체' GT 메쉬. --gt_mesh 가 이미 "
+                         "씬 메쉬(mesh_semantic.ply)면 불필요")
     ap.add_argument("--gt_depth_dir", default="", help="[gt_depth] depth 맵 폴더")
     ap.add_argument("--gt_depth_scale", type=float, default=6553.5)
     ap.add_argument("--n_views", type=int, default=120, help="사용할 뷰 수(균등 서브샘플, 0=전체)")
@@ -256,9 +330,33 @@ def main():
     thr = [float(x) for x in args.thresholds.split(",")]
     if args.vis_source == "gt_depth" and not args.gt_depth_dir:
         ap.error("--vis_source gt_depth 에는 --gt_depth_dir 가 필요합니다")
-    views = build_views(args)
 
-    G = sample(args.gt_mesh, args.n_sample)
+    # --- GT 로드 + 대상 객체 추출 ---
+    V, T, L = load_mesh_labeled(args.gt_mesh)
+    Vs, Ts = (V, T)
+    if args.gt_scene_mesh:                            # 씬 메쉬를 따로 준 경우
+        Vs, Ts, _ = load_mesh_labeled(args.gt_scene_mesh)
+    if L is not None:
+        lab = args.gt_label
+        if lab < 0:
+            ref = sample(args.recon, min(args.n_sample, 100000))
+            lab = auto_match_label(V, T, L, ref)
+        sel = L == lab
+        assert sel.any(), f"object_id={lab} 인 면이 없음"
+        T = T[sel]
+        print(f"[GT] object_id={lab} 추출: tri {int(sel.sum())}")
+    elif not args.gt_scene_mesh:
+        print("  ⚠ object_id 없음 — --gt_mesh 를 객체 메쉬로 간주. 타 객체 가림 반영을 위해 "
+              "--gt_scene_mesh 지정 권장")
+
+    scene_mesh = None
+    if args.vis_source == "gt_mesh":
+        scene_mesh = o3d.geometry.TriangleMesh(
+            o3d.utility.Vector3dVector(Vs),
+            o3d.utility.Vector3iVector(Ts.astype(np.int32)))
+    views = build_views(args, scene_mesh)
+
+    G, _ = sample_tris(V, T, args.n_sample)
     gs, _ = classify(G, views, args.margin, args.min_views, args.use_mask)
     print(f"[GT] {len(G)}점 — seen {gs.mean()*100:.1f}% / unseen {(~gs).mean()*100:.1f}%")
     if gs.mean() > 0.98:
