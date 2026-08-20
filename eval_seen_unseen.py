@@ -275,7 +275,7 @@ def _stat(d):
 
 
 def report(name, R, G, gs, gf, thresholds, views, args):
-    """recon 점군 R, GT 점군 G, GT 라벨(gs=seen) 로 영역별 지표 출력."""
+    """recon 점군 R, GT 점군 G, GT 라벨(gs=seen) 로 영역별 지표 출력 + dict 반환."""
     rs, rf = classify(R, views, args.margin, args.min_views, args.use_mask)
     dR = cKDTree(G).query(R, workers=-1)[0]          # accuracy 용 (recon→GT)
     dG = cKDTree(R).query(G, workers=-1)[0]          # completion 용 (GT→recon)
@@ -283,25 +283,52 @@ def report(name, R, G, gs, gf, thresholds, views, args):
     print(f"\n===== {name} =====")
     print(f"  점 구성  recon: seen {rs.mean()*100:5.1f}%  free위반 {rf.mean()*100:5.1f}%  "
           f"unseen {(~rs & ~rf).mean()*100:5.1f}%   |  GT: seen {gs.mean()*100:.1f}%")
-    for lab, rm, gm in (("ALL   ", np.ones(len(R), bool), np.ones(len(G), bool)),
-                        ("SEEN  ", rs, gs),
-                        ("UNSEEN", ~rs, ~gs)):
-        am, amd = _stat(dR[rm])
-        cm, cmd = _stat(dG[gm])
-        line = (f"  [{lab}] accuracy {am:7.2f}mm (med {amd:6.2f})   "
-                f"completion {cm:7.2f}mm (med {cmd:6.2f})")
-        print(line)
+    M = {"mesh": os.path.basename(name.split(": ")[-1]),
+         "free_pct": float(rf.mean() * 100),
+         "recon_seen_pct": float(rs.mean() * 100),
+         "recon_unseen_pct": float((~rs & ~rf).mean() * 100),
+         "gt_seen_pct": float(gs.mean() * 100)}
+    for lab, key, rm, gm in (("ALL   ", "all", np.ones(len(R), bool), np.ones(len(G), bool)),
+                             ("SEEN  ", "seen", rs, gs),
+                             ("UNSEEN", "unseen", ~rs, ~gs)):
+        am, amd = _stat(dR[rm]); cm, cmd = _stat(dG[gm])
+        M[f"{key}_acc"] = am; M[f"{key}_acc_med"] = amd
+        M[f"{key}_comp"] = cm; M[f"{key}_comp_med"] = cmd
+        print(f"  [{lab}] accuracy {am:7.2f}mm (med {amd:6.2f})   "
+              f"completion {cm:7.2f}mm (med {cmd:6.2f})")
         for thr in thresholds:
             p = float((dR[rm] < thr).mean()) if rm.sum() else float("nan")
             r = float((dG[gm] < thr).mean()) if gm.sum() else float("nan")
             f = 2 * p * r / (p + r) if (p + r) > 0 else 0.0
-            print(f"        F@{thr*100:.1f}cm {f:.4f} (P {p:.4f} / R {r:.4f})")
+            tn = f"{thr*100:.1f}"
+            M[f"{key}_F{tn}"] = f; M[f"{key}_P{tn}"] = p; M[f"{key}_R{tn}"] = r
+            print(f"        F@{tn}cm {f:.4f} (P {p:.4f} / R {r:.4f})")
     if rf.any():
         am, _ = _stat(dR[rf])
         print(f"  [FREE 위반] {int(rf.sum())}점 ({rf.mean()*100:.1f}%) — "
               f"관측된 빈 공간의 표면, accuracy {am:.2f}mm  ※ 명백한 오류")
-    return dict(seen_acc=_stat(dR[rs])[0], unseen_comp=_stat(dG[~gs])[0],
-                free_pct=float(rf.mean() * 100))
+    M["seen_acc_mm"] = M["seen_acc"]; M["unseen_comp_mm"] = M["unseen_comp"]
+    return M
+
+
+def write_csv(path, rows, tag):
+    """스윕 비교용 CSV 누적(헤더 자동, 파일 없으면 생성)."""
+    import csv
+    cols = ["tag", "mesh", "gt_seen_pct", "recon_seen_pct", "recon_unseen_pct", "free_pct",
+            "seen_acc", "seen_acc_med", "seen_comp", "seen_comp_med",
+            "seen_F1.0", "seen_P1.0", "seen_R1.0",
+            "unseen_acc", "unseen_acc_med", "unseen_comp", "unseen_comp_med",
+            "unseen_F2.0", "unseen_P2.0", "unseen_R2.0"]
+    path = os.path.expanduser(path)
+    new = not os.path.exists(path)
+    with open(path, "a", newline="") as fh:
+        w = csv.writer(fh)
+        if new:
+            w.writerow(cols)
+        for r in rows:
+            w.writerow([tag] + [f"{r[c]:.4f}" if isinstance(r.get(c), float) else r.get(c, "")
+                                for c in cols[1:]])
+    print(f"[csv] → {path}")
 
 
 def main():
@@ -338,6 +365,9 @@ def main():
     ap.add_argument("--use_mask", action="store_true",
                     help="객체 마스크도 가시 조건에 포함(인접 객체 depth 혼입 방지)")
     ap.add_argument("--thresholds", default="0.005,0.01,0.02")
+    ap.add_argument("--csv", default="", help="스윕 비교용 CSV 누적 경로")
+    ap.add_argument("--tag", default="", help="CSV 행 태그(예: d0.010)")
+    ap.add_argument("--csv_all", action="store_true", help="A 행도 CSV 에 기록(기본 B만)")
     args = ap.parse_args()
 
     thr = [float(x) for x in args.thresholds.split(",")]
@@ -376,18 +406,26 @@ def main():
     if gs.mean() > 0.98:
         print("  ⚠ unseen 이 거의 없음 — margin 과다 또는 뷰/depth 매칭 확인")
 
-    a = report("A: " + os.path.basename(args.recon),
-               sample(args.recon, args.n_sample), G, gs, None, thr, views, args)
+    rows = []
+    a = report("A: " + args.recon, sample(args.recon, args.n_sample),
+               G, gs, None, thr, views, args)
+    rows.append(a)
     if args.recon2:
-        b = report("B: " + os.path.basename(args.recon2),
-                   sample(args.recon2, args.n_sample), G, gs, None, thr, views, args)
+        b = report("B: " + args.recon2, sample(args.recon2, args.n_sample),
+                   G, gs, None, thr, views, args)
+        rows.append(b)
         print("\n===== A → B 변화 (원하는 방향: seen acc 유지, unseen comp 감소) =====")
         print(f"  seen accuracy      {a['seen_acc']:7.2f} → {b['seen_acc']:7.2f} mm  "
               f"({b['seen_acc']-a['seen_acc']:+.2f}, 0 에 가까울수록 관측 보존)")
         print(f"  unseen completion  {a['unseen_comp']:7.2f} → {b['unseen_comp']:7.2f} mm  "
               f"({b['unseen_comp']-a['unseen_comp']:+.2f}, 음수가 prior 기여)")
+        print(f"  unseen F@2cm       {a['unseen_F2.0']:7.4f} → {b['unseen_F2.0']:7.4f}  "
+              f"(P {a['unseen_P2.0']:.3f}→{b['unseen_P2.0']:.3f}, "
+              f"R {a['unseen_R2.0']:.3f}→{b['unseen_R2.0']:.3f})")
         print(f"  free 위반 비율     {a['free_pct']:6.2f}% → {b['free_pct']:6.2f}%  "
               f"({b['free_pct']-a['free_pct']:+.2f}%p, 낮을수록 좋음)")
+    if args.csv:
+        write_csv(args.csv, rows if args.csv_all else rows[-1:], args.tag or "")
 
 
 if __name__ == "__main__":
