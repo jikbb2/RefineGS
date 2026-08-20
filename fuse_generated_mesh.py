@@ -185,13 +185,25 @@ def apply9(P, R, t, S):
 
 
 def refine_pose_rc(gen_canon_mesh, cams, R, t, S, isotropic=False,
-                   lr_w=192, max_views=6, maxiter=120):
-    """render-and-compare 포즈 미세정합: 여러 뷰 실루엣 IoU 최대화.
-    평면(상판) 관측의 yaw·수직 모호성을 실루엣으로 해소. 광선을 canonical 로
-    역변환해 고정 메쉬에 raycast(저해상도) → 빠른 미분자유 최적화."""
+                   lr_w=192, max_views=6, maxiter=120,
+                   recon_mesh=None, depth_w=1.0, depth_cap=0.05):
+    """render-and-compare 포즈 미세정합: 실루엣 IoU + (선택) depth L1.
+
+    실루엣만으로는 '시선 방향' 오차에 구조적으로 둔감해 1~2cm 잔차가 남는다.
+    → 관측 메쉬(recon, 이미지에서만 유도됨)를 raycast 한 depth 를 타깃으로 추가.
+      GT depth 를 쓰지 않으므로 일반화 제약이 없다.
+
+    광선을 canonical 로 역변환해 고정 메쉬에 raycast. 방향벡터를 정규화하지 않으면
+    (카메라 z성분=1) 파라미터 t_hit 이 canonical/world 에서 동일하고 곧 z-depth 라,
+    관측 depth 와 바로 비교할 수 있다.
+    """
     scene = o3d.t.geometry.RaycastingScene()
     scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(gen_canon_mesh))
-    # 뷰별 저해상도 광선 원점/방향(world) + 다운스케일 마스크 사전계산
+    rec_scene = None
+    if recon_mesh is not None and depth_w > 0 and len(recon_mesh.triangles):
+        rec_scene = o3d.t.geometry.RaycastingScene()
+        rec_scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(recon_mesh))
+    # 뷰별 저해상도 광선 원점/방향(world) + 마스크 + 관측 depth 사전계산
     views = []
     for c, m in [x for x in cams if x[1] is not None][:max_views]:
         sc = lr_w / c["W"]; W = lr_w; H = int(round(c["H"] * sc))
@@ -199,35 +211,65 @@ def refine_pose_rc(gen_canon_mesh, cams, R, t, S, isotropic=False,
         Rc, tc = c["R"], c["t"]; C = cam_center(Rc, tc)
         uu, vv = np.meshgrid(np.arange(W), np.arange(H))
         dcam = np.stack([(uu - cx) / fx, (vv - cy) / fy, np.ones_like(uu, float)], -1).reshape(-1, 3)
-        dwn = (Rc.T @ dcam.T).T                                   # world 방향
+        dwn = (Rc.T @ dcam.T).T                                   # world 방향(비정규화)
         md = cv2.resize(m.astype(np.uint8), (W, H), interpolation=cv2.INTER_NEAREST) > 0
-        views.append((C.astype(np.float64), dwn, md))
+        dobs = None
+        if rec_scene is not None:
+            rays = np.concatenate([np.broadcast_to(C.astype(np.float32), dwn.shape),
+                                   dwn.astype(np.float32)], 1)
+            th = rec_scene.cast_rays(o3d.core.Tensor(rays))["t_hit"].numpy()
+            dobs = np.where(np.isfinite(th) & md.ravel(), th, 0.0)   # 마스크 내 관측 표면만
+        views.append((C.astype(np.float64), dwn, md, dobs))
+    if rec_scene is not None:
+        cov = np.mean([(v[3] > 0).mean() for v in views])
+        print(f"[정합] RC depth 항 활성 — 관측 depth 커버 {cov*100:.1f}%/뷰, "
+              f"w={depth_w}, cap={depth_cap*1000:.0f}mm")
 
     def unpack(x):
         R_ = Rotation.from_rotvec(x[:3]).as_matrix(); t_ = x[3:6]
         S_ = np.exp(x[6:7].repeat(3)) if isotropic else np.exp(x[6:9])
         return R_, t_, S_
 
-    def loss(x):
+    def terms(x):
+        """(1-IoU, depth L1 정규화) 평균."""
         R_, t_, S_ = unpack(x); Sinv = 1.0 / S_; Rt = R_.T
-        tot = 0.0
-        for C, dwn, md in views:
+        sil_l, dep_l = 0.0, 0.0
+        for C, dwn, md, dobs in views:
             o_c = (Sinv * (Rt @ (C - t_)))                        # canonical 원점
             d_c = (Sinv * (Rt @ dwn.T).T)                         # canonical 방향
             rays = np.concatenate([np.broadcast_to(o_c.astype(np.float32), d_c.shape),
                                    d_c.astype(np.float32)], 1)
             th = scene.cast_rays(o3d.core.Tensor(rays))["t_hit"].numpy()
-            sil = np.isfinite(th).reshape(md.shape)
+            hit = np.isfinite(th)
+            sil = hit.reshape(md.shape)
             inter = (sil & md).sum(); union = (sil | md).sum()
-            tot += 1.0 - inter / max(union, 1)
-        return tot / len(views)
+            sil_l += 1.0 - inter / max(union, 1)
+            if dobs is not None:
+                ok = hit & (dobs > 0)                             # 생성·관측 둘 다 표면
+                if ok.sum() > 50:
+                    e = np.minimum(np.abs(th[ok] - dobs[ok]), depth_cap) / depth_cap
+                    # 겹침이 적으면 신뢰도 낮음 → 커버리지로 가중
+                    dep_l += e.mean() * min(1.0, ok.sum() / max((md.sum()) * 0.3, 1))
+                else:
+                    dep_l += 1.0
+        n = len(views)
+        return sil_l / n, dep_l / n
+
+    def loss(x):
+        s, d = terms(x)
+        return s + depth_w * d
 
     x0 = np.concatenate([Rotation.from_matrix(R).as_rotvec(), t,
                          (np.log(S).mean(keepdims=True) if isotropic else np.log(S))])
-    iou0 = 1 - loss(x0)
+    s0, d0 = terms(x0)
     res = minimize(loss, x0, method="Powell", options={"maxiter": maxiter, "xtol": 1e-4})
-    R_, t_, S_ = unpack(res.x); iou1 = 1 - res.fun
-    print(f"[정합] render-compare 최적화 IoU {iou0:.3f} → {iou1:.3f}")
+    R_, t_, S_ = unpack(res.x)
+    s1, d1 = terms(res.x)
+    print(f"[정합] render-compare IoU {1-s0:.3f} → {1-s1:.3f}"
+          + (f"  depth {d0*depth_cap*1000:.1f} → {d1*depth_cap*1000:.1f}mm(정규화)"
+             if rec_scene is not None else ""))
+    if 1 - s1 < 1 - s0 - 0.02:
+        print("  ⚠ depth 항이 실루엣을 크게 희생 — --rc_depth_w 하향 고려")
     return R_, t_, S_
 
 
@@ -419,6 +461,13 @@ def main():
     ap.add_argument("--init_all_up", action="store_true",
                     help="정합 초기화를 up 축 6방향(±x,±y,±z)×yaw 로 확장 — 생성 canonical "
                          "방향이 제각각인 배치에서 권장")
+    ap.add_argument("--rc_depth_w", type=float, default=1.0,
+                    help="RC depth 항 가중치(0=실루엣만). 관측 recon 메쉬 raycast depth 기준 "
+                         "— GT depth 불필요. 실루엣이 못 잡는 시선방향 잔차를 제거")
+    ap.add_argument("--rc_depth_cap", type=float, default=0.05,
+                    help="depth 오차 클램프(m) — 이상치(가림/미관측) 영향 차단")
+    ap.add_argument("--rc_views", type=int, default=8,
+                    help="render-and-compare 에 쓸 뷰 수(많을수록 안정, 느림)")
     ap.add_argument("--min_iou", type=float, default=0.45,
                     help="최종 실루엣 IoU 게이트 — 미달 시 산출물 없이 종료(코드 3), "
                          "배치가 해당 객체를 prior 없이 skip")
@@ -492,7 +541,9 @@ def main():
 
     # render-and-compare 미세정합(평면 관측 모호성 해소) — 변환 전 canonical 메쉬 사용
     if args.refine and cams is not None:
-        R, t, S = refine_pose_rc(gen, cams, R, t, S, isotropic=args.isotropic)
+        R, t, S = refine_pose_rc(gen, cams, R, t, S, isotropic=args.isotropic,
+                                 max_views=args.rc_views, recon_mesh=recon,
+                                 depth_w=args.rc_depth_w, depth_cap=args.rc_depth_cap)
 
     gv = np.asarray(gen.vertices)
     gen.vertices = o3d.utility.Vector3dVector(apply9(gv, R, t, S))
