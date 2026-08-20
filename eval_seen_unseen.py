@@ -119,20 +119,30 @@ def sample_tris(V, T, n, seed=0):
     return P, idx
 
 
-def auto_match_label(V, T, L, ref_pts, n=300000):
-    """recon 점군과 가장 잘 겹치는 object_id 를 투표로 선택(GT 객체 추출)."""
+def auto_match_labels(V, T, L, ref_pts, min_share=0.10, n=300000):
+    """recon 과 겹치는 object_id 집합을 투표로 선택.
+
+    SAM3 인스턴스는 데이터셋 semantic id 와 1:1 이 아니다(한 인스턴스가 여러 GT 객체를
+    아우르거나 그 반대). 단일 라벨을 고르면 GT 가 과소/과대 잡히므로, 득표 비율이
+    min_share 이상인 라벨을 '모두' 채택하고 구성을 출력해 사람이 검증하게 한다.
+    """
     P, idx = sample_tris(V, T, min(n, 20 * len(T) + 1000))
     lab = L[idx]
     d, j = cKDTree(P).query(ref_pts, workers=-1)
-    keep = d < max(np.percentile(d, 80), 1e-6)        # 먼 점(오정합) 제외
+    keep = d < max(np.percentile(d, 80), 1e-6)        # 먼 점(floater) 제외
     vals, cnt = np.unique(lab[j][keep], return_counts=True)
-    best = int(vals[cnt.argmax()]); conf = cnt.max() / max(keep.sum(), 1)
-    top = np.argsort(-cnt)[:3]
-    print(f"[auto-match] object_id={best} (득표 {conf*100:.1f}%)  "
-          f"상위: {[(int(vals[i]), int(cnt[i])) for i in top]}")
-    if conf < 0.5:
-        print("  ⚠ 득표율 낮음 — --gt_label 로 직접 지정 권장")
-    return best
+    share = cnt / max(keep.sum(), 1)
+    order = np.argsort(-share)
+    print("[auto-match] 득표 구성: " + ", ".join(
+        f"id{int(vals[i])} {share[i]*100:.1f}%" for i in order[:6]))
+    sel = [int(vals[i]) for i in order if share[i] >= min_share]
+    if not sel:
+        sel = [int(vals[order[0]])]
+    cov = float(share[[i for i in order if share[i] >= min_share]].sum()) if sel else 0.0
+    print(f"  → 채택 라벨 {sel} (합계 {cov*100:.1f}%)")
+    if cov < 0.7:
+        print("  ⚠ 커버리지 낮음 — --gt_labels 로 직접 지정하거나 min_share 조정 권장")
+    return sel
 
 
 def raycast_depth(scene, cam, ds):
@@ -299,8 +309,11 @@ def main():
     ap.add_argument("--gt_mesh", required=True,
                     help="GT 메쉬. Replica mesh_semantic.ply 를 그대로 주면 object_id 로 "
                          "대상 객체를 자동 추출(--gt_label 로 직접 지정 가능)")
-    ap.add_argument("--gt_label", type=int, default=-1,
-                    help="추출할 object_id (-1=recon 과 겹침 투표로 자동 매칭)")
+    ap.add_argument("--gt_labels", default="",
+                    help="추출할 object_id 목록(쉼표). 비우면 recon 겹침 투표로 자동 매칭 "
+                         "— SAM3 인스턴스가 여러 GT 객체를 아우르는 경우까지 커버")
+    ap.add_argument("--match_min_share", type=float, default=0.10,
+                    help="자동 매칭 시 채택할 라벨의 최소 득표 비율")
     ap.add_argument("--recon", required=True, help="비교 A (보통 fuse_post.ply)")
     ap.add_argument("--recon2", default="", help="비교 B (보통 fused_prior.ply)")
     ap.add_argument("--colmap", required=True)
@@ -337,14 +350,15 @@ def main():
     if args.gt_scene_mesh:                            # 씬 메쉬를 따로 준 경우
         Vs, Ts, _ = load_mesh_labeled(args.gt_scene_mesh)
     if L is not None:
-        lab = args.gt_label
-        if lab < 0:
+        if args.gt_labels:
+            labs = [int(x) for x in args.gt_labels.split(",")]
+        else:
             ref = sample(args.recon, min(args.n_sample, 100000))
-            lab = auto_match_label(V, T, L, ref)
-        sel = L == lab
-        assert sel.any(), f"object_id={lab} 인 면이 없음"
+            labs = auto_match_labels(V, T, L, ref, args.match_min_share)
+        sel = np.isin(L, labs)
+        assert sel.any(), f"object_id={labs} 인 면이 없음"
         T = T[sel]
-        print(f"[GT] object_id={lab} 추출: tri {int(sel.sum())}")
+        print(f"[GT] object_id={labs} 추출: tri {int(sel.sum())}")
     elif not args.gt_scene_mesh:
         print("  ⚠ object_id 없음 — --gt_mesh 를 객체 메쉬로 간주. 타 객체 가림 반영을 위해 "
               "--gt_scene_mesh 지정 권장")
