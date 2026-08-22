@@ -48,6 +48,10 @@ def main():
     ap.add_argument("--config", default="balance", choices=list(preset_configs))
     ap.add_argument("--grid", type=int, default=256, help="필드 그리드 해상도(축당 점 수)")
     ap.add_argument("--chunk", type=int, default=32768)
+    ap.add_argument("--seed", type=int, default=0, help="flow matching 초기 노이즈 시드")
+    ap.add_argument("--ensemble", type=int, default=1,
+                    help="K개 시드로 필드를 뽑아 mean/std 저장. >50%% 미관측에서는 정답이 "
+                         "하나가 아니므로, 합의도(σ)를 융합 가중치로 넘긴다")
     ap.add_argument("--out", required=True)
     ap.add_argument("--save_mesh", default="", help="선택: 부호 필드의 zero-level 메쉬(검증용)")
     args = ap.parse_args()
@@ -78,26 +82,38 @@ def main():
     loader = torch.utils.data.DataLoader(ds, batch_size=1, shuffle=False,
                                          num_workers=0, collate_fn=ds.custom_collate)
 
+    G = args.grid
+    lin = np.linspace(-1.0, 1.0, G, dtype=np.float32)
+    gx, gy, gz = np.meshgrid(lin, lin, lin, indexing="ij")
+    pts = np.stack([gx, gy, gz], -1).reshape(-1, 3)
+    core = getattr(vae.model, "_orig_mod", vae.model)       # torch.compile 래퍼 우회
+
+    fields = []
     with torch.no_grad():
         batch = next(iter(loader))
         batch = InferenceDataset.move_batch_to_device(batch, device, dtype=torch.bfloat16)
-        kl = model.infer_latents(batch, token_shape=token_shape,
-                                 text_feature_extractor=tfe, num_steps=num_steps,
-                                 use_shifted_sampling=use_shifted)
-        core = getattr(vae.model, "_orig_mod", vae.model)   # torch.compile 래퍼 우회
-        latents = core.decode(kl)
-
-        # ---- 부호 있는 필드를 [-1,1]^3 그리드에 평가 (extract_mesh 와 동일 규약) ----
-        G = args.grid
-        lin = np.linspace(-1.0, 1.0, G, dtype=np.float32)
-        gx, gy, gz = np.meshgrid(lin, lin, lin, indexing="ij")
-        pts = np.stack([gx, gy, gz], -1).reshape(-1, 3)
-        vals = np.empty(len(pts), np.float32)
-        for s in tqdm(range(0, len(pts), args.chunk), desc="field"):
-            q = torch.from_numpy(pts[s:s + args.chunk]).to(device=device,
-                                                           dtype=latents.dtype)[None]
-            vals[s:s + args.chunk] = core.query(q, latents)[0].float().cpu().numpy()
-        F = vals.reshape(G, G, G)
+        for k in range(max(1, args.ensemble)):
+            torch.manual_seed(args.seed + k)               # flow matching 초기 노이즈
+            np.random.seed(args.seed + k)
+            kl = model.infer_latents(batch, token_shape=token_shape,
+                                     text_feature_extractor=tfe, num_steps=num_steps,
+                                     use_shifted_sampling=use_shifted)
+            latents = core.decode(kl)
+            # 부호 있는 필드를 [-1,1]^3 그리드에 평가 (extract_mesh 와 동일 규약)
+            vals = np.empty(len(pts), np.float32)
+            for s in tqdm(range(0, len(pts), args.chunk),
+                          desc=f"field[{k + 1}/{max(1, args.ensemble)}]"):
+                q = torch.from_numpy(pts[s:s + args.chunk]).to(device=device,
+                                                               dtype=latents.dtype)[None]
+                vals[s:s + args.chunk] = core.query(q, latents)[0].float().cpu().numpy()
+            fields.append(vals.reshape(G, G, G))
+    Fstack = np.stack(fields)
+    F = Fstack.mean(0)
+    Fstd = Fstack.std(0) if len(fields) > 1 else None
+    if Fstd is not None:
+        agree = (np.sign(Fstack) == np.sign(F)[None]).all(0)
+        print(f"[ensemble] K={len(fields)}  부호 합의 복셀 {agree.mean()*100:.1f}%  "
+              f"σ 중앙값 {np.median(Fstd):.4f}")
 
     # ---- pkl 에서 world 변환 복원 ----
     smp = pickle.load(open(args.input_pkl, "rb"))
@@ -129,9 +145,12 @@ def main():
 
     out = os.path.expanduser(args.out)
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
-    np.savez_compressed(out, field=Fm, center=center.astype(np.float64),
-                        R_align=R_align.astype(np.float64), scale=np.float64(scale),
-                        vox_world=np.float64(vox_world), raw_g=np.float64(g))
+    save = dict(field=Fm, center=center.astype(np.float64),
+                R_align=R_align.astype(np.float64), scale=np.float64(scale),
+                vox_world=np.float64(vox_world), raw_g=np.float64(g))
+    if Fstd is not None:
+        save["field_std"] = (Fstd / g).astype(np.float32)   # 동일 스케일로 환산
+    np.savez_compressed(out, **save)
     print(f"→ {out}  ({os.path.getsize(out)/1e6:.1f} MB)")
 
     if args.save_mesh:                                     # 부호 규약 육안 검증용

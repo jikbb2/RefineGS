@@ -805,6 +805,11 @@ def main():
     parser.add_argument("--prior_field", default="", type=str,
                         help="[권장] ShapeR 부호 SDF 그리드 npz(shaper_field.py 출력). "
                              "메쉬를 거치지 않아 sign-fix/shell_delta/정합이 모두 불필요")
+    parser.add_argument("--prior_sigma_w", default=1.0, type=float,
+                        help="앙상블 σ 가중 강도(0=off). 클수록 시드가 갈리는 곳의 생성을 "
+                             "적극 억제 — precision↑ recall↓")
+    parser.add_argument("--prior_sigma_ref", default=0.0, type=float,
+                        help="σ 기준값(m). 0=영교차 근방 σ 중앙값으로 자동")
     parser.add_argument("--prior_mesh", default="", type=str,
                         help="[Step2] 정합된 watertight 생성 메쉬(fuse_generated_mesh --save_aligned "
                              "출력 *_gen_aligned.ply). 표면점+볼륨 SDF distillation — extra_points 상위호환")
@@ -1034,6 +1039,25 @@ def main():
               f"내부 {(Ffield < 0).mean()*100:.2f}%")
         args.prior_watertight = True          # sign-fix 비활성(이미 signed)
 
+        # [앙상블 σ 가중] 50% 이상 미관측이면 정답이 하나가 아니다. 여러 시드가 동의하는
+        # 곳만 prior 를 믿고, 갈리는 곳(σ 큼)은 '표면 없음(+trunc)' 쪽으로 후퇴시켜
+        # 관측 표면에서의 자연스러운 연장(eikonal·평활화)에 맡긴다.
+        Fsig = None
+        if "field_std" in z.files and args.prior_sigma_w > 0:
+            Fsig = z["field_std"].astype(np.float32)
+            near = np.abs(Ffield) < 3 * float(z["vox_world"])
+            # 필드가 metric 이므로 σ0 는 '허용 가능한 표면 위치 불확실성'의 절대 기준.
+            # 기본 = prior_trunc → σ≪σ0 이면 w≈1(그대로 신뢰), σ≈σ0 이면 w=0.5.
+            # ※ σ0 를 σ 중앙값으로 잡으면 정의상 복셀 절반이 억제되므로 쓰지 않는다.
+            s0 = max(args.prior_sigma_ref if args.prior_sigma_ref > 0
+                     else args.prior_trunc, 1e-6)
+            Wsig = 1.0 / (1.0 + args.prior_sigma_w * (Fsig / s0) ** 2)
+            sm = float(np.median(Fsig[near])) if near.any() else float("nan")
+            print(f"[prior-field] σ 가중 활성: σ0={s0*1000:.1f}mm  "
+                  f"표면근방 σ 중앙값 {sm*1000:.2f}mm  "
+                  f"w 중앙값 {float(np.median(Wsig[near])) if near.any() else float('nan'):.3f}  "
+                  f"(w<0.5 복셀 {(Wsig < 0.5).mean()*100:.1f}%)")
+
         def _sd(q):
             """world 점 → 근사 metric SDF(음수=내부). 그리드 밖은 +trunc."""
             n = ((np.asarray(q, np.float64) - f_center) @ f_R.T) * f_scale
@@ -1045,16 +1069,24 @@ def main():
             p = idx[ok]
             i0 = np.floor(p).astype(np.int64); w = p - i0
             i1 = i0 + 1
-            v = np.zeros(len(p), np.float64)
-            for dx in (0, 1):                 # 삼선형 보간
-                for dy in (0, 1):
-                    for dz in (0, 1):
-                        ww = ((w[:, 0] if dx else 1 - w[:, 0])
-                              * (w[:, 1] if dy else 1 - w[:, 1])
-                              * (w[:, 2] if dz else 1 - w[:, 2]))
-                        v += ww * Ffield[(i1 if dx else i0)[:, 0],
-                                         (i1 if dy else i0)[:, 1],
-                                         (i1 if dz else i0)[:, 2]]
+
+            def _interp(vol):                 # 삼선형 보간
+                v = np.zeros(len(p), np.float64)
+                for dx in (0, 1):
+                    for dy in (0, 1):
+                        for dz in (0, 1):
+                            ww = ((w[:, 0] if dx else 1 - w[:, 0])
+                                  * (w[:, 1] if dy else 1 - w[:, 1])
+                                  * (w[:, 2] if dz else 1 - w[:, 2]))
+                            v += ww * vol[(i1 if dx else i0)[:, 0],
+                                          (i1 if dy else i0)[:, 1],
+                                          (i1 if dz else i0)[:, 2]]
+                return v
+
+            v = _interp(Ffield)
+            if Fsig is not None:              # 합의도 가중: 불확실하면 '표면 없음'으로 후퇴
+                wg = _interp(Wsig)
+                v = wg * v + (1 - wg) * args.prior_trunc
             out[ok] = v
             return out
     if args.prior_mesh:
