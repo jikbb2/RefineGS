@@ -111,8 +111,11 @@ def main():
     print(f"[points] {len(P_w)}점 (world)")
 
     # ---- 2) 오브젝트 프레임: 중력 정렬 + AABB 중심 ----
-    # centroid 대신 AABB 중심 — 절반 미관측 시 centroid 는 관측 쪽으로 크게 치우침
-    lo, hi = P_w.min(0), P_w.max(0)
+    # centroid 대신 AABB 중심 — 절반 미관측 시 centroid 는 관측 쪽으로 크게 치우침.
+    # ※ AABB 는 '샘플 점'이 아니라 '메쉬 정점'에서 계산한다 — 그래야 --n_points 를 바꿔도
+    #   오브젝트 프레임(center/bounds/scale)이 동일해져 앙상블 평균이 유효하다.
+    V_w = np.asarray(m.vertices, np.float64)
+    lo, hi = V_w.min(0), V_w.max(0)
     center = (lo + hi) / 2
     R_align = np.eye(3)
     if args.world_up != "z":                          # ShapeR 은 z-up 오브젝트 프레임 가정
@@ -120,7 +123,7 @@ def main():
         perm = [0, 1, 2]; perm[ax], perm[2] = perm[2], perm[ax]
         R_align = np.eye(3)[perm]
     P_m = (R_align @ (P_w - center).T).T
-    bounds = np.abs(P_m).max(0) * args.bounds_margin
+    bounds = np.abs((R_align @ (V_w - center).T).T).max(0) * args.bounds_margin
     scale = 0.9 / bounds.max()
     clipped = int((np.abs(P_m * scale) > 1.0).any(1).sum())
     print(f"[frame] center={np.round(center,3)}  half-extent={np.round(bounds,3)}m  "

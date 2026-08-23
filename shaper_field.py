@@ -78,45 +78,69 @@ def main():
     token_shape = (1, token_count, vae.get_embed_dim())
     use_shifted = getattr(config.fm_transformer, "time_sampler", "lognorm") == "flux"
 
-    ds = InferenceDataset(config, paths=[args.input_pkl], override_num_views=num_images)
-    loader = torch.utils.data.DataLoader(ds, batch_size=1, shuffle=False,
-                                         num_workers=0, collate_fn=ds.custom_collate)
-
+    pkls = [p.strip() for p in args.input_pkl.split(",") if p.strip()]
     G = args.grid
     lin = np.linspace(-1.0, 1.0, G, dtype=np.float32)
     gx, gy, gz = np.meshgrid(lin, lin, lin, indexing="ij")
     pts = np.stack([gx, gy, gz], -1).reshape(-1, 3)
     core = getattr(vae.model, "_orig_mod", vae.model)       # torch.compile 래퍼 우회
 
+    # 다양성 원천은 두 가지: (a) 시드 --ensemble, (b) 서로 다른 입력 pkl(포인트 서브샘플·
+    # 뷰 구성이 다른 것)을 콤마로 여러 개. 모델이 조건 대비 결정적이면 (a)는 σ≈0 이 되므로
+    # (b) 가 실질적인 epistemic 다양성을 준다.
     fields = []
+    K = max(1, args.ensemble)
     with torch.no_grad():
-        batch = next(iter(loader))
-        batch = InferenceDataset.move_batch_to_device(batch, device, dtype=torch.bfloat16)
-        for k in range(max(1, args.ensemble)):
-            torch.manual_seed(args.seed + k)               # flow matching 초기 노이즈
-            np.random.seed(args.seed + k)
-            kl = model.infer_latents(batch, token_shape=token_shape,
-                                     text_feature_extractor=tfe, num_steps=num_steps,
-                                     use_shifted_sampling=use_shifted)
-            latents = core.decode(kl)
-            # 부호 있는 필드를 [-1,1]^3 그리드에 평가 (extract_mesh 와 동일 규약)
-            vals = np.empty(len(pts), np.float32)
-            for s in tqdm(range(0, len(pts), args.chunk),
-                          desc=f"field[{k + 1}/{max(1, args.ensemble)}]"):
-                q = torch.from_numpy(pts[s:s + args.chunk]).to(device=device,
-                                                               dtype=latents.dtype)[None]
-                vals[s:s + args.chunk] = core.query(q, latents)[0].float().cpu().numpy()
-            fields.append(vals.reshape(G, G, G))
+        for pi, pk in enumerate(pkls):
+            ds = InferenceDataset(config, paths=[pk], override_num_views=num_images)
+            loader = torch.utils.data.DataLoader(ds, batch_size=1, shuffle=False,
+                                                 num_workers=0,
+                                                 collate_fn=ds.custom_collate)
+            batch = next(iter(loader))
+            batch = InferenceDataset.move_batch_to_device(batch, device,
+                                                          dtype=torch.bfloat16)
+            for k in range(K):
+                torch.manual_seed(args.seed + k)           # flow matching 초기 노이즈
+                np.random.seed(args.seed + k)
+                kl = model.infer_latents(batch, token_shape=token_shape,
+                                         text_feature_extractor=tfe, num_steps=num_steps,
+                                         use_shifted_sampling=use_shifted)
+                latents = core.decode(kl)
+                # 부호 있는 필드를 [-1,1]^3 그리드에 평가 (extract_mesh 와 동일 규약)
+                vals = np.empty(len(pts), np.float32)
+                tag = f"{pi * K + k + 1}/{len(pkls) * K}"
+                for s in tqdm(range(0, len(pts), args.chunk), desc=f"field[{tag}]"):
+                    q = torch.from_numpy(pts[s:s + args.chunk]).to(
+                        device=device, dtype=latents.dtype)[None]
+                    vals[s:s + args.chunk] = core.query(q, latents)[0].float().cpu().numpy()
+                fields.append(vals.reshape(G, G, G))
     Fstack = np.stack(fields)
     F = Fstack.mean(0)
     Fstd = Fstack.std(0) if len(fields) > 1 else None
     if Fstd is not None:
+        # ※ 전체 복셀 σ 중앙값은 포화 영역(멀리) 때문에 항상 0 에 가깝다 —
+        #   의미 있는 값은 '영교차 근방' σ. 여기가 0 이면 샘플이 사실상 동일하다는 뜻.
+        nz = np.abs(F) < 0.05 * np.abs(F).max()
+        smed = float(np.median(Fstd[nz])) if nz.any() else float("nan")
         agree = (np.sign(Fstack) == np.sign(F)[None]).all(0)
-        print(f"[ensemble] K={len(fields)}  부호 합의 복셀 {agree.mean()*100:.1f}%  "
-              f"σ 중앙값 {np.median(Fstd):.4f}")
+        print(f"[ensemble] K={len(fields)}  부호 합의 {agree.mean()*100:.1f}%  "
+              f"표면근방 σ 중앙값 {smed:.5f} / 최대 {Fstd.max():.5f} (raw 단위)")
+        if smed < 1e-5:
+            print("  ⚠ 샘플이 사실상 동일 — 시드가 초기 노이즈에 영향을 못 줍니다.\n"
+                  "     서로 다른 pkl(포인트 서브샘플 다름)을 --input_pkl 에 콤마로 넘기세요.")
 
     # ---- pkl 에서 world 변환 복원 ----
-    smp = pickle.load(open(args.input_pkl, "rb"))
+    smp = pickle.load(open(pkls[0], "rb"))     # world 변환은 첫 pkl 기준
+    if len(pkls) > 1:                          # 여러 pkl 이면 프레임이 같아야 평균이 유효
+        for pk in pkls[1:]:
+            o = pickle.load(open(pk, "rb"))
+            assert np.allclose(o["T_model_world"].numpy(), smp["T_model_world"].numpy(),
+                               atol=1e-6) and np.allclose(o["bounds"].numpy(),
+                                                          smp["bounds"].numpy(), atol=1e-6), \
+                (f"pkl 간 오브젝트 프레임 불일치: {pk}\n"
+                 "  → make_shaper_input 을 --n_points 만 바꿔 만들면 bounds 가 달라질 수 있습니다.\n"
+                 "     동일 프레임을 쓰려면 같은 --bounds_margin 과 같은 recon 을 쓰고,\n"
+                 "     bounds/center 를 첫 pkl 값으로 맞추세요.")
     bounds = smp["bounds"].numpy()
     scale = float(0.9 / np.max(bounds))                    # dataset 과 동일 규약
     Tmw = smp["T_model_world"].numpy()                     # world → model
