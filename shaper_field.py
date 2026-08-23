@@ -118,13 +118,16 @@ def main():
     F = Fstack.mean(0)
     Fstd = Fstack.std(0) if len(fields) > 1 else None
     if Fstd is not None:
-        # ※ 전체 복셀 σ 중앙값은 포화 영역(멀리) 때문에 항상 0 에 가깝다 —
-        #   의미 있는 값은 '영교차 근방' σ. 여기가 0 이면 샘플이 사실상 동일하다는 뜻.
-        nz = np.abs(F) < 0.05 * np.abs(F).max()
-        smed = float(np.median(Fstd[nz])) if nz.any() else float("nan")
-        agree = (np.sign(Fstack) == np.sign(F)[None]).all(0)
-        print(f"[ensemble] K={len(fields)}  부호 합의 {agree.mean()*100:.1f}%  "
-              f"표면근방 σ 중앙값 {smed:.5f} / 최대 {Fstd.max():.5f} (raw 단위)")
+        # 진단 주의: '평균이 0 근처'인 복셀은 (a) 진짜 표면 (b) 부호가 갈려 상쇄된 곳
+        # 두 가지가 섞인다. (b)만 보면 σ 가 필드 전 범위에 육박해 과대평가되므로,
+        # 표면 근방은 '샘플 각각의 |f|'로 정의하고, 불일치는 물체 부피 대비로 본다.
+        near_any = (np.abs(Fstack) < 0.05 * np.abs(Fstack).max()).any(0)
+        smed = float(np.median(Fstd[near_any])) if near_any.any() else float("nan")
+        disagree = (np.sign(Fstack) != np.sign(F)[None]).any(0)
+        obj = (Fstack < 0).any(0)                       # 어느 샘플이든 내부라고 본 복셀
+        rel = disagree.sum() / max(obj.sum(), 1) * 100
+        print(f"[ensemble] K={len(fields)}  부호 불일치 {disagree.mean()*100:.2f}% "
+              f"(물체 부피 대비 {rel:.0f}%)  표면근방 σ 중앙값 {smed:.5f} raw")
         if smed < 1e-5:
             print("  ⚠ 샘플이 사실상 동일 — 시드가 초기 노이즈에 영향을 못 줍니다.\n"
                   "     서로 다른 pkl(포인트 서브샘플 다름)을 --input_pkl 에 콤마로 넘기세요.")
@@ -164,6 +167,10 @@ def main():
     print(f"[field] G={G} voxel={vox_world*1000:.2f}mm  |∇f| 중앙값={g:.4f} "
           f"→ metric 환산\n        내부 복셀 {(Fm < 0).mean()*100:.2f}%  "
           f"범위 [{Fm.min():.3f}, {Fm.max():.3f}]m")
+    if Fstd is not None:                                   # σ 를 미터로 환산해 해석 가능하게
+        sm_mm = float(np.median((Fstd / g)[near_any])) * 1000 if near_any.any() else float("nan")
+        print(f"        표면근방 σ 중앙값 {sm_mm:.1f}mm "
+              f"(sdf_distill 의 --prior_sigma_ref 기본 50mm 와 비교)")
     if (Fm < 0).mean() < 1e-4:
         print("  ⚠ 내부 복셀이 거의 없음 — 부호가 반대일 수 있습니다(--flip 로 확인)")
 
