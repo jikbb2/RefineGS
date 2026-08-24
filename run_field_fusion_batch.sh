@@ -34,6 +34,10 @@ NPTS=${NPTS:-5000}                             # obj1 A/B 최고치
 GRID=${GRID:-256}
 PHASE=${PHASE:-all}
 ONLY=${ONLY:-}                                 # 예: ONLY="1 6 11" 이면 해당 gid 만
+# GT 라벨 자동 매칭 임계값. SAM3 인스턴스는 데이터셋 semantic id 와 1:1 이 아니라
+# 한 객체가 여러 id 에 걸친다(obj1: id9 81% + id70/18/71/8 각 5%).
+# 기본 0.10 이면 5%대가 전부 탈락 → GT 과소 매칭 → baseline seen acc 4.64mm 가 26mm 로 왜곡.
+MATCH_MIN_SHARE=${MATCH_MIN_SHARE:-0.03}
 
 CSV=${CSV:-${OUT}/_field_batch.csv}
 FAILCSV=${FAILCSV:-${OUT}/_field_batch_failures.csv}
@@ -67,7 +71,7 @@ caption_of() {  # gid → caption
 }
 
 note_fail() { echo "$1,$2,$3" >> "${FAILCSV}"; }
-[ -f "${FAILCSV}" ] || echo "gid,stage,detail" > "${FAILCSV}"
+echo "gid,stage,detail" > "${FAILCSV}"          # 매 실행 초기화(이전 실행 잔여물 혼동 방지)
 
 # 실패 원인이 로그 파일에만 남아 안 보이는 것을 막는다 — 꼬리를 즉시 출력
 show_tail() {
@@ -165,12 +169,14 @@ if [ "${PHASE}" = "fuse" ] || [ "${PHASE}" = "all" ]; then
       --colmap "${COLMAP}" --gid "${gid}" \
       --masks_root "${MASKS}" --use_mask \
       ${STEMS:+$([ -f "${STEMS}" ] && echo --stems "${STEMS}")} \
+      --match_min_share "${MATCH_MIN_SHARE}" \
       --tag "obj${gid}" --csv_all --csv "${CSV}" \
       > "${LOGDIR}/eval_${gid}.log" 2>&1 \
       || { echo "    평가 실패"; note_fail "${gid}" eval "eval_seen_unseen"; \
            show_tail "${LOGDIR}/eval_${gid}.log" 20; ng=$((ng+1)); continue; }
     # GT 라벨 자동 매칭 결과를 요약에 남긴다 (매칭이 나쁘면 지표 해석이 무의미)
-    grep -h "auto-match" "${LOGDIR}/eval_${gid}.log" | sed "s/^/    [${gid}] /"
+    grep -h "auto-match\|채택 라벨\|커버리지 낮음" "${LOGDIR}/eval_${gid}.log" \
+      | sed "s/^/    [${gid}] /"
     ok=$((ok+1))
   done
   echo ""
