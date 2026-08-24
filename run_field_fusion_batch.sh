@@ -69,6 +69,15 @@ caption_of() {  # gid → caption
 note_fail() { echo "$1,$2,$3" >> "${FAILCSV}"; }
 [ -f "${FAILCSV}" ] || echo "gid,stage,detail" > "${FAILCSV}"
 
+# 실패 원인이 로그 파일에만 남아 안 보이는 것을 막는다 — 꼬리를 즉시 출력
+show_tail() {
+  local f=$1 n=${2:-15}
+  [ -f "${f}" ] || { echo "      (로그 없음: ${f})"; return; }
+  echo "      ---- ${f} (마지막 ${n}줄) ----"
+  tail -n "${n}" "${f}" | sed 's/^/      /'
+  echo "      ------------------------------"
+}
+
 # ---------------- PHASE: pkl ----------------
 if [ "${PHASE}" = "pkl" ] || [ "${PHASE}" = "all" ]; then
   echo "=== [1/3] ShapeR 입력 pkl 생성 (n_points=${NPTS}) ==="
@@ -81,8 +90,13 @@ if [ "${PHASE}" = "pkl" ] || [ "${PHASE}" = "all" ]; then
       --recon "${RECON}" --colmap "${COLMAP}" --images "${IMAGES}" \
       --masks_root "${MASKS}" ${STEMS:+$([ -f "${STEMS}" ] && echo --stems "${STEMS}")} \
       --caption "${CAP}" --out "${SHAPER_DIR}/data/obj${gid}.pkl" \
-      > "${LOGDIR}/pkl_${gid}.log" 2>&1 \
-      || { echo "    pkl 실패"; note_fail "${gid}" pkl "make_shaper_input (로그 ${LOGDIR}/pkl_${gid}.log)"; }
+      > "${LOGDIR}/pkl_${gid}.log" 2>&1
+    if [ ! -f "${SHAPER_DIR}/data/obj${gid}.pkl" ]; then
+      echo "    pkl 실패"; note_fail "${gid}" pkl "make_shaper_input"
+      show_tail "${LOGDIR}/pkl_${gid}.log"
+    else
+      grep -h "^\[frame\]\|^\[views\]" "${LOGDIR}/pkl_${gid}.log" | sed 's/^/    /'
+    fi
   done
 fi
 
@@ -101,10 +115,22 @@ if [ "${PHASE}" = "field" ] || [ "${PHASE}" = "all" ]; then
     if [ "${SHAPER_DIRECT}" = "1" ]; then
       bash -c "${CMD}" > "${LOGDIR}/field_${gid}.log" 2>&1
     else
-      conda run -n "${SHAPER_ENV}" --no-capture-output bash -c "${CMD}" \
-        > "${LOGDIR}/field_${gid}.log" 2>&1
+      # conda 를 비대화형 셸에서 쓰려면 conda.sh 를 source 해야 하는 경우가 많다
+      CONDA_BASE=$(conda info --base 2>/dev/null)
+      if [ -n "${CONDA_BASE}" ] && [ -f "${CONDA_BASE}/etc/profile.d/conda.sh" ]; then
+        bash -c "source '${CONDA_BASE}/etc/profile.d/conda.sh' && conda activate '${SHAPER_ENV}' && ${CMD}" \
+          > "${LOGDIR}/field_${gid}.log" 2>&1
+      else
+        conda run -n "${SHAPER_ENV}" bash -c "${CMD}" \
+          > "${LOGDIR}/field_${gid}.log" 2>&1
+      fi
     fi
-    [ -f "${NPZ}" ] || { echo "    field 실패"; note_fail "${gid}" field "shaper_field (로그 ${LOGDIR}/field_${gid}.log)"; }
+    if [ ! -f "${NPZ}" ]; then
+      echo "    field 실패"; note_fail "${gid}" field "shaper_field"
+      show_tail "${LOGDIR}/field_${gid}.log" 20
+    else
+      grep -h "^\[field\]\|^\[ensemble\]" "${LOGDIR}/field_${gid}.log" | sed 's/^/    /'
+    fi
   done
 fi
 
@@ -130,7 +156,8 @@ if [ "${PHASE}" = "fuse" ] || [ "${PHASE}" = "all" ]; then
       --gt_depth_dir "${GTD}" \
       --out "${OUTD}/fused_field.ply" \
       > "${LOGDIR}/fuse_${gid}.log" 2>&1 \
-      || { echo "    융합 실패"; note_fail "${gid}" fuse "sdf_distill (로그 ${LOGDIR}/fuse_${gid}.log)"; ng=$((ng+1)); continue; }
+      || { echo "    융합 실패"; note_fail "${gid}" fuse "sdf_distill"; \
+           show_tail "${LOGDIR}/fuse_${gid}.log" 20; ng=$((ng+1)); continue; }
 
     echo "  [${gid}] 평가 (GT 라벨 자동 매칭)"
     python eval_seen_unseen.py --gt_mesh "${GT_MESH}" \
@@ -140,7 +167,8 @@ if [ "${PHASE}" = "fuse" ] || [ "${PHASE}" = "all" ]; then
       ${STEMS:+$([ -f "${STEMS}" ] && echo --stems "${STEMS}")} \
       --tag "obj${gid}" --csv_all --csv "${CSV}" \
       > "${LOGDIR}/eval_${gid}.log" 2>&1 \
-      || { echo "    평가 실패"; note_fail "${gid}" eval "eval_seen_unseen (로그 ${LOGDIR}/eval_${gid}.log)"; ng=$((ng+1)); continue; }
+      || { echo "    평가 실패"; note_fail "${gid}" eval "eval_seen_unseen"; \
+           show_tail "${LOGDIR}/eval_${gid}.log" 20; ng=$((ng+1)); continue; }
     # GT 라벨 자동 매칭 결과를 요약에 남긴다 (매칭이 나쁘면 지표 해석이 무의미)
     grep -h "auto-match" "${LOGDIR}/eval_${gid}.log" | sed "s/^/    [${gid}] /"
     ok=$((ok+1))
@@ -185,4 +213,7 @@ for k, lab in (("seen_acc", "seen accuracy(mm)"), ("seen_F1.0", "seen F@1cm"),
     print(f"  {lab:>24}: {A:8.3f} → {B:8.3f}  ({B - A:+.3f})")
 PY
 fi
-[ -s "${FAILCSV}" ] && { echo ""; echo "=== 실패 목록 (${FAILCSV}) ==="; column -t -s, "${FAILCSV}"; }
+if [ -s "${FAILCSV}" ] && [ "$(wc -l < "${FAILCSV}")" -gt 1 ]; then
+  echo ""; echo "=== 실패 목록 (${FAILCSV}) ==="
+  awk -F, '{printf "  %-6s %-8s %s\n", $1, $2, $3}' "${FAILCSV}"
+fi
