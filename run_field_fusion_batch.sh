@@ -38,6 +38,10 @@ ONLY=${ONLY:-}                                 # 예: ONLY="1 6 11" 이면 해�
 # 한 객체가 여러 id 에 걸친다(obj1: id9 81% + id70/18/71/8 각 5%).
 # 기본 0.10 이면 5%대가 전부 탈락 → GT 과소 매칭 → baseline seen acc 4.64mm 가 26mm 로 왜곡.
 MATCH_MIN_SHARE=${MATCH_MIN_SHARE:-0.03}
+# prior 적용 게이트: 생성 '표면' 중 unknown 비율이 이 값 미만이면 prior 미적용.
+# 이미 충분히 관측된 객체(배치 실측 obj16/28/10)에서 prior 가 손해만 보는 것을 막는다.
+MIN_UNKNOWN_FRAC=${MIN_UNKNOWN_FRAC:-0.20}
+FREE_MIN_VIEWS=${FREE_MIN_VIEWS:-2}
 
 CSV=${CSV:-${OUT}/_field_batch.csv}
 FAILCSV=${FAILCSV:-${OUT}/_field_batch_failures.csv}
@@ -150,12 +154,14 @@ if [ "${PHASE}" = "fuse" ] || [ "${PHASE}" = "all" ]; then
     STEMS=${STEMS_DIR}/${gid}.txt
     [ -f "${NPZ}" ] || { echo "  [skip ${gid}] 필드 없음"; note_fail "${gid}" fuse "필드 없음"; ng=$((ng+1)); continue; }
 
-    echo "  [${gid}] 융합"
+    # 융합은 객체당 수 분~십수 분. 진행 상황은 로그로만 보이므로 경로를 안내한다
+    echo "  [${gid}] 융합  (진행: tail -f ${LOGDIR}/fuse_${gid}.log)"
     python sdf_distill_depth.py -m "${MDIR}" --iteration ${ITER} \
       --data_device cpu --mask_dir auto --require_mask --mask_dist 0 \
       --prior_field "${NPZ}" --prior_sigma_w 0 \
       --grid_fuse --alpha_smooth 1.0 --color_blend_ramp 0.05 \
-      --prior_carve_views 150 --free_min_views 2 --num_cluster 10000 \
+      --prior_carve_views 150 --free_min_views "${FREE_MIN_VIEWS}" --num_cluster 10000 \
+      --min_unknown_frac "${MIN_UNKNOWN_FRAC}" \
       --voxel_size 0.005 --max_grid 512 --keep_connected \
       --gt_depth_dir "${GTD}" \
       --out "${OUTD}/fused_field.ply" \
