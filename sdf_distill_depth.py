@@ -788,13 +788,23 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
     if getattr(args, "debug_class_ply", ""):
         # --prior_field 경로에는 메쉬가 없으므로 필드의 영교차 복셀에서 직접 점을 만든다
         if debug_pts is None:
-            sel = np.argwhere(np.abs(SG) < 1.5 * (2 * scale / (G - 1)))
-            if len(sel) == 0:
-                sel = np.argwhere(SG < 0)
-            if len(sel) > 300000:
-                sel = sel[np.random.choice(len(sel), 300000, replace=False)]
-            debug_pts = (sel.astype(np.float64) * step - 1.0) * scale + center
-            print(f"[debug] prior 표면 복셀에서 점군 생성 {len(debug_pts)}개")
+            # 필드의 zero-level 을 marching cubes 로 직접 뽑는다.
+            # (|SG|<임계 방식은 필드 스케일에 민감해, 값이 작은 필드에서 그리드 전체가
+            #  선택되어 통짜 큐브가 나오는 문제가 있었다)
+            if SG.min() < 0 < SG.max():
+                dv, _, _, _ = marching_cubes(SG, level=0.0, spacing=(step,) * 3)
+                debug_pts = (dv - 1.0) * scale + center
+                if len(debug_pts) > 300000:
+                    debug_pts = debug_pts[np.random.choice(len(debug_pts), 300000,
+                                                           replace=False)]
+                print(f"[debug] prior zero-level 에서 점군 {len(debug_pts)}개 "
+                      f"(SG 범위 [{SG.min():.4f}, {SG.max():.4f}])")
+            else:
+                print(f"  ⚠ [debug] prior 필드에 영교차가 없음 "
+                      f"(SG 범위 [{SG.min():.4f}, {SG.max():.4f}]) — "
+                      f"필드 생성 실패 또는 게이트로 비활성화됨. 점군 생략")
+                debug_pts = np.zeros((0, 3))
+    if getattr(args, "debug_class_ply", "") and len(debug_pts):
         idx = np.clip(np.round(((debug_pts - center) / scale + 1) / step), 0, G - 1).astype(int)
         i, j, k = idx[:, 0], idx[:, 1], idx[:, 2]
         cls = np.zeros(len(debug_pts), int)
@@ -858,6 +868,9 @@ def main():
     parser.add_argument("--prior_field", default="", type=str,
                         help="[권장] ShapeR 부호 SDF 그리드 npz(shaper_field.py 출력). "
                              "메쉬를 거치지 않아 sign-fix/shell_delta/정합이 모두 불필요")
+    parser.add_argument("--prior_field_rescale", default=1, type=int,
+                        help="prior 필드의 포화값을 --prior_trunc 에 맞춰 정규화(1=on). "
+                             "carve 경계 급점프로 생기는 가짜 표면 방지. 영교차는 불변")
     parser.add_argument("--prior_sigma_w", default=1.0, type=float,
                         help="앙상블 σ 가중 강도(0=off). 클수록 시드가 갈리는 곳의 생성을 "
                              "적극 억제 — precision↑ recall↓")
@@ -1111,7 +1124,20 @@ def main():
         Gf = Ffield.shape[0]
         print(f"[prior-field] {os.path.basename(args.prior_field)}  G={Gf}  "
               f"voxel={float(z['vox_world'])*1000:.2f}mm  "
-              f"내부 {(Ffield < 0).mean()*100:.2f}%")
+              f"내부 {(Ffield < 0).mean()*100:.2f}%  "
+              f"범위 [{Ffield.min():.4f}, {Ffield.max():.4f}]m")
+
+        # [truncation 정규화] 디코더 출력은 객체마다 다른 값에서 포화한다(obj1 ±27mm,
+        # obj20 ±6mm). 그런데 융합은 carve 복셀을 +prior_trunc(50mm)로 채우므로,
+        # 포화값이 작을수록 carve 경계에서 필드가 급점프하고 스무딩이 그 구간에
+        # **인위적 영교차**(가짜 표면)를 만든다. 영교차 위치는 스케일링에 불변이므로
+        # 포화값을 prior_trunc 에 맞춰 두 필드를 commensurate 하게 만든다.
+        if args.prior_field_rescale:
+            sat = float(np.percentile(np.abs(Ffield), 99.5))
+            if sat > 1e-9 and abs(sat - args.prior_trunc) / args.prior_trunc > 0.2:
+                Ffield = (Ffield * (args.prior_trunc / sat)).astype(np.float32)
+                print(f"  → truncation 정규화: 포화 {sat*1000:.1f}mm → "
+                      f"{args.prior_trunc*1000:.0f}mm (×{args.prior_trunc/sat:.2f})")
         args.prior_watertight = True          # sign-fix 비활성(이미 signed)
 
         # [앙상블 σ 가중] 50% 이상 미관측이면 정답이 하나가 아니다. 여러 시드가 동의하는
