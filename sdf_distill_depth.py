@@ -785,14 +785,25 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
 
     # [debug] 생성 표면 샘플의 분류 시각화 — 다리가 왜 잘리는지 눈으로 판별:
     # 초록=unknown(생성 유지), 파랑=관측 지배, 노랑=타객체, 빨강=free-carve
-    if debug_pts is not None and getattr(args, "debug_class_ply", ""):
+    if getattr(args, "debug_class_ply", ""):
+        # --prior_field 경로에는 메쉬가 없으므로 필드의 영교차 복셀에서 직접 점을 만든다
+        if debug_pts is None:
+            sel = np.argwhere(np.abs(SG) < 1.5 * (2 * scale / (G - 1)))
+            if len(sel) == 0:
+                sel = np.argwhere(SG < 0)
+            if len(sel) > 300000:
+                sel = sel[np.random.choice(len(sel), 300000, replace=False)]
+            debug_pts = (sel.astype(np.float64) * step - 1.0) * scale + center
+            print(f"[debug] prior 표면 복셀에서 점군 생성 {len(debug_pts)}개")
         idx = np.clip(np.round(((debug_pts - center) / scale + 1) / step), 0, G - 1).astype(int)
         i, j, k = idx[:, 0], idx[:, 1], idx[:, 2]
         cls = np.zeros(len(debug_pts), int)
+        cls[~HULL[i, j, k]] = 4                      # hull 밖(마스크 원뿔 위반)
         cls[FREE[i, j, k]] = 3
         cls[OTH[i, j, k] & ~FREE[i, j, k]] = 2
         cls[alpha[i, j, k] > 0.5] = 1
-        pal = np.array([[0.1, 0.8, 0.1], [0.2, 0.4, 1.0], [1.0, 0.8, 0.1], [1.0, 0.15, 0.15]])
+        pal = np.array([[0.1, 0.8, 0.1], [0.2, 0.4, 1.0], [1.0, 0.8, 0.1],
+                        [1.0, 0.15, 0.15], [0.7, 0.1, 0.9]])
         pc = o3d.geometry.PointCloud()
         pc.points = o3d.utility.Vector3dVector(debug_pts)
         pc.colors = o3d.utility.Vector3dVector(pal[cls])
@@ -801,8 +812,8 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
         o3d.io.write_point_cloud(dp, pc)
         print(f"[debug] 분류 점군: {dp}  keep {(cls == 0).mean()*100:.0f}%  "
               f"obs {(cls == 1).mean()*100:.0f}%  oth {(cls == 2).mean()*100:.0f}%  "
-              f"free {(cls == 3).mean()*100:.0f}%  "
-              f"(초록=유지, 파랑=관측, 노랑=타객체, 빨강=carve)")
+              f"free {(cls == 3).mean()*100:.0f}%  hull밖 {(cls == 4).mean()*100:.0f}%  "
+              f"(초록=유지, 파랑=관측, 노랑=타객체, 빨강=carve, 보라=hull밖)")
     return verts, faces
 
 
