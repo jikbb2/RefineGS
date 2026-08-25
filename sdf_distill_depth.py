@@ -542,6 +542,8 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
     FRc = np.zeros((G, G, G), np.uint16)      # 관측된 빈 공간 '투표 수'(합의제)
     VOb = np.zeros((G, G, G), np.uint16)      # 씬 표면 근방 'obj6' 투표
     VOt = np.zeros((G, G, G), np.uint16)      # 씬 표면 근방 '타 객체' 투표
+    NFR = np.zeros((G, G, G), np.uint16)      # [visual hull] 시야에 든 뷰 수
+    NIN = np.zeros((G, G, G), np.uint16)      # [visual hull] 객체 마스크 안으로 투영된 뷰 수
     SG = np.empty((G, G, G), np.float32)      # 생성 SDF (truncated)
     for k0 in range(0, G, 8):
         k1 = min(k0 + 8, G)
@@ -551,6 +553,7 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
         f = np.zeros(len(Xw), np.float32); w = np.zeros(len(Xw), np.float32)
         fr = np.zeros(len(Xw), np.uint16)
         vo = np.zeros(len(Xw), np.uint16); vt = np.zeros(len(Xw), np.uint16)
+        nfr = np.zeros(len(Xw), np.uint16); nin = np.zeros(len(Xw), np.uint16)
         for b in VB:
             Xc = Xw @ b["R"].T + b["t"]; z = Xc[:, 2]; zz = np.maximum(z, 1e-6)
             u = b["fx"] * Xc[:, 0] / zz + b["cx"]
@@ -559,6 +562,11 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
             ui = np.clip(u, 0, b["W"] - 1).astype(int)
             vi = np.clip(v, 0, b["H"] - 1).astype(int)
             di = b["depth"][vi, ui]; mi = b["mask"][vi, ui]
+            # [visual hull] 마스크 원뿔의 교집합 — 가림 판정 불필요.
+            # 바닥/인접 객체 위 복셀은 대부분의 뷰에서 객체 마스크 밖으로 투영되어 배제되고,
+            # 객체 뒷면(미관측)은 마스크 안이라 보존된다.
+            nfr += infr.astype(np.uint16)
+            nin += (infr & mi).astype(np.uint16)
             sdf = di - z                                   # 양수 = 관측 표면 앞(밖)
             hit = infr & mi & (di > 0) & (sdf > -trunc)    # 표면 뒤 trunc 초과는 미적용(occlusion)
             f[hit] += np.clip(sdf[hit], -trunc, trunc); w[hit] += 1
@@ -581,6 +589,7 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
         Fo[:, :, k0:k1] += f.reshape(sh); Wo[:, :, k0:k1] += w.reshape(sh)
         FRc[:, :, k0:k1] += fr.reshape(sh)
         VOb[:, :, k0:k1] += vo.reshape(sh); VOt[:, :, k0:k1] += vt.reshape(sh)
+        NFR[:, :, k0:k1] += nfr.reshape(sh); NIN[:, :, k0:k1] += nin.reshape(sh)
         if (k0 // 8) % 8 == 0:
             print(f"  [grid-fuse] slab {k0}/{G}")
     Fobs = Fo / np.maximum(Wo, 1e-6)
@@ -678,6 +687,17 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
             SG = _fix_sign(SG)                             # 재계산된 SG 도 부호 복원
         debug_pts = (((pn_all - c0) * s_) @ R_.T + c0 + res.x[3:6]) * scale + center
 
+    # [visual hull] prior 를 객체 자신의 마스크 원뿔 교집합 안으로 제한.
+    # carve 는 '관측 표면보다 앞'만 지우므로, 생성 기하가 바닥이나 인접 객체 '속'으로
+    # 파고들면 살아남아 seen accuracy 가 폭발한다(배치 실측: obj20 2.1→107mm).
+    # hull 은 가림 판정 없이 이를 차단한다.
+    HULL = np.ones((G, G, G), bool)
+    if args.hull_min_frac > 0:
+        HULL = (NIN >= args.hull_min_frac * np.maximum(NFR, 1)) & (NFR >= args.hull_min_views)
+        print(f"[hull] 마스크 원뿔 통과 {HULL.mean()*100:.1f}%  "
+              f"(frac≥{args.hull_min_frac}, 최소 {args.hull_min_views}뷰)  "
+              f"→ 생성 표면 중 hull 밖 {(np.abs(SG) < 2*2*scale/(G-1))[~HULL].mean()*100 if (~HULL).any() else 0:.1f}% 제거")
+
     # [적용 게이트] 미관측이 거의 없는 객체에는 prior 가 얻을 게 없고 잃기만 한다
     # (배치 실측: baseline unseen completion 15mm 대 객체들에서 unseen F@2cm 이 0.68→0.21 로 붕괴).
     # 판정은 GT 없이 — '생성 **표면** 중 unknown 에 놓인 비율'.
@@ -693,7 +713,8 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
         print("  → 미관측이 충분치 않음: prior 미적용(관측만으로 재구성)")
         SG = np.full_like(SG, trunc)
 
-    base = np.where(FREE | OTH, trunc, SG)                 # 빈공간/타객체=+trunc, 미관측=생성
+    # 빈공간/타객체/hull 밖 = +trunc, 미관측 ∩ hull = 생성
+    base = np.where(FREE | OTH | ~HULL, trunc, SG)
     F = alpha * Fobs + (1 - alpha) * base                  # 우선순위 블렌드
 
     # [opening] 미관측 영역의 '뾰족한 돌출' 제거. 소파 뒷면처럼 어떤 카메라도 관통해
@@ -899,6 +920,12 @@ def main():
     parser.add_argument("--color_blend_ramp", default=0.05, type=float,
                         help="접합부 색 블렌드 거리(m) — 관측면에서 이 거리까지 관측색으로 "
                              "가중 혼합. 0=off")
+    parser.add_argument("--hull_min_frac", default=0.6, type=float,
+                        help="[visual hull] 시야에 든 뷰 중 객체 마스크 안으로 투영된 비율이 "
+                             "이 값 이상인 복셀에만 prior 허용. 0=off. 생성 기하가 바닥·인접 "
+                             "객체로 새는 것을 차단")
+    parser.add_argument("--hull_min_views", default=5, type=int,
+                        help="hull 판정에 필요한 최소 시야 뷰 수(증거 부족 복셀 배제)")
     parser.add_argument("--view_stride", default=1, type=int,
                         help="[속도] 학습 뷰를 이 간격으로만 사용(back-project/carve 비용 ∝ 뷰 수). "
                              "관측 점군은 어차피 서브샘플되므로 2~4 는 손실이 작다")
