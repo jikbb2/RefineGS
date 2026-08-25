@@ -27,6 +27,7 @@ RefineGS repo 루트(render.py 옆)에 두고 실행:
 """
 import os
 import copy
+import time
 import numpy as np
 import torch
 import torch.nn as nn
@@ -283,7 +284,12 @@ def collect_oriented_points(scene, gaussians, pipe, background, args, mask_dir=N
     require_mask: 마스크 없는 학습 뷰는 통째로 skip (composed 200뷰 모델 + 객체 마스크 8뷰 케이스).
     extra_cams: 추가 novel 카메라(MiniCam) — 마스크 미적용(ROI crop으로 제한 권장).
                 See3D 정제된 unseen은 orbit 포즈에서만 보이므로 추출에 필수."""
-    views = [(c, True) for c in scene.getTrainCameras()]
+    # [속도] 학습 뷰가 수천 장이면 back-project 가 지배적 비용이 된다. 관측 점군은
+    # --pts_per_view/--n_pts 로 어차피 서브샘플되므로 뷰를 성기게 써도 손실이 작다.
+    _stride = max(1, int(getattr(args, "view_stride", 1)))
+    views = [(c, True) for c in scene.getTrainCameras()[::_stride]]
+    if _stride > 1:
+        print(f"[속도] view_stride={_stride} → 학습뷰 {len(views)}장 사용")
     if extra_cams:
         views += [(c, False) for c in extra_cams]
     P_all, N_all, C_all, O_all = [], [], [], []
@@ -893,6 +899,9 @@ def main():
     parser.add_argument("--color_blend_ramp", default=0.05, type=float,
                         help="접합부 색 블렌드 거리(m) — 관측면에서 이 거리까지 관측색으로 "
                              "가중 혼합. 0=off")
+    parser.add_argument("--view_stride", default=1, type=int,
+                        help="[속도] 학습 뷰를 이 간격으로만 사용(back-project/carve 비용 ∝ 뷰 수). "
+                             "관측 점군은 어차피 서브샘플되므로 2~4 는 손실이 작다")
     parser.add_argument("--min_unknown_frac", default=0.10, type=float,
                         help="[적용 게이트] 생성 내부 부피 중 unknown 비율이 이 값 미만이면 "
                              "prior 를 쓰지 않는다(이미 충분히 관측된 객체). 0=항상 적용")
@@ -924,10 +933,19 @@ def main():
     parser.add_argument("--out", default="", type=str)
     args = get_combined_args(parser)
 
+    _T0 = time.time(); _tk = _T0
+
+    def _lap(msg):
+        now = time.time()
+        print(f"[time] {msg}: {now - _lap.prev:.1f}s (누적 {now - _T0:.1f}s)", flush=True)
+        _lap.prev = now
+    _lap.prev = _tk
+
     dataset = model.extract(args)
     pipe = pipeline.extract(args)
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians, load_iteration=args.iteration, shuffle=False)
+    _lap(f"Scene 로드 (학습뷰 {len(scene.getTrainCameras())}장)")
     gaussians.active_sh_degree = 0  # diffuse만(테xture) — render.py mesh 경로와 동일
     bg = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg, dtype=torch.float32, device="cuda")
@@ -968,6 +986,7 @@ def main():
                                                      require_mask=args.require_mask,
                                                      extra_cams=extra_cams,
                                                      extra_masks=extra_masks)
+    _lap("뷰별 depth back-project")
     print(f"표면점 {len(P)} (관측 back-projected)")
     if len(P) < 1000:
         raise SystemExit(f"[중단] 유효 표면점 {len(P)}개 — 마스크 값 규약 또는 alpha_thr 확인 필요. "
@@ -1249,6 +1268,7 @@ def main():
         assert _sd is not None, "--grid_fuse 는 --prior_field 또는 --prior_mesh 필요"
         assert VB, "--grid_fuse 는 뷰 버퍼 필요 (--prior_carve_views > 0, mask_dir 필수)"
         verts, faces = grid_fuse_tsdf(VB, _sd, center, scale, args, debug_pts=prior_dbg)
+        _lap("grid_fuse (TSDF 적분 + carve + marching cubes)")
     else:
         print("IGR SDF 학습 ...")
         net = train_sdf(Pn, N, On, EOn, ED, args, CV=CV, W=Wp, OBS=OBS, PV=PV, PS=PS)
