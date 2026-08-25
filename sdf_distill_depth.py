@@ -672,6 +672,21 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
             SG = _fix_sign(SG)                             # 재계산된 SG 도 부호 복원
         debug_pts = (((pn_all - c0) * s_) @ R_.T + c0 + res.x[3:6]) * scale + center
 
+    # [적용 게이트] 미관측이 거의 없는 객체에는 prior 가 얻을 게 없고 잃기만 한다
+    # (배치 실측: baseline unseen completion 15mm 대 객체들에서 unseen F@2cm 이 0.68→0.21 로 붕괴).
+    # 판정은 GT 없이 — '생성 **표면** 중 unknown 에 놓인 비율'.
+    # ※ 내부 부피로 재면 안 된다: 물체 내부는 어떤 경우에도 미관측이라 완전 관측 객체도
+    #   높게 나온다(구 검증: 완전 관측 67% vs 절반 미관측 91% — 변별력 없음).
+    vox_g = 2 * scale / (G - 1)
+    prior_surf = np.abs(SG) < 1.5 * vox_g
+    unknown = (alpha < 0.25) & ~FREE & ~OTH
+    ufrac = float((prior_surf & unknown).sum()) / max(int(prior_surf.sum()), 1)
+    print(f"[gate] 생성 표면 중 unknown 비율 {ufrac*100:.1f}% "
+          f"(임계 {args.min_unknown_frac*100:.0f}%)")
+    if ufrac < args.min_unknown_frac:
+        print("  → 미관측이 충분치 않음: prior 미적용(관측만으로 재구성)")
+        SG = np.full_like(SG, trunc)
+
     base = np.where(FREE | OTH, trunc, SG)                 # 빈공간/타객체=+trunc, 미관측=생성
     F = alpha * Fobs + (1 - alpha) * base                  # 우선순위 블렌드
 
@@ -878,6 +893,9 @@ def main():
     parser.add_argument("--color_blend_ramp", default=0.05, type=float,
                         help="접합부 색 블렌드 거리(m) — 관측면에서 이 거리까지 관측색으로 "
                              "가중 혼합. 0=off")
+    parser.add_argument("--min_unknown_frac", default=0.10, type=float,
+                        help="[적용 게이트] 생성 내부 부피 중 unknown 비율이 이 값 미만이면 "
+                             "prior 를 쓰지 않는다(이미 충분히 관측된 객체). 0=항상 적용")
     parser.add_argument("--keep_connected", action="store_true",
                         help="최종 음수 볼륨 중 관측 복셀과 연결된 성분만 유지 — "
                              "통짜 생성 prior 의 타 객체 잔해 제거(배치에서 권장)")
