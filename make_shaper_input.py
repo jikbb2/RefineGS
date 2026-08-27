@@ -67,6 +67,59 @@ def load_mask(masks_root, gid, stem):
     return a > 127
 
 
+def load_depth_map(depth_dir, stem, scale):
+    """stem → depth(meters). 이름 규약: frameNNNN→depthNNNN / 동일이름 / _depth."""
+    for c in (stem.replace("frame", "depth"), stem, stem + "_depth"):
+        for ext in (".png", ".npy"):
+            p = os.path.join(os.path.expanduser(depth_dir), c + ext)
+            if not os.path.exists(p):
+                continue
+            if ext == ".npy":
+                return np.load(p).astype(np.float32)
+            return np.array(Image.open(p)).astype(np.float32) / scale
+    return None
+
+
+def filter_observed(P_w, stems, cams, args):
+    """관측이 확인된 점만 남긴다.
+
+    ShapeR 는 포인트를 geometric anchor 로 '충실히' 따른다. 그런데 recon(fuse_post.ply)
+    은 미관측 영역에 부정확한 덩어리·floater 를 갖고 있어, 그대로 주면 생성물이 그
+    퍼진 형태를 재현한다(obj6: 다리가 성긴 그물로 생성됨).
+    → 각 점이 '어느 뷰에서 실제로 관측된 표면'인지(|z-depth|<margin, 마스크 안) 검사해
+      확인된 점만 조건으로 준다. 미관측 영역은 점 없음 = 모델이 자유롭게 추론.
+    """
+    n_seen = np.zeros(len(P_w), np.int32)
+    n_dep = 0
+    for s in stems:
+        D = load_depth_map(args.depth_dir, s, args.depth_scale)
+        if D is None:
+            continue
+        n_dep += 1
+        c = cams[s]
+        Hd, Wd = D.shape
+        sx, sy = Wd / c["W"], Hd / c["H"]
+        Xc = P_w @ c["R"].T + c["t"]
+        z = Xc[:, 2]
+        zz = np.maximum(z, 1e-6)
+        u = (c["fx"] * Xc[:, 0] / zz + c["cx"]) * sx
+        v = (c["fy"] * Xc[:, 1] / zz + c["cy"]) * sy
+        ok = (z > 0.05) & (u >= 0) & (u < Wd) & (v >= 0) & (v < Hd)
+        if not ok.any():
+            continue
+        ui = np.clip(u, 0, Wd - 1).astype(int); vi = np.clip(v, 0, Hd - 1).astype(int)
+        d = D[vi, ui]
+        n_seen += (ok & (d > 0.01) & (np.abs(z - d) < args.seen_margin)).astype(np.int32)
+    keep = n_seen >= args.seen_min_views
+    print(f"[filter] 관측 확인 점 {int(keep.sum())}/{len(P_w)} "
+          f"({keep.mean()*100:.1f}%)  depth 뷰 {n_dep}, "
+          f"기준 |z-d|<{args.seen_margin*1000:.0f}mm 이 {args.seen_min_views}뷰 이상")
+    if keep.sum() < 200:
+        print("  ⚠ 남은 점이 너무 적음 — depth 경로/스케일 확인. 필터 미적용")
+        return P_w
+    return P_w[keep]
+
+
 def find_image(images_dir, stem):
     for ext in (".jpg", ".jpeg", ".png", ".JPG", ".PNG"):
         p = os.path.join(images_dir, stem + ext)
@@ -98,6 +151,14 @@ def main():
     ap.add_argument("--img_max_side", type=int, default=640,
                     help="이미지 다운스케일 긴 변(ShapeR 추론은 280px 라 큰 해상도 무의미)")
     ap.add_argument("--gt_mesh", default="", help="선택: GT 메쉬(평가용)")
+    ap.add_argument("--depth_dir", default="",
+                    help="[관측 필터] depth 폴더. 지정 시 '관측이 확인된 점'만 조건으로 준다 — "
+                         "recon 의 미관측 영역 쓰레기가 생성물을 오염시키는 것을 막는다")
+    ap.add_argument("--depth_scale", type=float, default=6553.5)
+    ap.add_argument("--seen_margin", type=float, default=0.02,
+                    help="관측 판정 허용오차(m): |z - depth| < margin")
+    ap.add_argument("--seen_min_views", type=int, default=2,
+                    help="관측 판정 최소 뷰 수")
     args = ap.parse_args()
 
     assert read_colmap is not None, "warp_gt_to_pose 임포트 실패 — RefineGS 루트에서 실행하세요"
@@ -122,13 +183,8 @@ def main():
         ax = {"x": 0, "y": 1}[args.world_up]
         perm = [0, 1, 2]; perm[ax], perm[2] = perm[2], perm[ax]
         R_align = np.eye(3)[perm]
-    P_m = (R_align @ (P_w - center).T).T
     bounds = np.abs((R_align @ (V_w - center).T).T).max(0) * args.bounds_margin
     scale = 0.9 / bounds.max()
-    clipped = int((np.abs(P_m * scale) > 1.0).any(1).sum())
-    print(f"[frame] center={np.round(center,3)}  half-extent={np.round(bounds,3)}m  "
-          f"scale={scale:.3f}  (정규화 후 클리핑될 점 {clipped})")
-
     T_model_world = np.eye(4)                          # world → model
     T_model_world[:3, :3] = R_align
     T_model_world[:3, 3] = -R_align @ center
@@ -141,6 +197,14 @@ def main():
         stems = sorted(cams)
     stems = [s for s in stems if s in cams and find_image(args.images, s)]
     assert stems, "사용 가능한 뷰 없음 — --images / --stems 확인"
+
+    # ---- 2b) 관측 필터 (프레임은 메쉬 정점 기준이라 필터와 무관하게 고정) ----
+    if args.depth_dir:
+        P_w = filter_observed(P_w, stems, cams, args)
+    P_m = (R_align @ (P_w - center).T).T
+    clipped = int((np.abs(P_m * scale) > 1.0).any(1).sum())
+    print(f"[frame] center={np.round(center,3)}  half-extent={np.round(bounds,3)}m  "
+          f"scale={scale:.3f}  (정규화 후 클리핑될 점 {clipped})")
     if len(stems) > args.n_views:                      # 균등 간격 서브샘플
         idx = np.unique(np.linspace(0, len(stems) - 1, args.n_views).round().astype(int))
         stems = [stems[i] for i in idx]
