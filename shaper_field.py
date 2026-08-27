@@ -43,7 +43,8 @@ preset_configs = {"quality": (16, 4, 50), "speed": (4, 2, 10), "balance": (16, 4
 
 
 def infer_latents_guided(model, batch, token_shape, tfe, num_steps, cfg_value,
-                         use_shifted, core, obs_n, guide_w, guide_every, guide_t0):
+                         use_shifted, core, obs_n, guide_w, guide_every, guide_t0,
+                         free_n=None, guide_free_w=0.0):
     """관측 구속을 넣은 flow matching 샘플링 (infer_latents 의 커스텀 대체).
 
     왜: ShapeR 는 포인트를 조건으로만 받을 뿐, 생성 결과가 관측점을 실제로 지나간다는
@@ -63,25 +64,35 @@ def infer_latents_guided(model, batch, token_shape, tfe, num_steps, cfg_value,
         T = torch.linspace(0, 1, num_steps, device=dev)
     vm = WrappedModel(model, batch, tfe, None, cfg_value=cfg_value)
     x = model.get_x0_from_input(batch, token_shape=token_shape)
-    q = torch.from_numpy(np.asarray(obs_n, np.float32)).to(dev)
+    q = (torch.from_numpy(np.asarray(obs_n, np.float32)).to(dev)
+         if obs_n is not None and len(obs_n) else None)
+    qf = (torch.from_numpy(np.asarray(free_n, np.float32)).to(dev)
+          if free_n is not None and len(free_n) else None)
+    on = (guide_w > 0 and q is not None) or (guide_free_w > 0 and qf is not None)
 
     n_g = 0
     for i in tqdm(range(len(T) - 1), desc="guided sampling"):
         t, tn = T[i], T[i + 1]
         v = vm(x=x, t=t)
-        if guide_w > 0 and float(t) >= guide_t0 and (i % max(1, guide_every) == 0):
+        if on and float(t) >= guide_t0 and (i % max(1, guide_every) == 0):
             with torch.enable_grad():
                 x1 = (x + (1.0 - t) * v).detach().requires_grad_(True)
                 lat = core.decode(x1)
-                f = core.query(q[None].to(lat.dtype), lat)
-                loss = (f.float() ** 2).mean()
+                loss = 0.0
+                if guide_w > 0 and q is not None:      # 관측점: 표면 위 → f = 0
+                    loss = loss + guide_w * (
+                        core.query(q[None].to(lat.dtype), lat).float() ** 2).mean()
+                if guide_free_w > 0 and qf is not None:  # 빈 공간: 밖 → f ≥ 0
+                    loss = loss + guide_free_w * torch.relu(
+                        -core.query(qf[None].to(lat.dtype), lat).float()).mean()
                 g, = torch.autograd.grad(loss, x1)
-            v = v - guide_w * g.to(v.dtype)
+            v = v - g.to(v.dtype)
             n_g += 1
         x = x + (tn - t) * v
-    if guide_w > 0:
-        print(f"  [guide] 관측 구속 적용 {n_g}/{len(T)-1} 스텝 "
-              f"(w={guide_w}, t≥{guide_t0}, 관측점 {len(q)})")
+    if on:
+        print(f"  [guide] 구속 적용 {n_g}/{len(T)-1} 스텝  "
+              f"obs(w={guide_w}, {0 if q is None else len(q)}점) / "
+              f"free(w={guide_free_w}, {0 if qf is None else len(qf)}점), t≥{guide_t0}")
     return x
 
 
@@ -107,6 +118,10 @@ def main():
     ap.add_argument("--guide_w", type=float, default=0.0,
                     help="관측 구속 강도(0=off). 매 스텝 x̂₁ 을 디코딩해 관측점에서 "
                          "필드가 0 이 되도록 그래디언트 주입. 0.5~5 부터 시도")
+    ap.add_argument("--guide_free_w", type=float, default=0.0,
+                    help="free-space 구속 강도(0=off). pkl 의 free_points_model 에서 "
+                         "필드가 음수(내부)가 되지 않도록 벌점 → 다리 밑 등 '관측된 빈 공간'의 "
+                         "할루시네이션을 생성 단계에서 차단")
     ap.add_argument("--guide_every", type=int, default=1, help="관측 구속 적용 간격(스텝)")
     ap.add_argument("--guide_t0", type=float, default=0.3,
                     help="이 시각 이후에만 구속 적용(초반 저노이즈 구간은 형상이 없어 무의미)")
@@ -158,23 +173,34 @@ def main():
             batch = InferenceDataset.move_batch_to_device(batch, device,
                                                           dtype=torch.bfloat16)
             # 관측 구속용 점(정규화 좌표) — dataset 과 동일 규약으로 pkl 에서 가져온다
-            obs_n = None
-            if args.guide_w > 0:
+            obs_n = free_n = None
+            if args.guide_w > 0 or args.guide_free_w > 0:
                 _s = pickle.load(open(pk, "rb"))
                 _sc = float(0.9 / np.max(_s["bounds"].numpy()))
-                _p = _s["points_model"].numpy()[:, :3] * _sc
-                obs_n = _p[np.all(np.abs(_p) <= 1.0, axis=-1)]
-                if len(obs_n) > 8192:
-                    obs_n = obs_n[np.random.default_rng(0).choice(len(obs_n), 8192,
-                                                                  replace=False)]
+                _rng = np.random.default_rng(0)
+
+                def _norm(key, cap=8192):
+                    if key not in _s:
+                        return None
+                    p = _s[key].numpy()[:, :3] * _sc
+                    p = p[np.all(np.abs(p) <= 1.0, axis=-1)]
+                    if len(p) > cap:
+                        p = p[_rng.choice(len(p), cap, replace=False)]
+                    return p if len(p) else None
+
+                obs_n = _norm("points_model")
+                free_n = _norm("free_points_model")
+                if args.guide_free_w > 0 and free_n is None:
+                    print("  ⚠ pkl 에 free_points_model 없음 — make_shaper_input 을 "
+                          "--depth_dir 와 --free_points 로 다시 생성하세요")
             for k in range(K):
                 torch.manual_seed(args.seed + k)           # flow matching 초기 노이즈
                 np.random.seed(args.seed + k)
-                if args.guide_w > 0:
+                if args.guide_w > 0 or args.guide_free_w > 0:
                     kl = infer_latents_guided(
                         model, batch, token_shape, tfe, num_steps, args.cfg,
                         use_shifted, core, obs_n, args.guide_w, args.guide_every,
-                        args.guide_t0)
+                        args.guide_t0, free_n=free_n, guide_free_w=args.guide_free_w)
                 else:
                     kl = model.infer_latents(batch, token_shape=token_shape,
                                              text_feature_extractor=tfe,

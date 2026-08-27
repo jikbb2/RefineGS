@@ -90,12 +90,17 @@ def filter_observed(P_w, stems, cams, args):
       확인된 점만 조건으로 준다. 미관측 영역은 점 없음 = 모델이 자유롭게 추론.
     """
     n_seen = np.zeros(len(P_w), np.int32)
-    n_dep = 0
+    n_dep = n_msk = 0
     for s in stems:
         D = load_depth_map(args.depth_dir, s, args.depth_scale)
         if D is None:
             continue
         n_dep += 1
+        # 마스크도 함께 봐야 한다 — depth 일치만 보면 바닥·인접 객체 표면 위의 점도
+        # '관측됨'으로 통과해 버린다(그 점들이 생성물을 오염시킨다)
+        M = load_mask(args.masks_root, args.gid, s) if args.masks_root else None
+        if M is not None:
+            n_msk += 1
         c = cams[s]
         Hd, Wd = D.shape
         sx, sy = Wd / c["W"], Hd / c["H"]
@@ -109,15 +114,65 @@ def filter_observed(P_w, stems, cams, args):
             continue
         ui = np.clip(u, 0, Wd - 1).astype(int); vi = np.clip(v, 0, Hd - 1).astype(int)
         d = D[vi, ui]
-        n_seen += (ok & (d > 0.01) & (np.abs(z - d) < args.seen_margin)).astype(np.int32)
+        hit = ok & (d > 0.01) & (np.abs(z - d) < args.seen_margin)
+        if M is not None:                                  # 객체 마스크 안이어야 함
+            if M.shape != (Hd, Wd):
+                M = np.array(Image.fromarray(M.astype(np.uint8))
+                             .resize((Wd, Hd), Image.NEAREST)) > 0
+            hit &= M[vi, ui]
+        n_seen += hit.astype(np.int32)
     keep = n_seen >= args.seen_min_views
     print(f"[filter] 관측 확인 점 {int(keep.sum())}/{len(P_w)} "
-          f"({keep.mean()*100:.1f}%)  depth 뷰 {n_dep}, "
-          f"기준 |z-d|<{args.seen_margin*1000:.0f}mm 이 {args.seen_min_views}뷰 이상")
+          f"({keep.mean()*100:.1f}%)  depth 뷰 {n_dep}, 마스크 {n_msk}뷰, "
+          f"기준 |z-d|<{args.seen_margin*1000:.0f}mm ∧ 마스크 안 이 {args.seen_min_views}뷰 이상")
     if keep.sum() < 200:
         print("  ⚠ 남은 점이 너무 적음 — depth 경로/스케일 확인. 필터 미적용")
         return P_w
     return P_w[keep]
+
+
+def sample_free_points(stems, cams, center, R_align, bounds, args, n_target=6000):
+    """관측된 빈 공간 샘플(오브젝트 프레임).
+
+    카메라~관측 표면 사이 구간은 '비어 있음이 관측된' 곳이다. 이 점들을 pkl 에 실어
+    생성 과정의 free-space 구속으로 쓰면, 다리 밑 같은 관측 가능 영역의 할루시네이션이
+    원천 차단된다(융합 단계 carve 로 지우는 것보다 앞선 개입).
+    """
+    rng = np.random.default_rng(0)
+    per = max(64, n_target // max(1, len(stems)))
+    out = []
+    for s in stems:
+        D = load_depth_map(args.depth_dir, s, args.depth_scale)
+        if D is None:
+            continue
+        c = cams[s]
+        Hd, Wd = D.shape
+        sx, sy = Wd / c["W"], Hd / c["H"]
+        C = -c["R"].T @ c["t"]
+        vs, us = np.nonzero(D > 0.05)
+        if len(vs) == 0:
+            continue
+        k = min(per * 3, len(vs))
+        sel = rng.choice(len(vs), k, replace=False)
+        v_, u_ = vs[sel], us[sel]
+        d = D[v_, u_]
+        x = ((u_ / sx) - c["cx"]) / c["fx"]
+        y = ((v_ / sy) - c["cy"]) / c["fy"]
+        dirs = np.stack([x, y, np.ones_like(x)], 1) @ c["R"]      # world 방향(z성분=1 규약)
+        tau = rng.uniform(0.25, 0.95, k) * np.maximum(d - 2 * args.seen_margin, 1e-3)
+        P = C[None] + dirs * tau[:, None]
+        Pm = (R_align @ (P - center).T).T
+        keep = (np.abs(Pm) <= bounds).all(1)                      # 오브젝트 bbox 안만
+        if keep.any():
+            out.append(Pm[keep])
+    if not out:
+        print("[free] 샘플 0개 — depth 경로 확인")
+        return np.zeros((0, 3), np.float32)
+    F = np.concatenate(out)
+    if len(F) > n_target:
+        F = F[rng.choice(len(F), n_target, replace=False)]
+    print(f"[free] 관측된 빈 공간 샘플 {len(F)}점 (오브젝트 bbox 내)")
+    return F.astype(np.float32)
 
 
 def find_image(images_dir, stem):
@@ -159,6 +214,9 @@ def main():
                     help="관측 판정 허용오차(m): |z - depth| < margin")
     ap.add_argument("--seen_min_views", type=int, default=2,
                     help="관측 판정 최소 뷰 수")
+    ap.add_argument("--free_points", type=int, default=6000,
+                    help="pkl 에 실을 '관측된 빈 공간' 샘플 수(0=off). "
+                         "shaper_field.py --guide_free_w 로 생성 구속에 사용")
     args = ap.parse_args()
 
     assert read_colmap is not None, "warp_gt_to_pose 임포트 실패 — RefineGS 루트에서 실행하세요"
@@ -199,8 +257,12 @@ def main():
     assert stems, "사용 가능한 뷰 없음 — --images / --stems 확인"
 
     # ---- 2b) 관측 필터 (프레임은 메쉬 정점 기준이라 필터와 무관하게 고정) ----
+    F_m = np.zeros((0, 3), np.float32)
     if args.depth_dir:
         P_w = filter_observed(P_w, stems, cams, args)
+        if args.free_points > 0:
+            F_m = sample_free_points(stems, cams, center, R_align, bounds, args,
+                                     n_target=args.free_points)
     P_m = (R_align @ (P_w - center).T).T
     clipped = int((np.abs(P_m * scale) > 1.0).any(1).sum())
     print(f"[frame] center={np.round(center,3)}  half-extent={np.round(bounds,3)}m  "
@@ -273,6 +335,8 @@ def main():
         "is_ariagen2": False,
         "pinhole": True,                               # ← 패치가 이 플래그로 rectify 우회
     }
+    if len(F_m):                                       # 생성 단계 free-space 구속용
+        sample["free_points_model"] = torch.tensor(F_m, dtype=torch.float32)
     if args.gt_mesh:
         gm = o3d.io.read_triangle_mesh(os.path.expanduser(args.gt_mesh))
         if len(gm.vertices):
