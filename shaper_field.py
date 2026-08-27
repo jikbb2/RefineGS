@@ -78,11 +78,14 @@ def infer_latents_guided(model, batch, token_shape, tfe, num_steps, cfg_value,
 
     n_g = 0
     for i in tqdm(range(len(T) - 1), desc="guided sampling"):
-        t, tn = T[i], T[i + 1]
-        v = vm(x=x, t=t)
+        # 시간은 float32 로 유지(dt 정밀도) 하고, 모델에 넣을 때만 모델 dtype 으로 캐스팅.
+        # ODESolver 가 해주던 일 — 안 하면 timestep_embedding 이 Float 를 내고
+        # bfloat16 Linear 와 곱해져 dtype 불일치 에러가 난다.
+        t, tn = T[i].float(), T[i + 1].float()
+        v = vm(x=x, t=t.to(x.dtype))
         if on and float(t) >= guide_t0 and (i % max(1, guide_every) == 0):
             with torch.enable_grad():
-                x1 = (x + (1.0 - t) * v).detach().requires_grad_(True)
+                x1 = (x + (1.0 - t).to(x.dtype) * v).detach().requires_grad_(True)
                 lat = core.decode(x1)
                 loss = 0.0
                 if guide_w > 0 and q is not None:      # 관측점: 표면 위 → f = 0
@@ -94,7 +97,7 @@ def infer_latents_guided(model, batch, token_shape, tfe, num_steps, cfg_value,
                 g, = torch.autograd.grad(loss, x1)
             v = v - g.to(v.dtype)
             n_g += 1
-        x = x + (tn - t) * v
+        x = x + (tn - t).to(x.dtype) * v
     if on:
         print(f"  [guide] 구속 적용 {n_g}/{len(T)-1} 스텝  "
               f"obs(w={guide_w}, {0 if q is None else len(q)}점) / "
