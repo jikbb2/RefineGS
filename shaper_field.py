@@ -42,6 +42,49 @@ import infer_shape_pinhole  # noqa: F401  (핀홀 rectify 우회 패치 적용)
 preset_configs = {"quality": (16, 4, 50), "speed": (4, 2, 10), "balance": (16, 4, 25)}
 
 
+def infer_latents_guided(model, batch, token_shape, tfe, num_steps, cfg_value,
+                         use_shifted, core, obs_n, guide_w, guide_every, guide_t0):
+    """관측 구속을 넣은 flow matching 샘플링 (infer_latents 의 커스텀 대체).
+
+    왜: ShapeR 는 포인트를 조건으로만 받을 뿐, 생성 결과가 관측점을 실제로 지나간다는
+    보장이 없다. rectified flow 에서 현재 상태 x_t 로부터 데이터 추정치는
+        x̂₁ = x_t + (1-t)·v
+    이므로, 매 스텝 x̂₁ 을 디코딩해 **관측점에서 필드가 0** 이 되도록 그래디언트를 주면
+    생성 과정 자체에 관측이 hard constraint 로 들어간다(재학습 불필요).
+    """
+    from model.flow_matching.helpers.scheduler import FluxTimeSampler
+    from model.flow_matching.shaper_denoiser import WrappedModel
+
+    dev = batch["semi_dense_points"].feats.device
+    if use_shifted:
+        T = FluxTimeSampler(mode="inference")(num_steps, min(token_shape[0], 2048 * 2),
+                                              device=dev)
+    else:
+        T = torch.linspace(0, 1, num_steps, device=dev)
+    vm = WrappedModel(model, batch, tfe, None, cfg_value=cfg_value)
+    x = model.get_x0_from_input(batch, token_shape=token_shape)
+    q = torch.from_numpy(np.asarray(obs_n, np.float32)).to(dev)
+
+    n_g = 0
+    for i in tqdm(range(len(T) - 1), desc="guided sampling"):
+        t, tn = T[i], T[i + 1]
+        v = vm(x=x, t=t)
+        if guide_w > 0 and float(t) >= guide_t0 and (i % max(1, guide_every) == 0):
+            with torch.enable_grad():
+                x1 = (x + (1.0 - t) * v).detach().requires_grad_(True)
+                lat = core.decode(x1)
+                f = core.query(q[None].to(lat.dtype), lat)
+                loss = (f.float() ** 2).mean()
+                g, = torch.autograd.grad(loss, x1)
+            v = v - guide_w * g.to(v.dtype)
+            n_g += 1
+        x = x + (tn - t) * v
+    if guide_w > 0:
+        print(f"  [guide] 관측 구속 적용 {n_g}/{len(T)-1} 스텝 "
+              f"(w={guide_w}, t≥{guide_t0}, 관측점 {len(q)})")
+    return x
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--input_pkl", required=True, help="로컬 pkl 경로(그대로 사용)")
@@ -52,6 +95,21 @@ def main():
     ap.add_argument("--ensemble", type=int, default=1,
                     help="K개 시드로 필드를 뽑아 mean/std 저장. >50%% 미관측에서는 정답이 "
                          "하나가 아니므로, 합의도(σ)를 융합 가중치로 넘긴다")
+    ap.add_argument("--combine", default="best",
+                    choices=["mean", "median", "majority", "best"],
+                    help="K개 샘플 결합 방식. mean=필드 평균(형상이 뭉개짐 — 권장 안 함) / "
+                         "median=원소별 중앙값(이상치에 강함) / majority=점유 다수결 후 EDT "
+                         "(선명함 유지) / best=관측 정합도 최고 샘플 선택(권장)")
+    ap.add_argument("--cfg", type=float, default=-1.0,
+                    help="classifier-free guidance 배율. ShapeR 에 구현돼 있으나 "
+                         "infer_shape.py 는 안 넘겨 기본 비활성(-1). 2~5 로 올리면 조건"
+                         "(포인트·이미지·텍스트)을 강하게 따라 mode-averaging(사다리/그물) 완화")
+    ap.add_argument("--guide_w", type=float, default=0.0,
+                    help="관측 구속 강도(0=off). 매 스텝 x̂₁ 을 디코딩해 관측점에서 "
+                         "필드가 0 이 되도록 그래디언트 주입. 0.5~5 부터 시도")
+    ap.add_argument("--guide_every", type=int, default=1, help="관측 구속 적용 간격(스텝)")
+    ap.add_argument("--guide_t0", type=float, default=0.3,
+                    help="이 시각 이후에만 구속 적용(초반 저노이즈 구간은 형상이 없어 무의미)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--save_mesh", default="", help="선택: 부호 필드의 zero-level 메쉬(검증용)")
     args = ap.parse_args()
@@ -99,12 +157,30 @@ def main():
             batch = next(iter(loader))
             batch = InferenceDataset.move_batch_to_device(batch, device,
                                                           dtype=torch.bfloat16)
+            # 관측 구속용 점(정규화 좌표) — dataset 과 동일 규약으로 pkl 에서 가져온다
+            obs_n = None
+            if args.guide_w > 0:
+                _s = pickle.load(open(pk, "rb"))
+                _sc = float(0.9 / np.max(_s["bounds"].numpy()))
+                _p = _s["points_model"].numpy()[:, :3] * _sc
+                obs_n = _p[np.all(np.abs(_p) <= 1.0, axis=-1)]
+                if len(obs_n) > 8192:
+                    obs_n = obs_n[np.random.default_rng(0).choice(len(obs_n), 8192,
+                                                                  replace=False)]
             for k in range(K):
                 torch.manual_seed(args.seed + k)           # flow matching 초기 노이즈
                 np.random.seed(args.seed + k)
-                kl = model.infer_latents(batch, token_shape=token_shape,
-                                         text_feature_extractor=tfe, num_steps=num_steps,
-                                         use_shifted_sampling=use_shifted)
+                if args.guide_w > 0:
+                    kl = infer_latents_guided(
+                        model, batch, token_shape, tfe, num_steps, args.cfg,
+                        use_shifted, core, obs_n, args.guide_w, args.guide_every,
+                        args.guide_t0)
+                else:
+                    kl = model.infer_latents(batch, token_shape=token_shape,
+                                             text_feature_extractor=tfe,
+                                             num_steps=num_steps,
+                                             cfg_value=args.cfg,
+                                             use_shifted_sampling=use_shifted)
                 latents = core.decode(kl)
                 # 부호 있는 필드를 [-1,1]^3 그리드에 평가 (extract_mesh 와 동일 규약)
                 vals = np.empty(len(pts), np.float32)
@@ -115,8 +191,51 @@ def main():
                     vals[s:s + args.chunk] = core.query(q, latents)[0].float().cpu().numpy()
                 fields.append(vals.reshape(G, G, G))
     Fstack = np.stack(fields)
-    F = Fstack.mean(0)
     Fstd = Fstack.std(0) if len(fields) > 1 else None
+
+    # ---- 관측 정합도로 샘플 채점 (GT 불필요 — 조건으로 준 관측점에서 |f|≈0 이어야) ----
+    smp0 = pickle.load(open(pkls[0], "rb"))
+    _b0 = smp0["bounds"].numpy(); _sc0 = float(0.9 / np.max(_b0))
+    pm = smp0["points_model"].numpy()[:, :3] * _sc0          # dataset 과 동일 정규화
+    pm = pm[np.all(np.abs(pm) <= 1.0, axis=-1)]
+    pi_ = np.clip((pm + 1.0) * (G - 1) / 2.0, 0, G - 1.001)
+    i0 = np.floor(pi_).astype(np.int64); wgt = pi_ - i0; i1 = i0 + 1
+
+    def _probe(vol):                                          # 관측점에서 필드 삼선형 보간
+        v = np.zeros(len(pi_), np.float64)
+        for dx in (0, 1):
+            for dy in (0, 1):
+                for dz in (0, 1):
+                    w_ = ((wgt[:, 0] if dx else 1 - wgt[:, 0])
+                          * (wgt[:, 1] if dy else 1 - wgt[:, 1])
+                          * (wgt[:, 2] if dz else 1 - wgt[:, 2]))
+                    v += w_ * vol[(i1 if dx else i0)[:, 0],
+                                  (i1 if dy else i0)[:, 1],
+                                  (i1 if dz else i0)[:, 2]]
+        return v
+
+    scores = [float(np.median(np.abs(_probe(f)))) for f in fields]
+    print("[score] 관측점 |f| 중앙값(작을수록 관측과 일치): "
+          + ", ".join(f"#{i}:{s:.4f}" for i, s in enumerate(scores)))
+
+    if len(fields) == 1 or args.combine == "mean":
+        F = Fstack.mean(0)
+    elif args.combine == "median":
+        F = np.median(Fstack, 0)
+    elif args.combine == "best":
+        bi = int(np.argmin(scores))
+        F = Fstack[bi]
+        print(f"[combine] best 샘플 #{bi} 선택 (관측 정합도 최고)")
+    else:                                                     # majority: 점유 다수결 → EDT
+        from scipy.ndimage import distance_transform_edt as _edt
+        occ = (Fstack < 0).mean(0) >= 0.5
+        if not occ.any():
+            print("  ⚠ 다수결 내부 복셀 없음 — mean 으로 폴백"); F = Fstack.mean(0)
+        else:
+            vox_n = 2.0 / (G - 1)                             # 정규화 좌표 복셀
+            F = ((_edt(~occ) - _edt(occ)) * vox_n).astype(np.float32)
+            print(f"[combine] majority 점유 {occ.mean()*100:.2f}% → EDT SDF "
+                  "(형상 선명도 유지)")
     if Fstd is not None:
         # 진단 주의: '평균이 0 근처'인 복셀은 (a) 진짜 표면 (b) 부호가 갈려 상쇄된 곳
         # 두 가지가 섞인다. (b)만 보면 σ 가 필드 전 범위에 육박해 과대평가되므로,
