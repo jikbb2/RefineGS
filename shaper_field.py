@@ -135,6 +135,9 @@ def main():
     ap.add_argument("--guide_t0", type=float, default=0.3,
                     help="이 시각 이후에만 구속 적용(초반 저노이즈 구간은 형상이 없어 무의미)")
     ap.add_argument("--out", required=True)
+    ap.add_argument("--min_comp_frac", type=float, default=0.02,
+                    help="[부유물] 음수 연결성분 중 최대 성분 부피의 이 비율 미만은 제거. "
+                         "0=off. 얇은 다리가 본체와 끊겨 있다면 값을 낮추세요")
     ap.add_argument("--save_mesh", default="", help="선택: 부호 필드의 zero-level 메쉬(검증용)")
     args = ap.parse_args()
 
@@ -330,6 +333,27 @@ def main():
 
     out = os.path.expanduser(args.out)
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+    # [부유물 제거] 본체에서 떨어져 나온 작은 음수 성분을 필드 단계에서 걷어낸다.
+    # 융합의 keep_connected 는 '관측과의 연결'을 보므로, 물체 근처에 떠 있는 조각은
+    # 통과할 수 있다. 여기서는 크기 기준(최대 성분 대비 비율)이라 그런 조각도 잡힌다.
+    if args.min_comp_frac > 0:
+        from scipy.ndimage import label as _label
+        neg = Fm < 0
+        lab, ncomp = _label(neg)
+        if ncomp > 1:
+            sizes = np.bincount(lab.ravel())[1:]                # 배경(0) 제외
+            keep_ids = np.where(sizes >= args.min_comp_frac * sizes.max())[0] + 1
+            drop = neg & ~np.isin(lab, keep_ids)
+            if drop.any():
+                Fm[drop] = float(np.abs(Fm).max())              # 밖(양수)으로 채움
+            vox_l = (vox_world ** 3) * 1000                     # 복셀 부피(리터)
+            print(f"[floater] 음수 성분 {ncomp}개 → {len(keep_ids)}개 유지, "
+                  f"{int(drop.sum())}복셀({drop.sum()*vox_l:.2f}L, "
+                  f"내부의 {drop.sum()/max(neg.sum(),1)*100:.2f}%) 제거 "
+                  f"(임계 = 최대성분의 {args.min_comp_frac*100:.0f}%)")
+        else:
+            print(f"[floater] 음수 성분 1개 — 제거할 부유물 없음")
+
     save = dict(field=Fm, center=center.astype(np.float64),
                 R_align=R_align.astype(np.float64), scale=np.float64(scale),
                 vox_world=np.float64(vox_world), raw_g=np.float64(g))
