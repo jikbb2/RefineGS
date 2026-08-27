@@ -56,6 +56,12 @@ def infer_latents_guided(model, batch, token_shape, tfe, num_steps, cfg_value,
     from model.flow_matching.helpers.scheduler import FluxTimeSampler
     from model.flow_matching.shaper_denoiser import WrappedModel
 
+    # ※ 반드시 컴파일 전 원본 모듈을 쓴다.
+    #   torch.compile(..., fullgraph=True) 된 래퍼를 직접 호출하면 torchsparse 의
+    #   `if np.prod(size) % 2 == 1:` 에서 dynamo 가 data-dependent branching 으로 에러.
+    #   원래 코드가 멀쩡한 이유는 model.infer_latents(...) 가 메서드 위임이라
+    #   내부 self 가 이미 원본 모듈이기 때문이다.
+    model = getattr(model, "_orig_mod", model)
     dev = batch["semi_dense_points"].feats.device
     if use_shifted:
         T = FluxTimeSampler(mode="inference")(num_steps, min(token_shape[0], 2048 * 2),
