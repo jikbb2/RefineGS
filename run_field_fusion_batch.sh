@@ -30,8 +30,20 @@ STEMS_DIR=${STEMS_DIR:-$HOME/See3D/dataset/stage6/clean_stems}
 GTD=${GTD:-/home/elicer/nice-slam/Datasets/Replica/room0/results}
 GT_MESH=${GT_MESH:-$HOME/room_0/habitat/mesh_semantic.ply}
 CAPTIONS=${CAPTIONS:-${ROOT}/captions.tsv}     # 선택: "gid<TAB>caption" 줄. 없으면 기본 문구
-NPTS=${NPTS:-5000}                             # obj1 A/B 최고치
+NPTS=${NPTS:-20000}
 GRID=${GRID:-256}
+# ── obj6 튜닝에서 확정된 생성 설정 ────────────────────────────────────────
+# CFG   : ShapeR 에 구현돼 있으나 infer_shape.py 가 안 넘겨 비활성이던 값.
+#         켜면 mode-averaging(다리가 사다리/그물로 뭉개짐)이 사라진다. 5 가 최적.
+# 관측필터: recon 의 미관측 영역 쓰레기를 조건 포인트에서 제외(ShapeR 는 포인트를
+#         geometric anchor 로 충실히 따르므로, 안 거르면 그 오류가 생성물로 전파).
+# 부유물 : 필드의 음수 연결성분 중 최대 성분 대비 min_comp_frac 미만 제거.
+CFG=${CFG:-5}
+MIN_COMP_FRAC=${MIN_COMP_FRAC:-0.02}
+SEEN_MARGIN=${SEEN_MARGIN:-0.02}
+SEEN_MIN_VIEWS=${SEEN_MIN_VIEWS:-2}
+FREE_POINTS=${FREE_POINTS:-0}                  # 생성 단계 free 구속(0=off, 효과 미미했음)
+GUIDE_FREE_W=${GUIDE_FREE_W:-0}
 PHASE=${PHASE:-all}
 ONLY=${ONLY:-}                                 # 예: ONLY="1 6 11" 이면 해당 gid 만
 # GT 라벨 자동 매칭 임계값. SAM3 인스턴스는 데이터셋 semantic id 와 1:1 이 아니라
@@ -63,6 +75,9 @@ for MDIR in ${OUT}/*/; do
   gids+=("${gid}")
 done
 echo "대상 객체 ${#gids[@]}개: ${gids[*]}"
+echo "설정: n_points=${NPTS} grid=${GRID} cfg=${CFG} min_comp_frac=${MIN_COMP_FRAC}"
+echo "      관측필터 |z-d|<${SEEN_MARGIN}m×${SEEN_MIN_VIEWS}뷰, free_points=${FREE_POINTS}"
+echo "      융합 min_unknown_frac=${MIN_UNKNOWN_FRAC} free_min_views=${FREE_MIN_VIEWS}"
 [ ${#gids[@]} -gt 0 ] || { echo "대상 없음"; exit 1; }
 
 caption_of() {  # gid → caption
@@ -97,13 +112,16 @@ if [ "${PHASE}" = "pkl" ] || [ "${PHASE}" = "all" ]; then
     python make_shaper_input.py --gid "${gid}" --n_points "${NPTS}" \
       --recon "${RECON}" --colmap "${COLMAP}" --images "${IMAGES}" \
       --masks_root "${MASKS}" ${STEMS:+$([ -f "${STEMS}" ] && echo --stems "${STEMS}")} \
+      --depth_dir "${GTD}" --seen_margin "${SEEN_MARGIN}" \
+      --seen_min_views "${SEEN_MIN_VIEWS}" --free_points "${FREE_POINTS}" \
       --caption "${CAP}" --out "${SHAPER_DIR}/data/obj${gid}.pkl" \
       > "${LOGDIR}/pkl_${gid}.log" 2>&1
     if [ ! -f "${SHAPER_DIR}/data/obj${gid}.pkl" ]; then
       echo "    pkl 실패"; note_fail "${gid}" pkl "make_shaper_input"
       show_tail "${LOGDIR}/pkl_${gid}.log"
     else
-      grep -h "^\[frame\]\|^\[views\]" "${LOGDIR}/pkl_${gid}.log" | sed 's/^/    /'
+      grep -h "^\[filter\]\|^\[free\]\|^\[frame\]\|^\[views\]" \
+        "${LOGDIR}/pkl_${gid}.log" | sed 's/^/    /'
     fi
   done
 fi
@@ -119,6 +137,8 @@ if [ "${PHASE}" = "field" ] || [ "${PHASE}" = "all" ]; then
     echo "  [${gid}] field 추출"
     CMD="cd '${SHAPER_DIR}' && LD_LIBRARY_PATH= python shaper_field.py \
          --input_pkl data/obj${gid}.pkl --config balance --grid ${GRID} \
+         --cfg ${CFG} --min_comp_frac ${MIN_COMP_FRAC} \
+         $([ "${GUIDE_FREE_W}" != "0" ] && echo --guide_free_w ${GUIDE_FREE_W}) \
          --out '${NPZ}'"
     if [ "${SHAPER_DIRECT}" = "1" ]; then
       bash -c "${CMD}" > "${LOGDIR}/field_${gid}.log" 2>&1
@@ -137,7 +157,8 @@ if [ "${PHASE}" = "field" ] || [ "${PHASE}" = "all" ]; then
       echo "    field 실패"; note_fail "${gid}" field "shaper_field"
       show_tail "${LOGDIR}/field_${gid}.log" 20
     else
-      grep -h "^\[field\]\|^\[ensemble\]" "${LOGDIR}/field_${gid}.log" | sed 's/^/    /'
+      grep -h "^\[field\]\|^\[floater\]\|^\[ensemble\]\|^  \[guide\]" \
+        "${LOGDIR}/field_${gid}.log" | sed 's/^/    /'
     fi
   done
 fi
