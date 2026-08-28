@@ -164,14 +164,14 @@ if [ "${PHASE}" = "fuse" ] || [ "${PHASE}" = "all" ]; then
       --min_unknown_frac "${MIN_UNKNOWN_FRAC}" \
       --voxel_size 0.005 --max_grid 512 --keep_connected \
       --gt_depth_dir "${GTD}" \
-      --out "${OUTD}/fused_field.ply" \
+      --out "${OUTD}/fused_refine.ply" \
       > "${LOGDIR}/fuse_${gid}.log" 2>&1 \
       || { echo "    융합 실패"; note_fail "${gid}" fuse "sdf_distill"; \
            show_tail "${LOGDIR}/fuse_${gid}.log" 20; ng=$((ng+1)); continue; }
 
     echo "  [${gid}] 평가 (GT 라벨 자동 매칭)"
     python eval_seen_unseen.py --gt_mesh "${GT_MESH}" \
-      --recon "${OUTD}/fuse_post.ply" --recon2 "${OUTD}/fused_field_post.ply" \
+      --recon "${OUTD}/fuse_post.ply" --recon2 "${OUTD}/fused_refine_post.ply" \
       --colmap "${COLMAP}" --gid "${gid}" \
       --masks_root "${MASKS}" --use_mask \
       ${STEMS:+$([ -f "${STEMS}" ] && echo --stems "${STEMS}")} \
