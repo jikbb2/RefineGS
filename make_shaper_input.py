@@ -205,6 +205,9 @@ def main():
                          "보다 정확하므로 작게. 필터가 걸러내지 않도록")
     ap.add_argument("--img_max_side", type=int, default=640,
                     help="이미지 다운스케일 긴 변(ShapeR 추론은 280px 라 큰 해상도 무의미)")
+    ap.add_argument("--seed", type=int, default=0,
+                    help="포인트 샘플링 시드. 고정해야 같은 명령이 같은 pkl 을 낸다 — "
+                         "설정 A/B 를 비교하려면 필수")
     ap.add_argument("--gt_mesh", default="", help="선택: GT 메쉬(평가용)")
     ap.add_argument("--depth_dir", default="",
                     help="[관측 필터] depth 폴더. 지정 시 '관측이 확인된 점'만 조건으로 준다 — "
@@ -224,10 +227,23 @@ def main():
     # ---- 1) 관측 포인트 (world, metric) ----
     m = o3d.io.read_triangle_mesh(os.path.expanduser(args.recon))
     assert len(m.vertices), f"recon 로드 실패: {args.recon}"
-    pc = (m.sample_points_uniformly(args.n_points) if len(m.triangles)
-          else m.sample_points_uniformly(args.n_points))
+    # ※ 재현성: 포인트 샘플링이 시드 없이 매번 달라지면, 같은 명령이어도 조건 포인트가
+    #   바뀌어 생성 결과가 달라진다(ShapeR 는 포인트를 anchor 로 충실히 따름).
+    #   실제로 파이프라인의 주된 변동 원인은 ShapeR 샘플링이 아니라 여기다.
+    _seeded = False
+    try:
+        o3d.utility.random.seed(args.seed)             # Open3D >= 0.16
+        _seeded = True
+    except Exception:
+        pass
+    try:
+        pc = m.sample_points_uniformly(args.n_points, seed=args.seed)
+        _seeded = True
+    except TypeError:
+        pc = m.sample_points_uniformly(args.n_points)
     P_w = np.asarray(pc.points, np.float64)
-    print(f"[points] {len(P_w)}점 (world)")
+    print(f"[points] {len(P_w)}점 (world, seed={args.seed}"
+          + ("" if _seeded else ", ⚠ 시드 미지원 Open3D — 실행마다 달라짐") + ")")
 
     # ---- 2) 오브젝트 프레임: 중력 정렬 + AABB 중심 ----
     # centroid 대신 AABB 중심 — 절반 미관측 시 centroid 는 관측 쪽으로 크게 치우침.
