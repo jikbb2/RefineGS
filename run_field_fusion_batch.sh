@@ -40,6 +40,10 @@ GRID=${GRID:-256}
 # 부유물 : 필드의 음수 연결성분 중 최대 성분 대비 min_comp_frac 미만 제거.
 CFG=${CFG:-5}
 MIN_COMP_FRAC=${MIN_COMP_FRAC:-0.02}
+# 포인트 샘플링 시드 — 고정해야 재실행/설정비교가 재현된다.
+# (이게 없으면 같은 명령도 매번 다른 조건 포인트를 만들어 결과가 흔들린다)
+SEED=${SEED:-0}
+BOUNDS_MARGIN=${BOUNDS_MARGIN:-1.15}
 SEEN_MARGIN=${SEEN_MARGIN:-0.02}
 SEEN_MIN_VIEWS=${SEEN_MIN_VIEWS:-2}
 FREE_POINTS=${FREE_POINTS:-0}                  # 생성 단계 free 구속(0=off, 효과 미미했음)
@@ -54,6 +58,10 @@ MATCH_MIN_SHARE=${MATCH_MIN_SHARE:-0.03}
 # 이미 충분히 관측된 객체(배치 실측 obj16/28/10)에서 prior 가 손해만 보는 것을 막는다.
 MIN_UNKNOWN_FRAC=${MIN_UNKNOWN_FRAC:-0.20}
 FREE_MIN_VIEWS=${FREE_MIN_VIEWS:-2}
+# visual hull 제약: obj20 의 바닥 침투용으로 넣었으나 그 문제를 못 고쳤고(107mm 그대로),
+# obj6 에서는 생성 표면의 19%를 잘라 일부 정상 기하까지 제거했다 → 기본 off.
+# 바닥/인접 객체로 새는 객체가 있으면 0.3~0.6 으로 켜세요.
+HULL_MIN_FRAC=${HULL_MIN_FRAC:-0}
 
 CSV=${CSV:-${OUT}/_field_batch.csv}
 FAILCSV=${FAILCSV:-${OUT}/_field_batch_failures.csv}
@@ -75,9 +83,18 @@ for MDIR in ${OUT}/*/; do
   gids+=("${gid}")
 done
 echo "대상 객체 ${#gids[@]}개: ${gids[*]}"
-echo "설정: n_points=${NPTS} grid=${GRID} cfg=${CFG} min_comp_frac=${MIN_COMP_FRAC}"
+echo "설정: n_points=${NPTS} seed=${SEED} bounds_margin=${BOUNDS_MARGIN} grid=${GRID}"
+echo "      cfg=${CFG} min_comp_frac=${MIN_COMP_FRAC}"
 echo "      관측필터 |z-d|<${SEEN_MARGIN}m×${SEEN_MIN_VIEWS}뷰, free_points=${FREE_POINTS}"
-echo "      융합 min_unknown_frac=${MIN_UNKNOWN_FRAC} free_min_views=${FREE_MIN_VIEWS}"
+echo "      융합 min_unknown_frac=${MIN_UNKNOWN_FRAC} free_min_views=${FREE_MIN_VIEWS}"\
+" hull=${HULL_MIN_FRAC}"
+if [ -f "${CAPTIONS}" ]; then
+  echo "      캡션 ${CAPTIONS} ($(grep -c . "${CAPTIONS}")줄)"
+else
+  echo "      캡션 파일 없음(${CAPTIONS}) — 전 객체가 기본 문구 사용."
+  echo "        ShapeR 는 T5/CLIP 텍스트 조건을 받으므로 영향 가능성은 있으나,"
+  echo "        시드 고정 전이라 캡션 효과를 단독으로 검증한 적은 없습니다."
+fi
 [ ${#gids[@]} -gt 0 ] || { echo "대상 없음"; exit 1; }
 
 caption_of() {  # gid → caption
@@ -110,6 +127,7 @@ if [ "${PHASE}" = "pkl" ] || [ "${PHASE}" = "all" ]; then
     CAP=$(caption_of "${gid}")
     echo "  [${gid}] caption='${CAP}'"
     python make_shaper_input.py --gid "${gid}" --n_points "${NPTS}" \
+      --seed "${SEED}" --bounds_margin "${BOUNDS_MARGIN}" \
       --recon "${RECON}" --colmap "${COLMAP}" --images "${IMAGES}" \
       --masks_root "${MASKS}" ${STEMS:+$([ -f "${STEMS}" ] && echo --stems "${STEMS}")} \
       --depth_dir "${GTD}" --seen_margin "${SEEN_MARGIN}" \
@@ -182,17 +200,17 @@ if [ "${PHASE}" = "fuse" ] || [ "${PHASE}" = "all" ]; then
       --prior_field "${NPZ}" --prior_sigma_w 0 \
       --grid_fuse --alpha_smooth 1.0 --color_blend_ramp 0.05 \
       --prior_carve_views 150 --free_min_views "${FREE_MIN_VIEWS}" --num_cluster 10000 \
-      --min_unknown_frac "${MIN_UNKNOWN_FRAC}" \
+      --min_unknown_frac "${MIN_UNKNOWN_FRAC}" --hull_min_frac "${HULL_MIN_FRAC}" \
       --voxel_size 0.005 --max_grid 512 --keep_connected \
       --gt_depth_dir "${GTD}" \
-      --out "${OUTD}/fused_refine.ply" \
+      --out "${OUTD}/fused_field.ply" \
       > "${LOGDIR}/fuse_${gid}.log" 2>&1 \
       || { echo "    융합 실패"; note_fail "${gid}" fuse "sdf_distill"; \
            show_tail "${LOGDIR}/fuse_${gid}.log" 20; ng=$((ng+1)); continue; }
 
     echo "  [${gid}] 평가 (GT 라벨 자동 매칭)"
     python eval_seen_unseen.py --gt_mesh "${GT_MESH}" \
-      --recon "${OUTD}/fuse_post.ply" --recon2 "${OUTD}/fused_refine_post.ply" \
+      --recon "${OUTD}/fuse_post.ply" --recon2 "${OUTD}/fused_field_post.ply" \
       --colmap "${COLMAP}" --gid "${gid}" \
       --masks_root "${MASKS}" --use_mask \
       ${STEMS:+$([ -f "${STEMS}" ] && echo --stems "${STEMS}")} \
