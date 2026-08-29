@@ -936,9 +936,10 @@ def main():
     parser.add_argument("--alpha_smooth", default=1.0, type=float,
                         help="[seam] 관측 신뢰도 alpha 가우시안 sigma(voxel) — 관측/생성 "
                              "전이대를 만들어 접합부 계단 제거. 0=off")
-    parser.add_argument("--unseen_open", default=0.015, type=float,
+    parser.add_argument("--unseen_open", default=0.0, type=float,
                         help="[스파이크] 미관측 영역 모폴로지 opening 반경(m). 두께 2r 이하 "
-                             "돌기만 제거(굵은 구조 보존). 셸 팽창 2δ 를 감안해 δ 보다 크게. 0=off")
+                             "돌기를 제거한다. ⚠ 얇은 구조(테이블 다리 등)도 같이 지우므로 "
+                             "기본 off. 켤 때는 반드시 다리 생존을 확인할 것")
     parser.add_argument("--no_color_match", action="store_true",
                         help="생성 색을 관측 색 통계에 맞추는 보정 비활성")
     parser.add_argument("--color_blend_ramp", default=0.05, type=float,

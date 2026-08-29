@@ -62,6 +62,10 @@ FREE_MIN_VIEWS=${FREE_MIN_VIEWS:-2}
 # obj6 에서는 생성 표면의 19%를 잘라 일부 정상 기하까지 제거했다 → 기본 off.
 # 바닥/인접 객체로 새는 객체가 있으면 0.3~0.6 으로 켜세요.
 HULL_MIN_FRAC=${HULL_MIN_FRAC:-0}
+# ⚠ 미관측 영역 모폴로지 opening. 켜면 '두께 2r 이하' 구조를 전부 지우므로
+#   테이블 다리 같은 얇은 기하가 통째로 사라진다(실측: r=15mm 에서 78935복셀≈10L 삭제,
+#   게이트를 모두 꺼도 이 단계가 돌아 '강제 융합'조차 실패했던 원인). 반드시 0 유지.
+UNSEEN_OPEN=${UNSEEN_OPEN:-0}
 
 CSV=${CSV:-${OUT}/_field_batch.csv}
 FAILCSV=${FAILCSV:-${OUT}/_field_batch_failures.csv}
@@ -199,6 +203,7 @@ if [ "${PHASE}" = "fuse" ] || [ "${PHASE}" = "all" ]; then
       --data_device cpu --mask_dir auto --require_mask --mask_dist 0 \
       --prior_field "${NPZ}" --prior_sigma_w 0 \
       --grid_fuse --alpha_smooth 1.0 --color_blend_ramp 0.05 \
+      --unseen_open "${UNSEEN_OPEN}" \
       --prior_carve_views 150 --free_min_views "${FREE_MIN_VIEWS}" --num_cluster 10000 \
       --min_unknown_frac "${MIN_UNKNOWN_FRAC}" --hull_min_frac "${HULL_MIN_FRAC}" \
       --voxel_size 0.005 --max_grid 512 --keep_connected \
