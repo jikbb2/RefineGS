@@ -40,6 +40,13 @@ GRID=${GRID:-256}
 # 부유물 : 필드의 음수 연결성분 중 최대 성분 대비 min_comp_frac 미만 제거.
 CFG=${CFG:-5}
 MIN_COMP_FRAC=${MIN_COMP_FRAC:-0.02}
+# 앙상블: 조건을 고정한 A/B 에서 유의한 차이가 없어 기본 off 로 확정했다.
+#   (obj6_best.npz 와 배치 결과의 unseen precision 차이를 앙상블 탓으로 본 적이 있으나,
+#    그 비교는 npz 생성과 GRID_WCAP 이 동시에 달라 교란돼 있었다 — 근거로 쓰지 말 것.)
+#   생성 비용이 ENSEMBLE 배가 되므로, 켜려면 fuse 플래그를 고정한 깨끗한 A/B 로
+#   이득을 먼저 입증할 것. 평균/중앙값은 얇은 구조를 지우므로 combine 은 best 만 쓴다.
+ENSEMBLE=${ENSEMBLE:-1}
+COMBINE=${COMBINE:-best}
 # 포인트 샘플링 시드 — 고정해야 재실행/설정비교가 재현된다.
 # (이게 없으면 같은 명령도 매번 다른 조건 포인트를 만들어 결과가 흔들린다)
 SEED=${SEED:-0}
@@ -101,7 +108,8 @@ for MDIR in ${OUT}/*/; do
 done
 echo "대상 객체 ${#gids[@]}개: ${gids[*]}"
 echo "설정: n_points=${NPTS} seed=${SEED} bounds_margin=${BOUNDS_MARGIN} grid=${GRID}"
-echo "      cfg=${CFG} min_comp_frac=${MIN_COMP_FRAC}"
+echo "      cfg=${CFG} min_comp_frac=${MIN_COMP_FRAC} ensemble=${ENSEMBLE}/${COMBINE}"
+echo "      관측신뢰도 erode=${OBS_ERODE}px cos_min=${OBS_COS_MIN} wcap=${GRID_WCAP}"
 echo "      관측필터 |z-d|<${SEEN_MARGIN}m×${SEEN_MIN_VIEWS}뷰, free_points=${FREE_POINTS}"
 echo "      융합 min_unknown_frac=${MIN_UNKNOWN_FRAC} free_min_views=${FREE_MIN_VIEWS}"\
 " hull=${HULL_MIN_FRAC}"
@@ -173,6 +181,7 @@ if [ "${PHASE}" = "field" ] || [ "${PHASE}" = "all" ]; then
     CMD="cd '${SHAPER_DIR}' && LD_LIBRARY_PATH= python shaper_field.py \
          --input_pkl data/obj${gid}.pkl --config balance --grid ${GRID} \
          --cfg ${CFG} --min_comp_frac ${MIN_COMP_FRAC} \
+         $([ "${ENSEMBLE}" -gt 1 ] && echo --ensemble ${ENSEMBLE} --combine ${COMBINE}) \
          $([ "${GUIDE_FREE_W}" != "0" ] && echo --guide_free_w ${GUIDE_FREE_W}) \
          --out '${NPZ}'"
     if [ "${SHAPER_DIRECT}" = "1" ]; then

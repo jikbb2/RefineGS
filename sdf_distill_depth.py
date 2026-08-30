@@ -523,32 +523,52 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
     # ⚠ 기본 off — 이전에 unseen_open 기본값이 결과를 조용히 바꾼 전례가 있어,
     #    켤 때는 반드시 명시적으로 플래그를 준다.
     _obs_on = args.obs_erode > 0 or args.obs_cos_min > 0 or args.obs_cos_weight
-    for b in (VB if _obs_on else []):
-        if "obsw" in b or "depth" not in b:
-            continue
+
+    def _cos_map(b):
+        """depth 맵에서 |cos(시선, 표면법선)| 를 계산. 메모리 절약을 위해 저장하지 않는다."""
         d = b["depth"].astype(np.float32)
         H_, W_ = d.shape
         uu_, vv_ = np.meshgrid(np.arange(W_, dtype=np.float32),
                                np.arange(H_, dtype=np.float32))
-        X = (uu_ - b["cx"]) * d / b["fx"]
-        Y = (vv_ - b["cy"]) * d / b["fy"]
-        P = np.stack([X, Y, d], -1)
-        du = np.gradient(P, axis=1); dv = np.gradient(P, axis=0)
-        nrm = np.cross(du, dv)
-        ln = np.linalg.norm(nrm, axis=-1)
-        vd = np.linalg.norm(P, axis=-1)
-        cos = np.abs((nrm * P).sum(-1)) / np.maximum(ln * vd, 1e-9)
-        m = b.get("mask", d > 0)
-        if args.obs_erode > 0:                      # 마스크 경계 픽셀 배제
-            m = ndimage.binary_erosion(m, iterations=int(args.obs_erode))
-        ok = m & (d > 0) & (cos >= args.obs_cos_min)
-        b["obsw"] = np.where(ok, cos if args.obs_cos_weight else 1.0, 0.0).astype(np.float32)
-    _wv = [float((b["obsw"] > 0).mean()) for b in VB if "obsw" in b]
-    if _wv:
-        _m0 = np.mean([float((b["mask"] & (b["depth"] > 0)).mean()) for b in VB])
-        print(f"[관측신뢰도] erode={args.obs_erode}px cos_min={args.obs_cos_min} "
-              f"cos_weight={args.obs_cos_weight} → 유효 픽셀 {np.mean(_wv)*100:.1f}%/뷰 "
-              f"(가중 전 {_m0*100:.1f}%, 배제 {(1-np.mean(_wv)/max(_m0,1e-9))*100:.0f}%)")
+        P = np.stack([(uu_ - b["cx"]) * d / b["fx"],
+                      (vv_ - b["cy"]) * d / b["fy"], d], -1)
+        nrm = np.cross(np.gradient(P, axis=1), np.gradient(P, axis=0))
+        ln = np.linalg.norm(nrm, axis=-1); vd = np.linalg.norm(P, axis=-1)
+        return np.abs((nrm * P).sum(-1)) / np.maximum(ln * vd, 1e-9)
+
+    if _obs_on:
+        VBo = [b for b in VB if "depth" in b and "obsw" not in b]
+        # [배제율 가드] 침식은 화면에서 큰 객체엔 싸지만 얇은/작은 객체엔 치명적이다.
+        # (실측 obj6: 화면 3.4% 객체에 erode=2 → 배제 16%. 화면 0.5% 객체면 40%+)
+        # 대표 뷰로 배제율을 먼저 재고, 임계를 넘으면 erode 를 자동으로 낮춘다.
+        probe = VBo[:: max(1, len(VBo) // 20)][:20]
+        er = int(args.obs_erode)
+        while er >= 0:
+            kp = tot = 0.0
+            for b in probe:
+                m0 = b["mask"] & (b["depth"] > 0)
+                m = ndimage.binary_erosion(m0, iterations=er) if er > 0 else m0
+                tot += float(m0.sum())
+                kp += float((m & (_cos_map(b) >= args.obs_cos_min)).sum())
+            rej = 1.0 - kp / max(tot, 1.0)
+            if rej <= args.obs_max_reject or er == 0:
+                break
+            print(f"[관측신뢰도] 배제율 {rej*100:.0f}% > 임계 {args.obs_max_reject*100:.0f}% "
+                  f"→ erode {er}→{er-1} (얇은 구조 보호)")
+            er -= 1
+        if rej > args.obs_max_reject:
+            print(f"[관측신뢰도] ⚠ erode=0 에서도 배제율 {rej*100:.0f}% — cos_min 이 이 객체엔 "
+                  f"과하다(대부분 grazing 관측). 관측 근거가 얕아지니 결과를 눈으로 확인할 것")
+        for b in VBo:
+            m = b["mask"] & (b["depth"] > 0)
+            if er > 0:
+                m = ndimage.binary_erosion(m, iterations=er)
+            c = _cos_map(b)
+            ok = m & (c >= args.obs_cos_min)
+            b["obsw"] = np.where(ok, c if args.obs_cos_weight else 1.0, 0.0).astype(np.float32)
+        args.obs_erode_used = er
+        print(f"[관측신뢰도] erode={er}px(요청 {args.obs_erode}) cos_min={args.obs_cos_min} "
+              f"cos_weight={args.obs_cos_weight} → 배제 {rej*100:.0f}%")
 
     n_gt = sum(1 for b in VB if "dgt" in b)
     print(f"[grid-fuse] GT depth 버퍼 {n_gt}/{len(VB)}뷰"
@@ -955,6 +975,9 @@ def main():
                              "배제. depth 불연속 픽셀도 cos≈0 이라 함께 걸러진다. 0.15~0.3 권장")
     parser.add_argument("--obs_cos_weight", action="store_true",
                         help="[seen] 배제 대신 |cos| 로 가중 — 정면 관측이 실루엣 관측을 이긴다")
+    parser.add_argument("--obs_max_reject", default=0.35, type=float,
+                        help="[seen] 관측 픽셀 배제율 상한. 넘으면 --obs_erode 를 자동으로 "
+                             "1씩 낮춘다(작고 얇은 객체 보호). 배치 안전장치")
     parser.add_argument("--grid_smooth", default=0.7, type=float,
                         help="융합 grid 가우시안 스무딩 sigma(voxel). 0=off")
     parser.add_argument("--gt_depth_dir", default="", type=str,
