@@ -61,31 +61,16 @@ ONLY=${ONLY:-}                                 # 예: ONLY="1 6 11" 이면 해�
 # 한 객체가 여러 id 에 걸친다(obj1: id9 81% + id70/18/71/8 각 5%).
 # 기본 0.10 이면 5%대가 전부 탈락 → GT 과소 매칭 → baseline seen acc 4.64mm 가 26mm 로 왜곡.
 MATCH_MIN_SHARE=${MATCH_MIN_SHARE:-0.03}
-# prior 적용 게이트: 생성 '표면' 중 unknown 비율이 이 값 미만이면 prior 미적용.
-# 이미 충분히 관측된 객체(배치 실측 obj16/28/10)에서 prior 가 손해만 보는 것을 막는다.
-MIN_UNKNOWN_FRAC=${MIN_UNKNOWN_FRAC:-0.20}
-FREE_MIN_VIEWS=${FREE_MIN_VIEWS:-2}
-# visual hull 제약: obj20 의 바닥 침투용으로 넣었으나 그 문제를 못 고쳤고(107mm 그대로),
-# obj6 에서는 생성 표면의 19%를 잘라 일부 정상 기하까지 제거했다 → 기본 off.
-# 바닥/인접 객체로 새는 객체가 있으면 0.3~0.6 으로 켜세요.
-HULL_MIN_FRAC=${HULL_MIN_FRAC:-0}
-# ⚠ 미관측 영역 모폴로지 opening. 켜면 '두께 2r 이하' 구조를 전부 지우므로
-#   테이블 다리 같은 얇은 기하가 통째로 사라진다(실측: r=15mm 에서 78935복셀≈10L 삭제,
-#   게이트를 모두 꺼도 이 단계가 돌아 '강제 융합'조차 실패했던 원인). 반드시 0 유지.
-UNSEEN_OPEN=${UNSEEN_OPEN:-0}
-
-# [seen 품질] 관측 신뢰도 가중 — seen/unseen 경계에서 표면이 퍼지고 물체 밖으로
-#   삐져나가는 것은 '미관측'이 아니라 '나쁜 관측'(grazing angle + 흔들리는 마스크
-#   경계 + depth 불연속)이 원인. 셋 다 0/off 면 기존 동작과 완전히 동일하다.
-# OBS_ERODE=2 검증 완료(obj6): free 위반 4.24%→2.38%, 위반점 accuracy 20.1→10.9mm,
-#   얇은 다리 생존(unseen R@2cm 0.685→0.682, 사실상 불변). 3 이상은 미검증.
-OBS_ERODE=${OBS_ERODE:-2}          # 마스크 N픽셀 침식
-OBS_COS_MIN=${OBS_COS_MIN:-0.2}    # |cos(시선,법선)| 하한 (검증: 80도=0.23, 불연속=0.01)
-OBS_COS_WEIGHT=${OBS_COS_WEIGHT:-1}  # 1이면 |cos| 가중, 0이면 이진 배제만
-# cos 가중을 켜면 Wo(관측 가중합)가 대략 절반이 되어 alpha 포화가 늦어진다.
-# 관측면이 prior 쪽으로 끌려가면 GRID_WCAP 를 5 → 3 으로 낮출 것.
-GRID_WCAP=${GRID_WCAP:-5.0}
-_OBSW=""; [ "${OBS_COS_WEIGHT}" = "1" ] && _OBSW="--obs_cos_weight"
+# ── 융합 파라미터는 여기 없다 ────────────────────────────────────────────
+# 확정된 값(min_unknown_frac 0.20, free_min_views 2, hull_min_frac 0, unseen_open 0,
+# obs_erode 2, obs_cos_min 0.2, obs_cos_weight on, grid_wcap 5.0, voxel_size 0.005,
+# keep_connected on, prior_sigma_w 0 …)은 전부 sdf_distill_depth.py 의 기본값이며,
+# 매 실행 로그 맨 위 [config] 표에 '지정/기본' 출처와 함께 찍힌다.
+#
+# 실험할 값만 FUSE_EXTRA 로 덧붙인다:
+#   FUSE_EXTRA="--grid_wcap 3" bash run_field_fusion_batch.sh
+#   FUSE_EXTRA="--prior_sigma_w 1.0" PHASE=fuse bash run_field_fusion_batch.sh
+FUSE_EXTRA=${FUSE_EXTRA:-}
 
 CSV=${CSV:-${OUT}/_field_batch.csv}
 FAILCSV=${FAILCSV:-${OUT}/_field_batch_failures.csv}
@@ -109,10 +94,9 @@ done
 echo "대상 객체 ${#gids[@]}개: ${gids[*]}"
 echo "설정: n_points=${NPTS} seed=${SEED} bounds_margin=${BOUNDS_MARGIN} grid=${GRID}"
 echo "      cfg=${CFG} min_comp_frac=${MIN_COMP_FRAC} ensemble=${ENSEMBLE}/${COMBINE}"
-echo "      관측신뢰도 erode=${OBS_ERODE}px cos_min=${OBS_COS_MIN} wcap=${GRID_WCAP}"
+echo "      융합 파라미터는 sdf_distill_depth.py 기본값 (로그의 [config] 표 참조)"
+[ -n "${FUSE_EXTRA}" ] && echo "      FUSE_EXTRA=${FUSE_EXTRA}"
 echo "      관측필터 |z-d|<${SEEN_MARGIN}m×${SEEN_MIN_VIEWS}뷰, free_points=${FREE_POINTS}"
-echo "      융합 min_unknown_frac=${MIN_UNKNOWN_FRAC} free_min_views=${FREE_MIN_VIEWS}"\
-" hull=${HULL_MIN_FRAC}"
 if [ -f "${CAPTIONS}" ]; then
   echo "      캡션 ${CAPTIONS} ($(grep -c . "${CAPTIONS}")줄)"
 else
@@ -221,18 +205,12 @@ if [ "${PHASE}" = "fuse" ] || [ "${PHASE}" = "all" ]; then
 
     # 융합은 객체당 수 분~십수 분. 진행 상황은 로그로만 보이므로 경로를 안내한다
     echo "  [${gid}] 융합  (진행: tail -f ${LOGDIR}/fuse_${gid}.log)"
+    # 확정 파라미터는 전부 sdf_distill_depth.py 의 기본값이다. 여기서는 경로와
+    # '아직 실험 중인 값'만 넘긴다. 실제 적용값은 로그 맨 위 [config] 표에 찍힌다.
     python sdf_distill_depth.py -m "${MDIR}" --iteration ${ITER} \
-      --data_device cpu --mask_dir auto --require_mask --mask_dist 0 \
-      --prior_field "${NPZ}" --prior_sigma_w 0 \
-      --grid_fuse --alpha_smooth 1.0 --color_blend_ramp 0.05 \
-      --unseen_open "${UNSEEN_OPEN}" \
-      --obs_erode "${OBS_ERODE}" --obs_cos_min "${OBS_COS_MIN}" ${_OBSW} \
-      --grid_wcap "${GRID_WCAP}" \
-      --prior_carve_views 150 --free_min_views "${FREE_MIN_VIEWS}" --num_cluster 10000 \
-      --min_unknown_frac "${MIN_UNKNOWN_FRAC}" --hull_min_frac "${HULL_MIN_FRAC}" \
-      --voxel_size 0.005 --max_grid 512 --keep_connected \
-      --gt_depth_dir "${GTD}" \
+      --prior_field "${NPZ}" --gt_depth_dir "${GTD}" \
       --out "${OUTD}/fused_field.ply" \
+      ${FUSE_EXTRA} \
       > "${LOGDIR}/fuse_${gid}.log" 2>&1 \
       || { echo "    융합 실패"; note_fail "${gid}" fuse "sdf_distill"; \
            show_tail "${LOGDIR}/fuse_${gid}.log" 20; ng=$((ng+1)); continue; }

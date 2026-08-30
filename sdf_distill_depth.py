@@ -26,6 +26,7 @@ RefineGS repo 루트(render.py 옆)에 두고 실행:
   #   --num_cluster                 : safe_post_process_mesh 로 재사용(클러스터 수 클램프)
 """
 import os
+import sys
 import copy
 import time
 import numpy as np
@@ -37,6 +38,10 @@ from scene import Scene
 from gaussian_renderer import render, GaussianModel
 from arguments import ModelParams, PipelineParams, get_combined_args
 import open3d as o3d
+
+# GT depth 기본 경로 — 환경변수 REFINEGS_GT_DEPTH 로 덮어쓸 수 있고, 폴더가 없으면
+# 조용히 무시된다(다른 머신에서 실행해도 깨지지 않게).
+DEFAULT_GT_DEPTH_DIR = "/home/elicer/nice-slam/Datasets/Replica/room0/results"
 
 
 # ---------------------------------------------------------------------------
@@ -896,7 +901,7 @@ def main():
     parser.add_argument("--iteration", default=-1, type=int)
     # render.py TSDF 옵션 매핑
     parser.add_argument("--depth_trunc", default=6.0, type=float, help="최대 depth (back-project cutoff)")
-    parser.add_argument("--voxel_size", default=0.01, type=float, help="marching cubes 복셀 크기(그리드 산출)")
+    parser.add_argument("--voxel_size", default=0.005, type=float, help="marching cubes 복셀 크기(그리드 산출)")
     parser.add_argument("--sdf_trunc", default=0.04, type=float, help="(참고, SDF 경로 미사용)")
     parser.add_argument("--num_cluster", default=10000, type=int, help="post-process 유지 클러스터 수(클램프됨)")
     # SDF 관련
@@ -933,7 +938,7 @@ def main():
     parser.add_argument("--prior_field_rescale", default=1, type=int,
                         help="prior 필드의 포화값을 --prior_trunc 에 맞춰 정규화(1=on). "
                              "carve 경계 급점프로 생기는 가짜 표면 방지. 영교차는 불변")
-    parser.add_argument("--prior_sigma_w", default=1.0, type=float,
+    parser.add_argument("--prior_sigma_w", default=0.0, type=float,
                         help="앙상블 σ 가중 강도(0=off). 클수록 시드가 갈리는 곳의 생성을 "
                              "적극 억제 — precision↑ recall↓")
     parser.add_argument("--prior_sigma_ref", default=0.0, type=float,
@@ -955,7 +960,7 @@ def main():
                         help="[Step4] carve/empty 샘플이 prior mesh 표면 s<=gate(m) 이내면 제외")
     parser.add_argument("--prior_uniform_n", default=200000, type=int,
                         help="uniform far-field 볼륨 샘플 수 — 셸 밖 unseen 공간 부풀림 차단")
-    parser.add_argument("--prior_carve_views", default=40, type=int,
+    parser.add_argument("--prior_carve_views", default=150, type=int,
                         help="prior 할루시네이션 carve 에 쓸 균등 간격 뷰 수(0=off)")
     parser.add_argument("--prior_carve_margin", default=0.015, type=float,
                         help="carve depth 여유(m) — 관측 표면보다 이만큼 앞이면 freespace 위반")
@@ -966,15 +971,19 @@ def main():
                         help="관측 신뢰도 포화 뷰 수 — 이 이상 관측된 복셀은 관측 TSDF 100%")
     # ── 관측 신뢰도 가중 (seen 영역 품질) ───────────────────────────────────
     # 경계 번짐·삐져나감의 원인은 '미관측'이 아니라 '나쁜 관측'이다.
-    # 셋 다 0/off 면 기존과 완전히 동일하게 동작한다(가중치 1).
-    parser.add_argument("--obs_erode", default=0, type=int,
+    # obj6 검증: free 위반 4.93%→2.40%, seen 전 지표 baseline 우위, 얇은 다리 생존.
+    # 끄려면 --obs_erode 0 --obs_cos_min 0 --no_obs_cos_weight.
+    parser.add_argument("--obs_erode", default=2, type=int,
                         help="[seen] TSDF 적분에서 객체 마스크를 N픽셀 침식 — 뷰마다 흔들리는 "
                              "마스크 경계 픽셀(전경/배경 혼합)을 배제. 2~3 권장")
-    parser.add_argument("--obs_cos_min", default=0.0, type=float,
+    parser.add_argument("--obs_cos_min", default=0.2, type=float,
                         help="[seen] |cos(시선,법선)| 이 이 값 미만인 grazing 픽셀을 TSDF 에서 "
                              "배제. depth 불연속 픽셀도 cos≈0 이라 함께 걸러진다. 0.15~0.3 권장")
-    parser.add_argument("--obs_cos_weight", action="store_true",
-                        help="[seen] 배제 대신 |cos| 로 가중 — 정면 관측이 실루엣 관측을 이긴다")
+    parser.add_argument("--obs_cos_weight", dest="obs_cos_weight", action="store_true",
+                        default=True,
+                        help="[seen] |cos| 로 가중 — 정면 관측이 실루엣 관측을 이긴다 (기본 on)")
+    parser.add_argument("--no_obs_cos_weight", dest="obs_cos_weight", action="store_false",
+                        help="cos 가중 해제(이진 배제만)")
     parser.add_argument("--obs_max_reject", default=0.35, type=float,
                         help="[seen] 관측 픽셀 배제율 상한. 넘으면 --obs_erode 를 자동으로 "
                              "1씩 낮춘다(작고 얇은 객체 보호). 배치 안전장치")
@@ -987,7 +996,7 @@ def main():
                         help="GT depth PNG 스케일(픽셀값/스케일=미터). Replica nice-slam=6553.5")
     parser.add_argument("--prior_carve_ds", default=2, type=int,
                         help="뷰 버퍼 다운스케일(작을수록 경계 정밀, 메모리↑)")
-    parser.add_argument("--free_min_views", default=3, type=int,
+    parser.add_argument("--free_min_views", default=2, type=int,
                         help="free 판정 최소 합의 뷰 수 — 1이면 OR(공격적), 3+ 권장. "
                              "얇은 구조가 depth 경계 노이즈로 갉히는 것 방지")
     parser.add_argument("--gt_edge_thr", default=0.1, type=float,
@@ -1021,7 +1030,7 @@ def main():
     parser.add_argument("--color_blend_ramp", default=0.05, type=float,
                         help="접합부 색 블렌드 거리(m) — 관측면에서 이 거리까지 관측색으로 "
                              "가중 혼합. 0=off")
-    parser.add_argument("--hull_min_frac", default=0.6, type=float,
+    parser.add_argument("--hull_min_frac", default=0.0, type=float,
                         help="[visual hull] 시야에 든 뷰 중 객체 마스크 안으로 투영된 비율이 "
                              "이 값 이상인 복셀에만 prior 허용. 0=off. 생성 기하가 바닥·인접 "
                              "객체로 새는 것을 차단")
@@ -1030,18 +1039,21 @@ def main():
     parser.add_argument("--view_stride", default=1, type=int,
                         help="[속도] 학습 뷰를 이 간격으로만 사용(back-project/carve 비용 ∝ 뷰 수). "
                              "관측 점군은 어차피 서브샘플되므로 2~4 는 손실이 작다")
-    parser.add_argument("--min_unknown_frac", default=0.10, type=float,
+    parser.add_argument("--min_unknown_frac", default=0.20, type=float,
                         help="[적용 게이트] 생성 내부 부피 중 unknown 비율이 이 값 미만이면 "
                              "prior 를 쓰지 않는다(이미 충분히 관측된 객체). 0=항상 적용")
-    parser.add_argument("--keep_connected", action="store_true",
+    parser.add_argument("--keep_connected", dest="keep_connected", action="store_true",
+                        default=True,
                         help="최종 음수 볼륨 중 관측 복셀과 연결된 성분만 유지 — "
-                             "통짜 생성 prior 의 타 객체 잔해 제거(배치에서 권장)")
+                             "통짜 생성 prior 의 타 객체 잔해 제거 (기본 on)")
+    parser.add_argument("--no_keep_connected", dest="keep_connected", action="store_false",
+                        help="연결성분 필터 해제(분리된 부품이 있는 객체)")
     parser.add_argument("--carve_depth_dir", default="", type=str,
                         help="dump_scene_depth.py 출력 폴더. 전체 씬 200뷰 depth로 free-space carving (empty-ray보다 우선)")
     parser.add_argument("--offsurf_delta", default=0.01, type=float, help="정규화 좌표 기준 off-surface 오프셋")
     parser.add_argument("--grid", default=0, type=int, help="marching cubes 해상도(0=voxel_size로 산출)")
     parser.add_argument("--max_grid", default=512, type=int)
-    parser.add_argument("--mask_dist", default=0.10, type=float,
+    parser.add_argument("--mask_dist", default=0.0, type=float,
                         help="메쉬 정점이 관측 점군에서 이 거리(world) 초과면 제거(0=off) — 박스 제거 vs 구멍채움 균형. "
                              "unseen 완성(측면/뒷면 보간)을 보존하려면 ROI crop과 함께 0 또는 크게")
     parser.add_argument("--roi_mesh", default="", type=str,
@@ -1049,8 +1061,11 @@ def main():
     parser.add_argument("--roi_dist", default=0.15, type=float)
     parser.add_argument("--mask_dir", default="auto", type=str,
                         help="뷰별 객체 마스크 폴더. 'auto'=<source_path>/masks (있으면 사용), ''=사용 안 함")
-    parser.add_argument("--require_mask", action="store_true",
-                        help="마스크 없는 학습 뷰는 통째로 skip (composed 모델에서 객체만 추출할 때 필수)")
+    parser.add_argument("--require_mask", dest="require_mask", action="store_true",
+                        default=True,
+                        help="마스크 없는 학습 뷰는 통째로 skip (객체별 추출에 필수, 기본 on)")
+    parser.add_argument("--no_require_mask", dest="require_mask", action="store_false",
+                        help="마스크 없는 뷰도 사용(씬 전체 추출)")
     parser.add_argument("--extra_poses", default="", type=str,
                         help="추가 novel 포즈 npz(render_hole_novel soft_out poses.npz). "
                              "See3D 정제된 unseen 밴드를 추출에 포함")
@@ -1060,6 +1075,46 @@ def main():
     parser.add_argument("--extra_mask_thr", default=0.3, type=float)
     parser.add_argument("--out", default="", type=str)
     args = get_combined_args(parser)
+
+    # ══ 확정 설정 자동 적용 ═══════════════════════════════════════════════
+    # obj6 튜닝으로 확정된 값들은 전부 argparse 기본값에 들어가 있다. 여기서는
+    # 명령줄로 표현하기 번거로운 나머지 셋만 처리하고, 실제 적용값을 전부 찍는다.
+    #   (기본값이 조용히 결과를 바꿔 며칠을 날린 적이 있다 — unseen_open 0.015.
+    #    그래서 '기본값을 감추는 대신 매 실행마다 전부 출력'하는 쪽을 택한다.)
+    _given = {a.split("=")[0] for a in sys.argv[1:] if a.startswith("--")}
+
+    if "--data_device" not in _given:
+        args.data_device = "cpu"              # GPU 메모리 절약, 결과 불변
+    if args.prior_field and not args.grid_fuse and "--no_grid_fuse" not in _given:
+        args.grid_fuse = True                 # prior_field 를 준 시점에 의도는 명확하다
+    if not args.gt_depth_dir and "--no_gt_depth" not in _given:
+        _d = os.environ.get("REFINEGS_GT_DEPTH", DEFAULT_GT_DEPTH_DIR)
+        if os.path.isdir(_d):
+            args.gt_depth_dir = _d
+
+    print("┌─ [config] 이번 실행에 적용된 값 " + "─" * 30)
+    for _k, _v, _note in [
+        ("prior_field",     args.prior_field,      "생성 prior 필드 npz"),
+        ("prior_sigma_w",   args.prior_sigma_w,    "σ 가중(0=off, 앙상블 npz 에서만 의미)"),
+        ("grid_fuse",       args.grid_fuse,        "결정적 grid 융합"),
+        ("obs_erode",       args.obs_erode,        "마스크 침식 px [seen 품질]"),
+        ("obs_cos_min",     args.obs_cos_min,      "grazing 배제 임계 [seen 품질]"),
+        ("obs_cos_weight",  args.obs_cos_weight,   "cos 가중 [seen 품질]"),
+        ("grid_wcap",       args.grid_wcap,        "관측 신뢰도 포화 뷰 수"),
+        ("unseen_open",     args.unseen_open,      "⚠ >0 이면 얇은 구조가 지워진다"),
+        ("free_min_views",  args.free_min_views,   "carve 합의 뷰 수"),
+        ("min_unknown_frac", args.min_unknown_frac, "prior 적용 게이트"),
+        ("hull_min_frac",   args.hull_min_frac,    "visual hull 게이트(0=off)"),
+        ("keep_connected",  args.keep_connected,   "연결성분 필터"),
+        ("voxel_size",      args.voxel_size,       "복셀 크기(m)"),
+        ("gt_depth_dir",    args.gt_depth_dir,     "GT depth(carve 기준)"),
+    ]:
+        _src = "지정" if f"--{_k}" in _given or f"--no_{_k}" in _given else "기본"
+        print(f"│ {_k:<17} = {str(_v):<28} [{_src}] {_note}")
+    print("└" + "─" * 62)
+    if args.unseen_open > 0:
+        print("⚠ [config] unseen_open > 0 — 미관측 영역의 얇은 구조(테이블 다리 등)가 "
+              "모폴로지 opening 으로 삭제된다. 의도한 것이 맞는지 확인할 것")
 
     _T0 = time.time(); _tk = _T0
 
