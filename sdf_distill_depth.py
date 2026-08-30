@@ -514,6 +514,42 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
     G = args.grid if args.grid > 0 else int(round(2 * scale / args.voxel_size))
     G = int(min(G, args.max_grid))
     print(f"[grid-fuse] G={G} voxel≈{2*scale/(G-1):.4f}m trunc={trunc}m views={len(VB)}")
+    # [관측 신뢰도] 실루엣 근처 관측은 믿을 수 없다 — grazing angle 이라 depth 오차가 크고,
+    # 마스크 경계 픽셀은 뷰마다 흔들리며 전경/배경이 섞인다. 지금까지는 모든 뷰·픽셀에
+    # 가중치 1 로 적분해서, seen/unseen 경계에서 표면이 퍼지고 물체 밖으로 삐져나갔다.
+    #   w_pix = (마스크를 erode 한 내부) × (|cos(시선, 법선)| ≥ cos_min) × (|cos| or 1)
+    # 법선은 depth 맵에서 직접 계산한다. depth 불연속 픽셀은 법선이 시선과 직교해
+    # cos≈0 이 되므로 cos_min 만으로 자동 배제된다.
+    # ⚠ 기본 off — 이전에 unseen_open 기본값이 결과를 조용히 바꾼 전례가 있어,
+    #    켤 때는 반드시 명시적으로 플래그를 준다.
+    _obs_on = args.obs_erode > 0 or args.obs_cos_min > 0 or args.obs_cos_weight
+    for b in (VB if _obs_on else []):
+        if "obsw" in b or "depth" not in b:
+            continue
+        d = b["depth"].astype(np.float32)
+        H_, W_ = d.shape
+        uu_, vv_ = np.meshgrid(np.arange(W_, dtype=np.float32),
+                               np.arange(H_, dtype=np.float32))
+        X = (uu_ - b["cx"]) * d / b["fx"]
+        Y = (vv_ - b["cy"]) * d / b["fy"]
+        P = np.stack([X, Y, d], -1)
+        du = np.gradient(P, axis=1); dv = np.gradient(P, axis=0)
+        nrm = np.cross(du, dv)
+        ln = np.linalg.norm(nrm, axis=-1)
+        vd = np.linalg.norm(P, axis=-1)
+        cos = np.abs((nrm * P).sum(-1)) / np.maximum(ln * vd, 1e-9)
+        m = b.get("mask", d > 0)
+        if args.obs_erode > 0:                      # 마스크 경계 픽셀 배제
+            m = ndimage.binary_erosion(m, iterations=int(args.obs_erode))
+        ok = m & (d > 0) & (cos >= args.obs_cos_min)
+        b["obsw"] = np.where(ok, cos if args.obs_cos_weight else 1.0, 0.0).astype(np.float32)
+    _wv = [float((b["obsw"] > 0).mean()) for b in VB if "obsw" in b]
+    if _wv:
+        _m0 = np.mean([float((b["mask"] & (b["depth"] > 0)).mean()) for b in VB])
+        print(f"[관측신뢰도] erode={args.obs_erode}px cos_min={args.obs_cos_min} "
+              f"cos_weight={args.obs_cos_weight} → 유효 픽셀 {np.mean(_wv)*100:.1f}%/뷰 "
+              f"(가중 전 {_m0*100:.1f}%, 배제 {(1-np.mean(_wv)/max(_m0,1e-9))*100:.0f}%)")
+
     n_gt = sum(1 for b in VB if "dgt" in b)
     print(f"[grid-fuse] GT depth 버퍼 {n_gt}/{len(VB)}뷰"
           + ("" if n_gt else "  ⚠ GT depth 없음 — (구)실루엣 carve 사용, 다리 절단 위험"))
@@ -569,7 +605,13 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
             nin += (infr & mi).astype(np.uint16)
             sdf = di - z                                   # 양수 = 관측 표면 앞(밖)
             hit = infr & mi & (di > 0) & (sdf > -trunc)    # 표면 뒤 trunc 초과는 미적용(occlusion)
-            f[hit] += np.clip(sdf[hit], -trunc, trunc); w[hit] += 1
+            # [관측 신뢰도] 실루엣/grazing 픽셀은 가중치가 낮거나 0 — 경계 번짐의 주원인.
+            if "obsw" in b:
+                wp = b["obsw"][vi, ui]
+                hit &= wp > 0
+                f[hit] += np.clip(sdf[hit], -trunc, trunc) * wp[hit]; w[hit] += wp[hit]
+            else:
+                f[hit] += np.clip(sdf[hit], -trunc, trunc); w[hit] += 1
             dg = b.get("dgt")
             if dg is not None:
                 # [GT-depth carve] 마스크 무관, 실제 씬 기하 기준:
@@ -902,6 +944,17 @@ def main():
                              "--prior_mesh 필수, --prior_carve_views 120+ 권장. 부풀림·스펀지 원천 차단")
     parser.add_argument("--grid_wcap", default=5.0, type=float,
                         help="관측 신뢰도 포화 뷰 수 — 이 이상 관측된 복셀은 관측 TSDF 100%")
+    # ── 관측 신뢰도 가중 (seen 영역 품질) ───────────────────────────────────
+    # 경계 번짐·삐져나감의 원인은 '미관측'이 아니라 '나쁜 관측'이다.
+    # 셋 다 0/off 면 기존과 완전히 동일하게 동작한다(가중치 1).
+    parser.add_argument("--obs_erode", default=0, type=int,
+                        help="[seen] TSDF 적분에서 객체 마스크를 N픽셀 침식 — 뷰마다 흔들리는 "
+                             "마스크 경계 픽셀(전경/배경 혼합)을 배제. 2~3 권장")
+    parser.add_argument("--obs_cos_min", default=0.0, type=float,
+                        help="[seen] |cos(시선,법선)| 이 이 값 미만인 grazing 픽셀을 TSDF 에서 "
+                             "배제. depth 불연속 픽셀도 cos≈0 이라 함께 걸러진다. 0.15~0.3 권장")
+    parser.add_argument("--obs_cos_weight", action="store_true",
+                        help="[seen] 배제 대신 |cos| 로 가중 — 정면 관측이 실루엣 관측을 이긴다")
     parser.add_argument("--grid_smooth", default=0.7, type=float,
                         help="융합 grid 가우시안 스무딩 sigma(voxel). 0=off")
     parser.add_argument("--gt_depth_dir", default="", type=str,

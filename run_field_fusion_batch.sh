@@ -67,6 +67,20 @@ HULL_MIN_FRAC=${HULL_MIN_FRAC:-0}
 #   게이트를 모두 꺼도 이 단계가 돌아 '강제 융합'조차 실패했던 원인). 반드시 0 유지.
 UNSEEN_OPEN=${UNSEEN_OPEN:-0}
 
+# [seen 품질] 관측 신뢰도 가중 — seen/unseen 경계에서 표면이 퍼지고 물체 밖으로
+#   삐져나가는 것은 '미관측'이 아니라 '나쁜 관측'(grazing angle + 흔들리는 마스크
+#   경계 + depth 불연속)이 원인. 셋 다 0/off 면 기존 동작과 완전히 동일하다.
+# ⚠ OBS_ERODE 는 기본 0 — 얇은 다리는 영상에서 폭이 몇 픽셀뿐이라 2px 침식이
+#   다리의 '관측 근거'를 통째로 지울 수 있다(그 경우 다리는 사라지지 않고 prior
+#   기하로 대체된다). obj6 에서 A/B 로 다리 생존을 확인한 뒤에만 올릴 것.
+OBS_ERODE=${OBS_ERODE:-0}          # 마스크 N픽셀 침식
+OBS_COS_MIN=${OBS_COS_MIN:-0.2}    # |cos(시선,법선)| 하한 (검증: 80도=0.23, 불연속=0.01)
+OBS_COS_WEIGHT=${OBS_COS_WEIGHT:-1}  # 1이면 |cos| 가중, 0이면 이진 배제만
+# cos 가중을 켜면 Wo(관측 가중합)가 대략 절반이 되어 alpha 포화가 늦어진다.
+# 관측면이 prior 쪽으로 끌려가면 GRID_WCAP 를 5 → 3 으로 낮출 것.
+GRID_WCAP=${GRID_WCAP:-5.0}
+_OBSW=""; [ "${OBS_COS_WEIGHT}" = "1" ] && _OBSW="--obs_cos_weight"
+
 CSV=${CSV:-${OUT}/_field_batch.csv}
 FAILCSV=${FAILCSV:-${OUT}/_field_batch_failures.csv}
 LOGDIR=${LOGDIR:-${PRIOR}/logs}
@@ -204,6 +218,8 @@ if [ "${PHASE}" = "fuse" ] || [ "${PHASE}" = "all" ]; then
       --prior_field "${NPZ}" --prior_sigma_w 0 \
       --grid_fuse --alpha_smooth 1.0 --color_blend_ramp 0.05 \
       --unseen_open "${UNSEEN_OPEN}" \
+      --obs_erode "${OBS_ERODE}" --obs_cos_min "${OBS_COS_MIN}" ${_OBSW} \
+      --grid_wcap "${GRID_WCAP}" \
       --prior_carve_views 150 --free_min_views "${FREE_MIN_VIEWS}" --num_cluster 10000 \
       --min_unknown_frac "${MIN_UNKNOWN_FRAC}" --hull_min_frac "${HULL_MIN_FRAC}" \
       --voxel_size 0.005 --max_grid 512 --keep_connected \
