@@ -70,10 +70,9 @@ UNSEEN_OPEN=${UNSEEN_OPEN:-0}
 # [seen 품질] 관측 신뢰도 가중 — seen/unseen 경계에서 표면이 퍼지고 물체 밖으로
 #   삐져나가는 것은 '미관측'이 아니라 '나쁜 관측'(grazing angle + 흔들리는 마스크
 #   경계 + depth 불연속)이 원인. 셋 다 0/off 면 기존 동작과 완전히 동일하다.
-# ⚠ OBS_ERODE 는 기본 0 — 얇은 다리는 영상에서 폭이 몇 픽셀뿐이라 2px 침식이
-#   다리의 '관측 근거'를 통째로 지울 수 있다(그 경우 다리는 사라지지 않고 prior
-#   기하로 대체된다). obj6 에서 A/B 로 다리 생존을 확인한 뒤에만 올릴 것.
-OBS_ERODE=${OBS_ERODE:-0}          # 마스크 N픽셀 침식
+# OBS_ERODE=2 검증 완료(obj6): free 위반 4.24%→2.38%, 위반점 accuracy 20.1→10.9mm,
+#   얇은 다리 생존(unseen R@2cm 0.685→0.682, 사실상 불변). 3 이상은 미검증.
+OBS_ERODE=${OBS_ERODE:-2}          # 마스크 N픽셀 침식
 OBS_COS_MIN=${OBS_COS_MIN:-0.2}    # |cos(시선,법선)| 하한 (검증: 80도=0.23, 불연속=0.01)
 OBS_COS_WEIGHT=${OBS_COS_WEIGHT:-1}  # 1이면 |cos| 가중, 0이면 이진 배제만
 # cos 가중을 켜면 Wo(관측 가중합)가 대략 절반이 되어 alpha 포화가 늦어진다.
