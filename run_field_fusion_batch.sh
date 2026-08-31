@@ -40,12 +40,12 @@ GRID=${GRID:-256}
 # 부유물 : 필드의 음수 연결성분 중 최대 성분 대비 min_comp_frac 미만 제거.
 CFG=${CFG:-5}
 MIN_COMP_FRAC=${MIN_COMP_FRAC:-0.02}
-# 앙상블: 조건을 고정한 A/B 에서 유의한 차이가 없어 기본 off 로 확정했다.
-#   (obj6_best.npz 와 배치 결과의 unseen precision 차이를 앙상블 탓으로 본 적이 있으나,
-#    그 비교는 npz 생성과 GRID_WCAP 이 동시에 달라 교란돼 있었다 — 근거로 쓰지 말 것.)
-#   생성 비용이 ENSEMBLE 배가 되므로, 켜려면 fuse 플래그를 고정한 깨끗한 A/B 로
-#   이득을 먼저 입증할 것. 평균/중앙값은 얇은 구조를 지우므로 combine 은 best 만 쓴다.
-ENSEMBLE=${ENSEMBLE:-1}
+# 앙상블: ab_ensemble.sh 로 --prior_field 만 바꾼 격리 A/B 결과(obj6) —
+#   unseen P@2cm 0.6054 → 0.6872 (+8.2%p), unseen acc 24.52 → 23.24mm.
+#   seen 비용은 acc +0.047mm, F@1cm -0.0008 로 노이즈 수준. 생성 시간만 3배.
+#   (같은 A/B 에서 σ 가중은 세 번째 자리만 움직여 무효 → prior_sigma_w 0 유지)
+#   평균/중앙값 결합은 얇은 구조를 지우므로 combine 은 best 만 쓴다.
+ENSEMBLE=${ENSEMBLE:-3}
 COMBINE=${COMBINE:-best}
 # 포인트 샘플링 시드 — 고정해야 재실행/설정비교가 재현된다.
 # (이게 없으면 같은 명령도 매번 다른 조건 포인트를 만들어 결과가 흔들린다)
@@ -160,7 +160,18 @@ if [ "${PHASE}" = "field" ] || [ "${PHASE}" = "all" ]; then
     PKL=${SHAPER_DIR}/data/obj${gid}.pkl
     NPZ=${PRIOR}/obj${gid}_field.npz
     [ -f "${PKL}" ] || { echo "  [skip ${gid}] pkl 없음"; note_fail "${gid}" field "pkl 없음"; continue; }
-    [ -f "${NPZ}" ] && { echo "  [skip ${gid}] 필드 이미 있음"; continue; }
+    # [stale prior 가드] 기존 npz 를 무조건 skip 하면, ENSEMBLE 을 켜도 예전 단일 샘플
+    # prior 를 조용히 재사용한다(파일명이 같아서 눈치채기 어렵다). 앙상블 산출물은
+    # field_std 를 갖고 있으므로 그걸로 구분해 필요하면 다시 만든다.
+    if [ -f "${NPZ}" ]; then
+      if [ "${ENSEMBLE}" -gt 1 ] && \
+         ! python -c "import numpy,sys; sys.exit(0 if 'field_std' in numpy.load(sys.argv[1]).files else 1)" "${NPZ}" 2>/dev/null; then
+        echo "  [${gid}] 기존 필드가 단일 샘플(field_std 없음) — 앙상블로 재생성"
+        mv -f "${NPZ}" "${NPZ%.npz}_single.npz"
+      else
+        echo "  [skip ${gid}] 필드 이미 있음"; continue
+      fi
+    fi
     echo "  [${gid}] field 추출"
     CMD="cd '${SHAPER_DIR}' && LD_LIBRARY_PATH= python shaper_field.py \
          --input_pkl data/obj${gid}.pkl --config balance --grid ${GRID} \
