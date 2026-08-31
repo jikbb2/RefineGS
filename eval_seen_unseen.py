@@ -261,12 +261,26 @@ def classify(P, views, margin, min_views, use_mask):
     return seen, free
 
 
-def sample(mesh_path, n):
+def sample(mesh_path, n, seed=0):
+    """메쉬 균등 샘플. ⚠ 시드 필수.
+
+    시드가 없으면 같은 메쉬를 두 번 평가해도 지표가 달라진다. 실측(obj6, wcap 스윕)
+    에서 seen F@1cm 이 wcap 3→4→5 에 대해 0.9254→0.9179→0.9213 으로 비단조로
+    튀었는데, 물리적으로 단조여야 할 값이었다 — 원인이 이 샘플링이었다.
+    설정 비교를 하려면 반드시 같은 시드로, 노이즈 폭을 알려면 시드를 바꿔가며 잰다.
+    """
     m = o3d.io.read_triangle_mesh(os.path.expanduser(mesh_path))
     assert len(m.vertices), f"메쉬 로드 실패: {mesh_path}"
     if len(m.triangles) == 0:
         return np.asarray(m.vertices)
-    pc = m.sample_points_uniformly(number_of_points=n)
+    try:                                    # o3d >= 0.16 전역 RNG
+        o3d.utility.random.seed(int(seed))
+    except Exception:
+        pass
+    try:                                    # 일부 버전은 seed 인자를 받는다
+        pc = m.sample_points_uniformly(number_of_points=n, seed=int(seed))
+    except TypeError:
+        pc = m.sample_points_uniformly(number_of_points=n)
     return np.asarray(pc.points)
 
 
@@ -358,6 +372,10 @@ def main():
     ap.add_argument("--n_views", type=int, default=120, help="사용할 뷰 수(균등 서브샘플, 0=전체)")
     ap.add_argument("--ds", type=int, default=2, help="depth/mask 다운스케일")
     ap.add_argument("--n_sample", type=int, default=200000)
+    ap.add_argument("--seed", type=int, default=0,
+                    help="메쉬 샘플링 시드. 설정 비교는 반드시 같은 시드로. "
+                         "시드를 0..4 로 바꿔가며 같은 메쉬를 재평가하면 이 평가 자체의 "
+                         "노이즈 폭을 알 수 있다(그보다 작은 차이는 해석하지 말 것)")
     ap.add_argument("--margin", type=float, default=0.015,
                     help="가시 판정 허용오차(m) — GT depth 노이즈+이산화 여유")
     ap.add_argument("--min_views", type=int, default=1,
@@ -383,7 +401,7 @@ def main():
         if args.gt_labels:
             labs = [int(x) for x in args.gt_labels.split(",")]
         else:
-            ref = sample(args.recon, min(args.n_sample, 100000))
+            ref = sample(args.recon, min(args.n_sample, 100000), args.seed)
             labs = auto_match_labels(V, T, L, ref, args.match_min_share)
         sel = np.isin(L, labs)
         assert sel.any(), f"object_id={labs} 인 면이 없음"
@@ -407,11 +425,11 @@ def main():
         print("  ⚠ unseen 이 거의 없음 — margin 과다 또는 뷰/depth 매칭 확인")
 
     rows = []
-    a = report("A: " + args.recon, sample(args.recon, args.n_sample),
+    a = report("A: " + args.recon, sample(args.recon, args.n_sample, args.seed),
                G, gs, None, thr, views, args)
     rows.append(a)
     if args.recon2:
-        b = report("B: " + args.recon2, sample(args.recon2, args.n_sample),
+        b = report("B: " + args.recon2, sample(args.recon2, args.n_sample, args.seed),
                    G, gs, None, thr, views, args)
         rows.append(b)
         print("\n===== A → B 변화 (원하는 방향: seen acc 유지, unseen comp 감소) =====")
