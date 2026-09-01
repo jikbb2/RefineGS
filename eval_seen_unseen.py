@@ -262,12 +262,15 @@ def classify(P, views, margin, min_views, use_mask):
 
 
 def sample(mesh_path, n, seed=0):
-    """메쉬 균등 샘플. ⚠ 시드 필수.
+    """메쉬 균등 샘플. 설정 비교는 반드시 같은 시드로.
 
-    시드가 없으면 같은 메쉬를 두 번 평가해도 지표가 달라진다. 실측(obj6, wcap 스윕)
-    에서 seen F@1cm 이 wcap 3→4→5 에 대해 0.9254→0.9179→0.9213 으로 비단조로
-    튀었는데, 물리적으로 단조여야 할 값이었다 — 원인이 이 샘플링이었다.
-    설정 비교를 하려면 반드시 같은 시드로, 노이즈 폭을 알려면 시드를 바꿔가며 잰다.
+    측정된 노이즈 폭 (obj6 융합 메쉬, 시드 5회, eval_noise.sh):
+        seen F@1cm  ±0.0001    seen acc      ±0.022mm
+        seen P@1cm  ±0.0003    unseen acc    ±0.26mm
+        seen R@1cm  ±0.0004    unseen P@2cm  ±0.0033
+        free 위반   ±0.085%p   unseen R@2cm  ±0.0005
+    → 이 프로토콜은 재현성이 매우 높다. 위 폭보다 큰 차이는 실재하는 차이로 봐도
+      되고(예: wcap 스윕의 F@1cm 0.0075 는 노이즈의 75배), 작으면 해석하지 말 것.
     """
     m = o3d.io.read_triangle_mesh(os.path.expanduser(mesh_path))
     assert len(m.vertices), f"메쉬 로드 실패: {mesh_path}"
@@ -352,7 +355,8 @@ def main():
                          "대상 객체를 자동 추출(--gt_label 로 직접 지정 가능)")
     ap.add_argument("--gt_labels", default="",
                     help="추출할 object_id 목록(쉼표). 비우면 recon 겹침 투표로 자동 매칭 "
-                         "— SAM3 인스턴스가 여러 GT 객체를 아우르는 경우까지 커버")
+                         "— SAM3 인스턴스가 여러 GT 객체를 아우르는 경우까지 커버. "
+                         "'all' 이면 라벨 선택 없이 씬 전체와 비교(씬 단위 평가)")
     ap.add_argument("--match_min_share", type=float, default=0.10,
                     help="자동 매칭 시 채택할 라벨의 최소 득표 비율")
     ap.add_argument("--recon", required=True, help="비교 A (보통 fuse_post.ply)")
@@ -397,7 +401,12 @@ def main():
     Vs, Ts = (V, T)
     if args.gt_scene_mesh:                            # 씬 메쉬를 따로 준 경우
         Vs, Ts, _ = load_mesh_labeled(args.gt_scene_mesh)
-    if L is not None:
+    if L is not None and args.gt_labels.strip().lower() == "all":
+        # [씬 평가] 라벨 선택 없이 GT 전체를 쓴다. per-object 평가가 성립하지 않는
+        # 경우(SAM3 인스턴스가 GT 객체 여럿에 걸침, 생성 prior 가 인스턴스 밖으로
+        # 물체를 완성함)를 위한 경로 — 씬 단위에서는 그 기하가 오답이 아니다.
+        print(f"[GT] 전체 씬 사용: tri {len(T)}  (라벨 선택 없음)")
+    elif L is not None:
         if args.gt_labels:
             labs = [int(x) for x in args.gt_labels.split(",")]
         else:
