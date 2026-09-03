@@ -13,11 +13,19 @@
 #     뷰가 200장이라 진짜 빈 공간은 어차피 다수가 동의한다
 #     (로그 증거: '합의 2뷰 24.7% / 1뷰라도 24.7%').
 #
-#   [검증 중] 관측 신뢰도 가중. cos/erode 로 관측을 버리면 그 복셀은 Wo=0 이 되고,
-#     prior 가 차단된 상태에서는 채울 것이 없어 구멍이 된다. B 에서 prior 가
-#     seen F@1 을 0.821→0.870 으로 되돌린 것도 이 구멍을 메운 것으로 설명된다.
-#     ⇒ 그렇다면 A′ 는 공정한 ablation 팔이 아니다(관측 폐기는 prior 가 메운다는
-#       전제 위의 설계). 그 경우 논문에는 A vs B 만 싣고 A′ 는 진단용으로만 쓴다.
+#   [확정] 원인은 관측 신뢰도 가중이었다. prior 차단, 5객체 중앙값:
+#              baseline    full   nocos  noerode   none
+#     seen F@1    0.924   0.857   0.866    0.895  0.960   ← 전부 끄면 baseline 을 넘는다
+#     uns F@2     0.214   0.099   0.100    0.156  0.221
+#     free 위반    3.814   0.326   0.336    1.413  4.184   ← 유일하게 full 이 이기는 축
+#     기여: 침식 +0.038, cos 게이트 +0.009, 전부 해제 +0.103 (합보다 큼)
+#     ⇒ 세 번째 성분인 |cos| 가중 자체가 가장 크다. Wo 를 절반으로 줄여 alpha 가
+#       낮아지고, 채울 prior 가 없으면 그 복셀이 그대로 빈 공간이 된다.
+#
+#   [남은 질문] 위는 prior 차단 조건이다. 관측 가중은 '버린 관측을 prior 가
+#     메운다'는 전제의 설계이므로, PRIOR_ON=1 로 같은 팔을 돌려 상호작용을
+#     확인하기 전에는 제거를 결정하지 않는다. obj6 에서는 prior 를 켠 채로
+#     관측 가중이 도움이 됐다(free 위반 4.93→1.65, seen F@1 0.881→0.924).
 #
 # 왜 여러 객체인가:
 #   현재 값은 뷰 205장짜리 큰 객체 obj6 하나로 정했고 일반화되지 않았다.
@@ -64,12 +72,18 @@ arm_flags () {            # 팔 이름 → sdf_distill_depth.py 플래그
   esac
 }
 
+# PRIOR_ON=1 이면 prior 를 켠 채로 같은 팔을 돈다. 관측 가중은 '버린 관측을
+# prior 가 메운다'는 전제의 설계라, 최종 판단은 반드시 이쪽 결과로 해야 한다.
+# (prior 차단 결과만 보고 빼면 또 한 변수만 보고 결정하는 것)
+PRIOR_ON=${PRIOR_ON:-0}
+if [ "${PRIOR_ON}" = "1" ]; then GATE=""; TAGP="B"; else GATE="--min_unknown_frac 1.1"; TAGP="A′"; fi
+
 LOGDIR=${LOGDIR:-${PRIOR}/logs}
-CSV=${CSV:-${PRIOR}/_sweep_${AXIS}.csv}
+CSV=${CSV:-${PRIOR}/_sweep_${AXIS}${PRIOR_ON:+_p$PRIOR_ON}.csv}
 mkdir -p "${LOGDIR}"; rm -f "${CSV}"
 cd "${ROOT}" || exit 1
 
-echo "=== 융합 단계 스윕 (prior 차단)  축=${AXIS}  팔: ${VALS} ==="
+echo "=== 융합 단계 스윕  팔=${TAGP} (${AXIS})  arms: ${VALS} ==="
 echo "객체: ${GIDS}"
 echo ""
 
@@ -83,14 +97,14 @@ for V in ${VALS}; do
     echo -n "  ${NAME} ... "
     python sdf_distill_depth.py -m "${MDIR}" --iteration ${ITER} \
       --prior_field "${NPZ}" --gt_depth_dir "${GTD}" \
-      --min_unknown_frac 1.1 $(arm_flags "${V}") \
-      --out "${OUTD}/sw_${AXIS}${V}.ply" \
+      ${GATE} $(arm_flags "${V}") \
+      --out "${OUTD}/sw_p${PRIOR_ON}${AXIS}${V}.ply" \
       > "${LOGDIR}/sw_${NAME}.log" 2>&1 || { echo "융합 실패"; tail -5 "${LOGDIR}/sw_${NAME}.log"; continue; }
     # 관측복셀 비율이 팔마다 얼마나 달라지는지 — recall 손실의 직접 증거
     grep -h "^\[관측신뢰도\]\|^\[grid-fuse\] 관측복셀" "${LOGDIR}/sw_${NAME}.log" \
       | tr '\n' ' ' | sed 's/^/        /'; echo
     python eval_seen_unseen.py --gt_mesh "${GT_MESH}" \
-      --recon "${OUTD}/fuse_post.ply" --recon2 "${OUTD}/sw_${AXIS}${V}_post.ply" \
+      --recon "${OUTD}/fuse_post.ply" --recon2 "${OUTD}/sw_p${PRIOR_ON}${AXIS}${V}_post.ply" \
       --colmap "${COLMAP}" --gid "${g}" --masks_root "${MASKS}" --use_mask \
       ${STEMS:+$([ -f "${STEMS}" ] && echo --stems "${STEMS}")} \
       --match_min_share "${MATCH_MIN_SHARE}" --seed 0 \
@@ -115,7 +129,7 @@ ks = [("seen acc(mm)","seen_acc"), ("seen F@1cm","seen_F1.0"),
 vals = sorted(by, key=lambda x: (0,float(x)) if x.replace(".","").isdigit() else (1,0))
 w = max(len(k[0]) for k in ks) + 2
 bl = next(iter(base.values()), None)
-print(f"객체 {len(next(iter(by.values())))}개 중앙값 (prior 차단)\n")
+print(f"객체 {len(next(iter(by.values())))}개 중앙값\n")
 print(" "*w + f"{'baseline':>12}" + "".join(f"{v:>12}" for v in vals))
 for nm, k in ks:
     b = st.median(float(r[k]) for r in bl) if bl else float("nan")
