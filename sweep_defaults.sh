@@ -16,18 +16,13 @@
 #   uns F@2 ±0.0033, free ±0.085%p. 이보다 작은 차이는 해석하지 않는다.
 #
 # 축:
-#   wcap        [진행중] 5객체 결과 — 8 이 5보다 낫고 아직 꺾이지 않았다:
-#                            baseline      3      5      8
-#                 seen acc      5.055  5.010  4.972  4.481   ← 8 이 크게 이김
-#                 seen F@1      0.924  0.959  0.959  0.960
-#                 uns comp      125.5  23.09  23.18  24.24
-#                 uns F@2       0.214  0.355  0.371  0.367   ← 5 와 사실상 동률
-#                 free 위반      3.814  6.626  5.893  4.923   ← 8 이 크게 이김
+#   wcap        [종결] 8 채택, 기본값 반영 완료.
+#               5객체(3/5/8): 5→8 이 seen acc -0.49mm, free -0.97%p 로 크게 이김
+#               3객체(8/16/32): 8 에서 평탄. 32 까지 가면 seen acc 만 0.12mm 얻고
+#                 uns comp +2.6mm, free +0.33%p 를 잃는다.
 #               alpha=clip(Wo/wcap,0,1) 이고 뷰가 200장이라 잘 관측된 복셀의 Wo 는
 #               수십~수백이다. wcap 을 올리면 '몇 뷰만 관측된 경계 밴드'만 prior 로
 #               넘어간다. 관측가중은 그 밴드를 삭제했고(손해), wcap 은 위임한다(이득).
-#               ⇒ 다음: VALS="8 16 32". 무한대로 가면 순수 prior(obj6 단독 9.35mm)가
-#                 되므로 반드시 꺾인다. 그 지점을 찾는다.
 #   gate        prior 적용 게이트.       obj16/obj8 을 막았는데 그 판단이 옳았는지 미확인
 #   carveviews  prior 할루시네이션 carve. free 위반(유일한 약축)의 직접 레버
 #   connect     연결성분 필터.           분리 부품이 있는 객체에서 손해일 수 있음
@@ -61,7 +56,7 @@ MATCH_MIN_SHARE=${MATCH_MIN_SHARE:-0.03}
 GIDS=${GIDS:-"6 1 22 2 16"}
 AXIS=${AXIS:-wcap}
 case "${AXIS}" in
-  wcap)       VALS=${VALS:-"3 5 8"} ;;          # 현재 5
+  wcap)       VALS=${VALS:-"8 16 32"} ;;        # 현재 8 (종결)
   gate)       VALS=${VALS:-"0 0.2 0.4"} ;;      # 현재 0.2
   carveviews) VALS=${VALS:-"40 150 300"} ;;     # 현재 150
   connect)    VALS=${VALS:-"on off"} ;;         # 현재 on
@@ -160,6 +155,8 @@ for nm, k, sgn in ks:
     mark = "" if spread > NOISE[k] else "   (차이가 노이즈 이하)"
     print(f"{nm:<{w}}{b:>12.3f}" + "".join(f"{m[v]:>12.3f}" for v in vals) + mark)
 print("\n축별 최선: " + ", ".join(f"{nm}→{v}" for nm, v in best.items()))
-print("현재 기본값 기준선(5객체): seen acc 4.979 / F@1 0.959 / uns comp 23.18 / "
-      "uns F@2 0.371 / free 5.80 — 현재 값 열이 이를 재현하는지 먼저 확인할 것")
+print("⚠ baseline 열은 GIDS 가 바뀌면 함께 바뀐다(다른 객체 집합의 중앙값).")
+print("  실행끼리 절대값을 가로질러 비교하지 말 것 — 같은 표 안에서만 비교한다.")
+print("  참고 기준선  5객체(6/1/22/2/16): baseline uns F@2 0.214 / free 3.81")
+print("               3객체(6/22/2)     : baseline uns F@2 0.174 / free 4.93")
 PY
