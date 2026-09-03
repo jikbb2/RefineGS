@@ -850,6 +850,41 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
     verts, faces, _, _ = marching_cubes(F, level=0.0, spacing=(step,) * 3)
     verts = (verts - 1.0) * scale + center
 
+    # ══ [sanity] prior 오배치 검출 ═════════════════════════════════════════
+    # 배치 실측: obj0 는 seen accuracy 3.85mm → 1165mm(1.2m!), free 위반 41% 로
+    # 멀쩡한 재구성을 prior 가 통째로 망가뜨렸다. obj20/28/31 도 같은 양상.
+    # 품질 저하가 아니라 '생성물이 엉뚱한 곳에 놓인' 정렬 실패이므로, GT 없이도
+    # 두 가지로 잡아낼 수 있다. 조용히 쓰레기를 내보내느니 실패하는 편이 낫다.
+    #   1) 출력 표면이 '관측된 빈 공간'에 있는 비율
+    #   2) 관측 영역에서 출력 표면이 관측 TSDF 표면으로부터 밀려난 거리
+    if not args.no_sanity:
+        vi_ = np.clip(((verts - center) / scale + 1.0) / step, 0, G - 1).astype(int)
+        sx, sy, sz = vi_[:, 0], vi_[:, 1], vi_[:, 2]
+        s_free = float(FREE[sx, sy, sz].mean())
+        obsv = Wo[sx, sy, sz] > 0
+        s_disp = float(np.median(np.abs(Fobs[sx, sy, sz][obsv]))) if obsv.any() else 0.0
+        print(f"[sanity] 출력 표면 {len(verts)}점 중 관측된 빈 공간 {s_free*100:.1f}% "
+              f"(임계 {args.sanity_free_max*100:.0f}%) / 관측영역 표면 이탈 중앙값 "
+              f"{s_disp*1000:.1f}mm (임계 {args.sanity_disp_max*1000:.0f}mm, "
+              f"관측 표면 위 정점 {int(obsv.sum())}개)")
+        bad = []
+        if s_free > args.sanity_free_max:
+            bad.append(f"표면의 {s_free*100:.0f}% 가 관측된 빈 공간에 있음")
+        if s_disp > args.sanity_disp_max:
+            bad.append(f"관측 표면에서 {s_disp*1000:.0f}mm 이탈")
+        if bad:
+            print("\n" + "!" * 70)
+            print("[sanity] 융합 결과가 관측과 모순됩니다 — prior 오배치로 판단해 중단합니다.")
+            for b_ in bad:
+                print(f"  · {b_}")
+            print("  확인 순서: ① npz 의 center/scale/R_align 이 이 객체 것인지"
+                  " (다른 객체 npz 를 가리키고 있지 않은지)")
+            print("            ② pkl 의 T_model_world 와 bounds")
+            print("            ③ SAM3 인스턴스가 GT 객체 여럿에 걸쳐 있지 않은지")
+            print("  이 검사를 끄려면 --no_sanity (권장하지 않음)")
+            print("!" * 70, flush=True)
+            sys.exit(2)
+
     # [debug] 생성 표면 샘플의 분류 시각화 — 다리가 왜 잘리는지 눈으로 판별:
     # 초록=unknown(생성 유지), 파랑=관측 지배, 노랑=타객체, 빨강=free-carve
     if getattr(args, "debug_class_ply", ""):
@@ -969,21 +1004,45 @@ def main():
                              "--prior_mesh 필수, --prior_carve_views 120+ 권장. 부풀림·스펀지 원천 차단")
     parser.add_argument("--grid_wcap", default=5.0, type=float,
                         help="관측 신뢰도 포화 뷰 수 — 이 이상 관측된 복셀은 관측 TSDF 100%")
-    # ── 관측 신뢰도 가중 (seen 영역 품질) ───────────────────────────────────
-    # 경계 번짐·삐져나감의 원인은 '미관측'이 아니라 '나쁜 관측'이다.
-    # obj6 검증: free 위반 4.93%→2.40%, seen 전 지표 baseline 우위, 얇은 다리 생존.
-    # 끄려면 --obs_erode 0 --obs_cos_min 0 --no_obs_cos_weight.
-    parser.add_argument("--obs_erode", default=2, type=int,
+    # ── 관측 신뢰도 가중 (기본 off) ─────────────────────────────────────────
+    # obj6 의 경계 번짐을 고치려고 넣었고 그 객체에서는 효과가 있었으나(free 위반
+    # 4.93→1.65%), 5객체(6/1/22/2/16) 스윕에서 순손실로 확인돼 기본값을 껐다.
+    #
+    #   prior ON, 5객체 중앙값        baseline   full  noerode   none(=off)
+    #     seen F@1cm                    0.924   0.923    0.933   0.959
+    #     unseen F@2cm                  0.214   0.344    0.351   0.371
+    #     unseen completion(mm)         125.5   23.29    23.44   23.18
+    #     free 위반(%)                    3.81    4.42     4.49    5.80
+    #
+    # prior 를 꺼도(= 버린 관측을 메울 것이 없어도) 같은 결론이었다:
+    #     seen F@1cm  full 0.857 / nocos 0.866 / noerode 0.895 / none 0.960
+    #   성분 기여는 침식 +0.038, cos 게이트 +0.009, 전부 해제 +0.103 으로 합보다
+    #   커서, |cos| 가중 자체가 가장 크다(Wo 가 절반이 되어 alpha 가 낮아진다).
+    #
+    # 유일하게 켜서 이득인 축은 free 위반이다. 그것만 필요하면 --obs_erode 0
+    # --obs_cos_min 0.2 (noerode) 가 절충점: seen acc 4.381mm 로 가장 좋고
+    # free 위반 4.49% 로 none 의 5.80% 보다 낮다.
+    parser.add_argument("--obs_erode", default=0, type=int,
                         help="[seen] TSDF 적분에서 객체 마스크를 N픽셀 침식 — 뷰마다 흔들리는 "
                              "마스크 경계 픽셀(전경/배경 혼합)을 배제. 2~3 권장")
-    parser.add_argument("--obs_cos_min", default=0.2, type=float,
+    parser.add_argument("--obs_cos_min", default=0.0, type=float,
                         help="[seen] |cos(시선,법선)| 이 이 값 미만인 grazing 픽셀을 TSDF 에서 "
                              "배제. depth 불연속 픽셀도 cos≈0 이라 함께 걸러진다. 0.15~0.3 권장")
     parser.add_argument("--obs_cos_weight", dest="obs_cos_weight", action="store_true",
-                        default=True,
-                        help="[seen] |cos| 로 가중 — 정면 관측이 실루엣 관측을 이긴다 (기본 on)")
+                        default=False,
+                        help="[seen] |cos| 로 가중 — 정면 관측이 실루엣 관측을 이긴다. "
+                             "⚠ 기본 off: 5객체 스윕에서 seen F@1cm 을 가장 크게 깎은 성분")
     parser.add_argument("--no_obs_cos_weight", dest="obs_cos_weight", action="store_false",
-                        help="cos 가중 해제(이진 배제만)")
+                        help="cos 가중 해제(기본값)")
+    # ── prior 오배치 sanity 검사 (배치 안전장치) ────────────────────────────
+    parser.add_argument("--sanity_free_max", default=0.25, type=float,
+                        help="출력 표면 중 '관측된 빈 공간'에 있는 비율 상한. 넘으면 중단. "
+                             "실측: 정상 2~18%, obj0 오배치 41%")
+    parser.add_argument("--sanity_disp_max", default=0.05, type=float,
+                        help="관측 영역에서 출력 표면이 관측 TSDF 표면으로부터 이탈한 "
+                             "거리(m) 중앙값 상한. 실측: 정상 4~8mm, obj20 116mm")
+    parser.add_argument("--no_sanity", action="store_true",
+                        help="sanity 검사 해제 — 오배치된 prior 가 그대로 출력된다")
     parser.add_argument("--obs_max_reject", default=0.35, type=float,
                         help="[seen] 관측 픽셀 배제율 상한. 넘으면 --obs_erode 를 자동으로 "
                              "1씩 낮춘다(작고 얇은 객체 보호). 배치 안전장치")
