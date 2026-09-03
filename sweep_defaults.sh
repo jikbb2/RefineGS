@@ -15,18 +15,34 @@
 # 평가 노이즈 폭(eval_noise.sh 실측): seen F@1 ±0.0001, seen acc ±0.022mm,
 #   uns F@2 ±0.0033, free ±0.085%p. 이보다 작은 차이는 해석하지 않는다.
 #
-# 축 (권장 순서):
-#   wcap        관측/생성 신뢰도 균형.   obj6 스윕에서 5 채택, 5객체 미확인
+# 축:
+#   wcap        [진행중] 5객체 결과 — 8 이 5보다 낫고 아직 꺾이지 않았다:
+#                            baseline      3      5      8
+#                 seen acc      5.055  5.010  4.972  4.481   ← 8 이 크게 이김
+#                 seen F@1      0.924  0.959  0.959  0.960
+#                 uns comp      125.5  23.09  23.18  24.24
+#                 uns F@2       0.214  0.355  0.371  0.367   ← 5 와 사실상 동률
+#                 free 위반      3.814  6.626  5.893  4.923   ← 8 이 크게 이김
+#               alpha=clip(Wo/wcap,0,1) 이고 뷰가 200장이라 잘 관측된 복셀의 Wo 는
+#               수십~수백이다. wcap 을 올리면 '몇 뷰만 관측된 경계 밴드'만 prior 로
+#               넘어간다. 관측가중은 그 밴드를 삭제했고(손해), wcap 은 위임한다(이득).
+#               ⇒ 다음: VALS="8 16 32". 무한대로 가면 순수 prior(obj6 단독 9.35mm)가
+#                 되므로 반드시 꺾인다. 그 지점을 찾는다.
 #   gate        prior 적용 게이트.       obj16/obj8 을 막았는데 그 판단이 옳았는지 미확인
 #   carveviews  prior 할루시네이션 carve. free 위반(유일한 약축)의 직접 레버
 #   connect     연결성분 필터.           분리 부품이 있는 객체에서 손해일 수 있음
 #   obs         [종결] 관측가중 — 기록용. 결론: 전부 off
 #
-# 비용: 융합 1회 약 5분 × 객체수 × 값 개수. 기본(5객체×3값) 축당 약 75분.
-#   선별만 빠르게 하려면 GIDS="6 22 16" (3객체) 로 절반.
+# 비용 (실측, 융합 1회):
+#   obj2 240s / obj6 550s / obj22 720s / obj16 1395s / obj1 1700s
+#   5객체 = 값당 약 77분. 3값이면 230분.
 #
-# 사용: AXIS=wcap bash sweep_defaults.sh
-#       AXIS=gate GIDS="6 22 16" bash sweep_defaults.sh
+#   ⚠ prior 관련 축에서는 obj16 을 빼는 것이 낫다 — 게이트가 0.0% 로 prior 를 항상
+#     차단해 모든 팔에서 같은 값이 나온다(차이에 기여 0인데 값당 23분을 쓴다).
+#     GIDS="6 22 2" 면 값당 25분으로 3배 빠르고 신호는 유지된다.
+#
+# 사용: AXIS=wcap VALS="8 16 32" GIDS="6 22 2" bash sweep_defaults.sh
+#       AXIS=gate bash sweep_defaults.sh      # 게이트 축은 obj16 을 포함해야 의미 있음
 set -uo pipefail
 
 ROOT=${ROOT:-$HOME/RefineGS}
@@ -72,9 +88,19 @@ CSV=${CSV:-${PRIOR}/_sweep_${AXIS}.csv}
 mkdir -p "${LOGDIR}"; rm -f "${CSV}"
 cd "${ROOT}" || exit 1
 
+# 실측 융합 시간(초)으로 예상 소요를 낸다 — 5분/회 추정은 3배 빗나갔다(75 vs 230분)
+est=0
+for g in ${GIDS}; do
+  case "${g}" in 2) t=240;; 6) t=550;; 22) t=720;; 16) t=1395;; 1) t=1700;; *) t=700;; esac
+  est=$((est+t))
+done
 nv=$(echo ${VALS} | wc -w); ng=$(echo ${GIDS} | wc -w)
 echo "=== 기본값 재확인  축=${AXIS}  값: ${VALS} ==="
-echo "객체 ${ng}개: ${GIDS}   융합 $((nv*ng))회, 예상 $((nv*ng*5))분 내외"
+echo "객체 ${ng}개: ${GIDS}   융합 $((nv*ng))회, 예상 $((nv*est/60))분"
+[ "${AXIS}" != "gate" ] && case " ${GIDS} " in *" 16 "*)
+  echo "  ⚠ obj16 은 게이트가 prior 를 항상 차단해 모든 팔에서 같은 값이 나온다"
+  echo "    (값당 23분을 쓰면서 차이에는 기여하지 않음). GIDS=\"6 22 2\" 권장" ;;
+esac
 echo ""
 T0=$(date +%s)
 
