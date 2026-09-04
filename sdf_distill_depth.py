@@ -1084,6 +1084,10 @@ def main():
     parser.add_argument("--alpha_thr", default=0.5, type=float, help="이하 alpha 픽셀 제거(배경/floater)")
     parser.add_argument("--pts_per_view", default=40000, type=int)
     parser.add_argument("--n_pts", default=1500000, type=int, help="학습용 표면점 상한(subsample)")
+    parser.add_argument("--pts_seed", default=0, type=int,
+                        help="점군 서브샘플링 시드. 이게 없으면 같은 명령도 매번 다른 "
+                             "center/scale 을 만들어 결과가 흔들린다(실측: gate 34.6%↔38.4%). "
+                             "설정 비교는 반드시 같은 시드로")
     parser.add_argument("--sdf_iters", default=10000, type=int)
     parser.add_argument("--batch", default=16384, type=int)
     parser.add_argument("--lr", default=1e-4, type=float)
@@ -1311,6 +1315,15 @@ def main():
     parser.add_argument("--out", default="", type=str)
     args = get_combined_args(parser)
 
+    # ══ 재현성 ════════════════════════════════════════════════════════════
+    # 관측 점군 P 를 시드 없이 서브샘플링하면 그 percentile 로 정해지는 center/scale 이
+    # 매 실행 달라지고, 복셀 그리드 전체가 조금씩 다른 자리에 놓인다.
+    # 실측(obj6, 동일 설정 2회): [gate] 34.6% vs 38.4%, 정점 405개 차이, Chamfer 0.09mm.
+    # 게이트 임계(0.20) 근처 객체는 이 흔들림만으로 prior 적용 여부가 뒤집힌다
+    # (obj28 은 18.1% 로 임계 바로 아래였다).
+    # ⚠ 설정 A/B 를 할 때 이 시드가 다르면 설정 차이와 샘플링 차이가 섞인다.
+    np.random.seed(args.pts_seed)
+
     # ══ 확정 설정 자동 적용 ═══════════════════════════════════════════════
     # obj6 튜닝으로 확정된 값들은 전부 argparse 기본값에 들어가 있다. 여기서는
     # 명령줄로 표현하기 번거로운 나머지 셋만 처리하고, 실제 적용값을 전부 찍는다.
@@ -1343,6 +1356,8 @@ def main():
         ("keep_connected",  args.keep_connected,   "연결성분 필터"),
         ("voxel_size",      args.voxel_size,       "복셀 크기(m)"),
         ("gt_depth_dir",    args.gt_depth_dir,     "GT depth(carve 기준)"),
+        ("pts_seed",        args.pts_seed,         "점군 샘플링 시드(재현성)"),
+        ("fuse_device",     args.fuse_device,      "융합 실행 장치"),
     ]:
         _src = "지정" if f"--{_k}" in _given or f"--no_{_k}" in _given else "기본"
         print(f"│ {_k:<17} = {str(_v):<28} [{_src}] {_note}")
