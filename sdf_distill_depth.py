@@ -867,6 +867,21 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
               f"(임계 {args.sanity_free_max*100:.0f}%) / 관측영역 표면 이탈 중앙값 "
               f"{s_disp*1000:.1f}mm (임계 {args.sanity_disp_max*1000:.0f}mm, "
               f"관측 표면 위 정점 {int(obsv.sum())}개)")
+
+        # [free 위반 귀속] free 위반이 baseline 의 2배(10% vs 4.9%)로 유일한 약축인데
+        # free_min_views(2/4/8)도 prior_carve_views(40/150/300)도 움직이지 못했다.
+        # 어느 단계가 표면을 남겼는지 직접 센다 — blind 스윕을 한 번 더 돌지 않기 위해.
+        vfr = FRc[sx, sy, sz]                 # 이 복셀을 '비었다'고 투표한 뷰 수
+        vfree = FREE[sx, sy, sz]              # 우리 carve 가 최종 FREE 로 판정
+        va = alpha[sx, sy, sz] > 0.5          # 관측이 지배하는 복셀
+        vgen = (SG[sx, sy, sz] < 0) & ~va     # prior 가 만든 표면
+        n = max(len(verts), 1)
+        print(f"[free-분해] FREE 인데 표면 있음 {vfree.mean()*100:.1f}% "
+              f"(그중 관측지배 {float((vfree & va).sum())/max(int(vfree.sum()),1)*100:.0f}% / "
+              f"prior {float((vfree & vgen).sum())/max(int(vfree.sum()),1)*100:.0f}%)  |  "
+              f"1뷰 이상이 '비었다'고 했지만 FREE 아님 {float(((vfr > 0) & ~vfree).sum())/n*100:.1f}% "
+              f"← 이 값이 크면 우리 carve 가 평가 기준보다 관대하다"
+              f"(평가는 min_views=1, 우리는 {args.free_min_views}뷰 합의 + depth 경계 픽셀 제외)")
         bad = []
         if s_free > args.sanity_free_max:
             bad.append(f"표면의 {s_free*100:.0f}% 가 관측된 빈 공간에 있음")
