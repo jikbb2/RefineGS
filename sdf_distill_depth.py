@@ -805,6 +805,20 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
     if args.grid_smooth > 0:
         F = ndimage.gaussian_filter(F, sigma=args.grid_smooth)
 
+    # [free-hard] 스무딩 뒤 carve 제약을 다시 건다.
+    #   base = np.where(FREE|OTH|~HULL, trunc, SG) 로 하드 제약을 걸어놓고도
+    #   그 다음 줄에서 가우시안을 돌리면, prior 몸통(-trunc)과 carve 된 빈 공간
+    #   (+trunc)이 맞닿은 경계에서 영교차가 빈 공간 쪽으로 밀린다.
+    #   실측(obj22): free 위반의 71% 가 prior, 20% 가 관측, carve 관대함은 3.7% 뿐이었다.
+    #   → 표면 품질용 스무딩이 기하 제약을 덮어쓰고 있었다는 뜻.
+    #   관측이 지배하는 곳(alpha 큰 곳)은 건드리지 않는다 — 거기선 관측이 우선이다.
+    if args.free_hard:
+        hard = (FREE | OTH) & (alpha < args.free_hard_alpha)
+        nneg = int((hard & (F < 0)).sum())
+        F = np.where(hard, np.maximum(F, trunc), F)
+        print(f"[free-hard] 스무딩 후 carve 재적용: 빈 공간·타객체 복셀에 남아 있던 "
+              f"음수 {nneg}복셀 제거 (alpha<{args.free_hard_alpha})")
+
     # [keep-connected] 최종 음수 볼륨 중 '이 객체의 관측 복셀과 연결된' 성분만 유지.
     # 통짜 생성(여러 객체 포함) prior 가 타 객체의 가려진 공간(unknown)에 남기는
     # 잔해를 구조적으로 차단 — 다리는 상판/하판을 통해 관측부와 연결되므로 보존.
@@ -870,18 +884,26 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
 
         # [free 위반 귀속] free 위반이 baseline 의 2배(10% vs 4.9%)로 유일한 약축인데
         # free_min_views(2/4/8)도 prior_carve_views(40/150/300)도 움직이지 못했다.
-        # 어느 단계가 표면을 남겼는지 직접 센다 — blind 스윕을 한 번 더 돌지 않기 위해.
-        vfr = FRc[sx, sy, sz]                 # 이 복셀을 '비었다'고 투표한 뷰 수
-        vfree = FREE[sx, sy, sz]              # 우리 carve 가 최종 FREE 로 판정
+        #
+        # ⚠ 'FREE 복셀에 정점이 있다'로 세면 안 된다. marching cubes 정점은 복셀
+        #   '사이'에 놓이므로, 물체와 빈 공간의 정상적인 경계면 정점이 반올림으로
+        #   FREE 쪽에 들어간다(실측 obj22 에서 9.1% 중 상당수가 이 아티팩트).
+        #   평가 기준과 맞추려면 '빈 공간 안으로 margin 이상 들어간' 정점만 센다.
+        k = max(1, int(np.ceil(args.sanity_free_depth / vox_g)))
+        FREE_deep = ndimage.binary_erosion(FREE, iterations=k)   # 경계에서 k복셀 안쪽
+        vdeep = FREE_deep[sx, sy, sz]
+        nd = max(int(vdeep.sum()), 1)
         va = alpha[sx, sy, sz] > 0.5          # 관측이 지배하는 복셀
         vgen = (SG[sx, sy, sz] < 0) & ~va     # prior 가 만든 표면
-        n = max(len(verts), 1)
-        print(f"[free-분해] FREE 인데 표면 있음 {vfree.mean()*100:.1f}% "
-              f"(그중 관측지배 {float((vfree & va).sum())/max(int(vfree.sum()),1)*100:.0f}% / "
-              f"prior {float((vfree & vgen).sum())/max(int(vfree.sum()),1)*100:.0f}%)  |  "
-              f"1뷰 이상이 '비었다'고 했지만 FREE 아님 {float(((vfr > 0) & ~vfree).sum())/n*100:.1f}% "
-              f"← 이 값이 크면 우리 carve 가 평가 기준보다 관대하다"
-              f"(평가는 min_views=1, 우리는 {args.free_min_views}뷰 합의 + depth 경계 픽셀 제외)")
+        vfr = FRc[sx, sy, sz]
+        print(f"[free-분해] 빈 공간 안쪽 {args.sanity_free_depth*1000:.0f}mm(={k}복셀) "
+              f"이상으로 들어간 표면 {vdeep.mean()*100:.1f}%  "
+              f"(그중 관측지배 {float((vdeep & va).sum())/nd*100:.0f}% / "
+              f"prior {float((vdeep & vgen).sum())/nd*100:.0f}%)")
+        print(f"[free-분해] 1뷰 이상이 '비었다'고 했지만 FREE 아님 "
+              f"{float(((vfr > 0) & ~FREE[sx, sy, sz]).sum())/max(len(verts),1)*100:.1f}% "
+              f"← 크면 우리 carve 가 평가보다 관대하다"
+              f"(평가 min_views=1, 우리 {args.free_min_views}뷰 합의 + depth 경계 픽셀 제외)")
         bad = []
         if s_free > args.sanity_free_max:
             bad.append(f"표면의 {s_free*100:.0f}% 가 관측된 빈 공간에 있음")
@@ -1062,6 +1084,15 @@ def main():
                              "⚠ 기본 off: 5객체 스윕에서 seen F@1cm 을 가장 크게 깎은 성분")
     parser.add_argument("--no_obs_cos_weight", dest="obs_cos_weight", action="store_false",
                         help="cos 가중 해제(기본값)")
+    # ── free-space 하드 제약 재적용 ────────────────────────────────────────
+    # ⚠ 기본 off — 검증 전. A/B 로 free 위반과 seen/unseen 을 함께 볼 것.
+    parser.add_argument("--free_hard", action="store_true",
+                        help="grid_smooth 뒤에 carve(FREE/OTH) 제약을 다시 적용. "
+                             "스무딩이 하드 제약을 뭉개 prior 가 빈 공간으로 새는 것을 막는다. "
+                             "실측(obj22): free 위반의 71%가 prior 기여")
+    parser.add_argument("--free_hard_alpha", default=0.5, type=float,
+                        help="이 값보다 alpha 가 낮은(=관측이 약한) 복셀에만 재적용. "
+                             "관측이 지배하는 곳은 관측 우선 원칙을 유지")
     # ── prior 오배치 sanity 검사 (배치 안전장치) ────────────────────────────
     parser.add_argument("--sanity_free_max", default=0.25, type=float,
                         help="출력 표면 중 '관측된 빈 공간'에 있는 비율 상한. 넘으면 중단. "
@@ -1069,6 +1100,9 @@ def main():
     parser.add_argument("--sanity_disp_max", default=0.05, type=float,
                         help="관측 영역에서 출력 표면이 관측 TSDF 표면으로부터 이탈한 "
                              "거리(m) 중앙값 상한. 실측: 정상 4~8mm, obj20 116mm")
+    parser.add_argument("--sanity_free_depth", default=0.015, type=float,
+                        help="free 위반 귀속에서 '빈 공간 안으로 이만큼 들어간' 표면만 센다(m). "
+                             "eval_seen_unseen.py 의 --margin 과 같은 값이어야 비교가 성립")
     parser.add_argument("--no_sanity", action="store_true",
                         help="sanity 검사 해제 — 오배치된 prior 가 그대로 출력된다")
     parser.add_argument("--obs_max_reject", default=0.35, type=float,
