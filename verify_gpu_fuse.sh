@@ -6,12 +6,18 @@
 #   '최적화 덕분'인지 '이식 오류' 인지 구분된다. 이 프로젝트에서 교란된 비교로
 #   여러 번 잘못된 결론을 냈다(앙상블 효과, 관측가중, unseen_open).
 #
-# 기대치:
-#   · 정수 카운터(free 투표, hull 등)는 완전 일치 — 오프라인 전사 검증 완료
-#   · TSDF 합은 float32(GPU) vs float64(CPU) 차이로 ~1e-7 (trunc 0.05 대비 3e-6)
-#   · 메쉬 정점 수는 몇 개 다를 수 있다(영교차가 임계에 걸친 복셀). 표면 거리가
-#     복셀 크기의 1% 이내면 동일한 것으로 본다.
-#   · 속도: 실측 CPU 550~1700s/객체 → GPU 수십 초 기대
+# 실측 결과 (obj6, float64):
+#   CPU↔CPU  Chamfer 0.0497mm   ← 같은 명령 2회. 이게 파이프라인의 재현성 폭이다.
+#   CPU↔GPU  Chamfer 0.0585mm   ← 1.18배. 이식 정확으로 판정.
+#   (float32 일 때는 0.196mm = 노이즈의 4배였다 → 그래서 기본을 float64 로)
+#   속도 523s → 116s (4.5배). 50~100배는 슬랩 루프만의 수치였고, 뷰 렌더링·sd_fn
+#   보간·marching cubes·연결성분이 CPU 에 남아 있어 전체는 이만큼이다.
+#
+# ⚠ 노이즈 바닥이 0 이 아닌 이유: 상류 2DGS 렌더가 CUDA 원자연산·타일 정렬 때문에
+#   비트 단위로 재현되지 않는다. 시드를 고정해도 게이트가 40.4/40.2/39.6% 로 흔들린다.
+#   따라서 설정 A/B 는 이 폭보다 큰 차이만 해석해야 한다.
+#   (최대 거리는 판정에 쓰지 말 것 — CPU↔CPU 에서도 22mm 이상치가 나온다. 한쪽에만
+#    생긴 작은 부유물이며 평균에는 거의 영향이 없다)
 #
 # 사용: bash verify_gpu_fuse.sh            # obj6
 #       GID=22 bash verify_gpu_fuse.sh
@@ -66,7 +72,7 @@ python - "/tmp/vg_${GID}_cpuA_post.ply" "/tmp/vg_${GID}_cpuB_post.ply" <<'PY'
 import sys, numpy as np, open3d as o3d
 A = o3d.io.read_triangle_mesh(sys.argv[1]); B = o3d.io.read_triangle_mesh(sys.argv[2])
 va, vb = np.asarray(A.vertices), np.asarray(B.vertices)
-print(f"정점  GPU {len(va):,}  CPU {len(vb):,}  차이 {abs(len(va)-len(vb)):,} "
+print(f"정점  1회차 {len(va):,}  2회차 {len(vb):,}  차이 {abs(len(va)-len(vb)):,} "
       f"({abs(len(va)-len(vb))/max(len(vb),1)*100:.3f}%)")
 if not len(va) or not len(vb):
     sys.exit("메쉬가 비었습니다")
