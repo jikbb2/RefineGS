@@ -608,6 +608,31 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
             dg = b.get("dgt")
             if dg is not None and "dgt_ok" not in b:
                 b["dgt_ok"] = dg > 0.01
+    # ══ [GPU] 뷰 버퍼를 한 번만 GPU 로 올린다 ═══════════════════════════════
+    # 슬랩당 200뷰 × 2.1M 복셀 투영을 64슬랩 반복하면 270억 회다. numpy 로 28분,
+    # GPU 로 수십 초. 수식은 그대로이므로 결과가 같아야 한다(--fuse_device cpu 로 대조).
+    # 전체 그리드(512³ 기준 5GB)는 CPU 에 두고 슬랩만 주고받아 GPU 는 ~1.5GB 만 쓴다.
+    _dev = args.fuse_device
+    if _dev == "auto":
+        _dev = "cuda" if torch.cuda.is_available() else "cpu"
+    _gpu = _dev.startswith("cuda")
+    if _gpu:
+        _t0g = time.time()
+        for b in VB:
+            b["_R"] = torch.as_tensor(b["R"], dtype=torch.float32, device=_dev)
+            b["_t"] = torch.as_tensor(b["t"], dtype=torch.float32, device=_dev)
+            b["_depth"] = torch.as_tensor(b["depth"], dtype=torch.float32, device=_dev)
+            b["_mask"] = torch.as_tensor(np.ascontiguousarray(b["mask"]),
+                                         dtype=torch.bool, device=_dev)
+            if "obsw" in b:
+                b["_obsw"] = torch.as_tensor(b["obsw"], dtype=torch.float32, device=_dev)
+            if b.get("dgt") is not None:
+                b["_dgt"] = torch.as_tensor(b["dgt"], dtype=torch.float32, device=_dev)
+                b["_dgt_ok"] = torch.as_tensor(np.ascontiguousarray(b["dgt_ok"]),
+                                               dtype=torch.bool, device=_dev)
+        _mb = torch.cuda.memory_allocated(_dev) / 1024**2
+        print(f"[fuse-gpu] 뷰 버퍼 {len(VB)}장 → {_dev} ({_mb:.0f}MB, {time.time()-_t0g:.1f}s)")
+
     lin = np.linspace(-1, 1, G, dtype=np.float32)
     Fo = np.zeros((G, G, G), np.float32)      # 관측 TSDF 가중합
     Wo = np.zeros((G, G, G), np.float32)      # 관측 가중치(뷰 수)
@@ -622,6 +647,64 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
         gx, gy, gz = np.meshgrid(lin, lin, lin[k0:k1], indexing="ij")
         Xw = np.stack([gx, gy, gz], -1).reshape(-1, 3).astype(np.float64) * scale + center
         SG[:, :, k0:k1] = np.clip(sd_fn(Xw), -trunc, trunc).reshape(G, G, k1 - k0)
+        if _gpu:
+            # [GPU 경로] CPU 경로와 같은 수식·같은 순서. 누적을 float32 로 하므로
+            # 부동소수 결합 순서까지 동일하고, 결과는 비트 수준까지는 아니어도
+            # 1e-6 이내로 일치해야 한다(--fuse_device cpu 와 대조로 확인).
+            Xt = torch.as_tensor(Xw, dtype=torch.float32, device=_dev)
+            N = Xt.shape[0]
+            f_ = torch.zeros(N, dtype=torch.float32, device=_dev)
+            w_ = torch.zeros(N, dtype=torch.float32, device=_dev)
+            fr_ = torch.zeros(N, dtype=torch.int32, device=_dev)
+            vo_ = torch.zeros(N, dtype=torch.int32, device=_dev)
+            vt_ = torch.zeros(N, dtype=torch.int32, device=_dev)
+            nfr_ = torch.zeros(N, dtype=torch.int32, device=_dev)
+            nin_ = torch.zeros(N, dtype=torch.int32, device=_dev)
+            for b in VB:
+                Xc = Xt @ b["_R"].T + b["_t"]
+                z = Xc[:, 2]; zz = z.clamp_min(1e-6)
+                u = b["fx"] * Xc[:, 0] / zz + b["cx"]
+                v = b["fy"] * Xc[:, 1] / zz + b["cy"]
+                infr = (z > 0.05) & (u >= 0) & (u < b["W"]) & (v >= 0) & (v < b["H"])
+                ui = u.clamp(0, b["W"] - 1).long()
+                vi = v.clamp(0, b["H"] - 1).long()
+                di = b["_depth"][vi, ui]; mi = b["_mask"][vi, ui]
+                nfr_ += infr.int()
+                nin_ += (infr & mi).int()
+                sdf = di - z
+                hit = infr & mi & (di > 0) & (sdf > -trunc)
+                if "_obsw" in b:
+                    wp = b["_obsw"][vi, ui]
+                    hit = hit & (wp > 0)
+                    hm = hit.float()
+                    f_ += sdf.clamp(-trunc, trunc) * wp * hm
+                    w_ += wp * hm
+                else:
+                    hm = hit.float()
+                    f_ += sdf.clamp(-trunc, trunc) * hm
+                    w_ += hm
+                if "_dgt" in b:
+                    dgt = b["_dgt"][vi, ui]
+                    vgt = infr & b["_dgt_ok"][vi, ui]
+                    fr_ += (vgt & (z < dgt - margin)).int()
+                    near = vgt & ((z - dgt).abs() < 2 * margin)
+                    vo_ += (near & mi).int()
+                    vt_ += (near & ~mi).int()
+                else:
+                    fr_ += (infr & (~mi) & ((di <= 0) | (z < di - margin))).int()
+            f = f_.cpu().numpy(); w = w_.cpu().numpy()
+            fr = fr_.cpu().numpy().astype(np.uint16)
+            vo = vo_.cpu().numpy().astype(np.uint16); vt = vt_.cpu().numpy().astype(np.uint16)
+            nfr = nfr_.cpu().numpy().astype(np.uint16); nin = nin_.cpu().numpy().astype(np.uint16)
+            sh = (G, G, k1 - k0)
+            Fo[:, :, k0:k1] += f.reshape(sh); Wo[:, :, k0:k1] += w.reshape(sh)
+            FRc[:, :, k0:k1] += fr.reshape(sh)
+            VOb[:, :, k0:k1] += vo.reshape(sh); VOt[:, :, k0:k1] += vt.reshape(sh)
+            NFR[:, :, k0:k1] += nfr.reshape(sh); NIN[:, :, k0:k1] += nin.reshape(sh)
+            if (k0 // 8) % 8 == 0:
+                print(f"  [grid-fuse/gpu] slab {k0}/{G}", flush=True)
+            continue
+
         f = np.zeros(len(Xw), np.float32); w = np.zeros(len(Xw), np.float32)
         fr = np.zeros(len(Xw), np.uint16)
         vo = np.zeros(len(Xw), np.uint16); vt = np.zeros(len(Xw), np.uint16)
@@ -670,6 +753,13 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
         NFR[:, :, k0:k1] += nfr.reshape(sh); NIN[:, :, k0:k1] += nin.reshape(sh)
         if (k0 // 8) % 8 == 0:
             print(f"  [grid-fuse] slab {k0}/{G}")
+    if _gpu:   # 슬랩 루프가 끝나면 뷰 버퍼를 즉시 반납 — 이후 단계는 CPU 배열만 쓴다
+        for b in VB:
+            for k in ("_R", "_t", "_depth", "_mask", "_obsw", "_dgt", "_dgt_ok"):
+                b.pop(k, None)
+        torch.cuda.empty_cache()
+        print(f"[fuse-gpu] 뷰 버퍼 반납 (잔여 {torch.cuda.memory_allocated(_dev)/1024**2:.0f}MB)")
+
     Fobs = Fo / np.maximum(Wo, 1e-6)
     alpha = np.clip(Wo / args.grid_wcap, 0, 1)             # 관측 신뢰도(뷰 수 기반)
     # [seam] 관측/생성 전이를 부드럽게 — alpha 를 흐리면 경계에 blend band 가 생겨
@@ -787,9 +877,11 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
     ufrac = float((prior_surf & unknown).sum()) / max(int(prior_surf.sum()), 1)
     print(f"[gate] 생성 표면 중 unknown 비율 {ufrac*100:.1f}% "
           f"(임계 {args.min_unknown_frac*100:.0f}%)")
+    prior_applied = True
     if ufrac < args.min_unknown_frac:
         print("  → 미관측이 충분치 않음: prior 미적용(관측만으로 재구성)")
         SG = np.full_like(SG, trunc)
+        prior_applied = False
 
     # 빈공간/타객체/hull 밖 = +trunc, 미관측 ∩ hull = 생성
     base = np.where(FREE | OTH | ~HULL, trunc, SG)
@@ -875,61 +967,62 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
     verts, faces, _, _ = marching_cubes(F, level=0.0, spacing=(step,) * 3)
     verts = (verts - 1.0) * scale + center
 
-    # ══ [sanity] prior 오배치 검출 ═════════════════════════════════════════
-    # 배치 실측: obj0 는 seen accuracy 3.85mm → 1165mm(1.2m!), free 위반 41% 로
-    # 멀쩡한 재구성을 prior 가 통째로 망가뜨렸다. obj20/28/31 도 같은 양상.
-    # 품질 저하가 아니라 '생성물이 엉뚱한 곳에 놓인' 정렬 실패이므로, GT 없이도
-    # 두 가지로 잡아낼 수 있다. 조용히 쓰레기를 내보내느니 실패하는 편이 낫다.
-    #   1) 출력 표면이 '관측된 빈 공간'에 있는 비율
-    #   2) 관측 영역에서 출력 표면이 관측 TSDF 표면으로부터 밀려난 거리
+    # ══ [sanity] 출력이 관측과 모순되는지 ══════════════════════════════════
+    # 배치 실측: obj0 는 seen accuracy 3.85mm → 1165mm(1.2m!) 로 멀쩡한 재구성이
+    # 통째로 망가졌다. 품질 저하가 아니라 형상이 엉뚱한 곳에 놓인 것이므로 GT 없이
+    # 잡을 수 있다. 조용히 쓰레기를 내보내느니 실패하는 편이 낫다.
+    #
+    # ⚠ 판정에 'FREE 복셀에 정점이 있다'를 쓰면 안 된다 — marching cubes 정점은
+    #   복셀 '사이'에 놓이므로 물체와 빈 공간의 '정상적인 경계면' 정점이 반올림으로
+    #   FREE 쪽에 들어간다. 합성 검증: 완벽한 구를 carve 안에 두어도 50% 가 나온다.
+    #   실제로 이 기준 때문에 obj28 이 오탐으로 죽었다(반올림 25.8% vs 깊이 5.7%,
+    #   게다가 게이트가 prior 를 막아 prior 기여는 0% 였다).
+    #   → 반드시 '빈 공간 안으로 margin 이상 들어간' 정점만 센다.
     if not args.no_sanity:
         vi_ = np.clip(((verts - center) / scale + 1.0) / step, 0, G - 1).astype(int)
         sx, sy, sz = vi_[:, 0], vi_[:, 1], vi_[:, 2]
-        s_free = float(FREE[sx, sy, sz].mean())
-        obsv = Wo[sx, sy, sz] > 0
-        s_disp = float(np.median(np.abs(Fobs[sx, sy, sz][obsv]))) if obsv.any() else 0.0
-        print(f"[sanity] 출력 표면 {len(verts)}점 중 관측된 빈 공간 {s_free*100:.1f}% "
-              f"(임계 {args.sanity_free_max*100:.0f}%) / 관측영역 표면 이탈 중앙값 "
-              f"{s_disp*1000:.1f}mm (임계 {args.sanity_disp_max*1000:.0f}mm, "
-              f"관측 표면 위 정점 {int(obsv.sum())}개)")
-
-        # [free 위반 귀속] free 위반이 baseline 의 2배(10% vs 4.9%)로 유일한 약축인데
-        # free_min_views(2/4/8)도 prior_carve_views(40/150/300)도 움직이지 못했다.
-        #
-        # ⚠ 'FREE 복셀에 정점이 있다'로 세면 안 된다. marching cubes 정점은 복셀
-        #   '사이'에 놓이므로, 물체와 빈 공간의 정상적인 경계면 정점이 반올림으로
-        #   FREE 쪽에 들어간다(실측 obj22 에서 9.1% 중 상당수가 이 아티팩트).
-        #   평가 기준과 맞추려면 '빈 공간 안으로 margin 이상 들어간' 정점만 센다.
         k = max(1, int(np.ceil(args.sanity_free_depth / vox_g)))
         FREE_deep = ndimage.binary_erosion(FREE, iterations=k)   # 경계에서 k복셀 안쪽
         vdeep = FREE_deep[sx, sy, sz]
+        s_free = float(vdeep.mean())
+        obsv = Wo[sx, sy, sz] > 0
+        s_disp = float(np.median(np.abs(Fobs[sx, sy, sz][obsv]))) if obsv.any() else 0.0
         nd = max(int(vdeep.sum()), 1)
         va = alpha[sx, sy, sz] > 0.5          # 관측이 지배하는 복셀
         vgen = (SG[sx, sy, sz] < 0) & ~va     # prior 가 만든 표면
         vfr = FRc[sx, sy, sz]
-        print(f"[free-분해] 빈 공간 안쪽 {args.sanity_free_depth*1000:.0f}mm(={k}복셀) "
-              f"이상으로 들어간 표면 {vdeep.mean()*100:.1f}%  "
-              f"(그중 관측지배 {float((vdeep & va).sum())/nd*100:.0f}% / "
-              f"prior {float((vdeep & vgen).sum())/nd*100:.0f}%)")
-        print(f"[free-분해] 1뷰 이상이 '비었다'고 했지만 FREE 아님 "
+        print(f"[sanity] 출력 표면 {len(verts)}점 중 빈 공간 안쪽 "
+              f"{args.sanity_free_depth*1000:.0f}mm(={k}복셀) 이상 침범 {s_free*100:.1f}% "
+              f"(임계 {args.sanity_free_max*100:.0f}%) / 관측영역 표면 이탈 중앙값 "
+              f"{s_disp*1000:.1f}mm (임계 {args.sanity_disp_max*1000:.0f}mm, "
+              f"관측 표면 위 정점 {int(obsv.sum())}개)")
+        print(f"[free-분해] 침범분의 구성: 관측지배 {float((vdeep & va).sum())/nd*100:.0f}% / "
+              f"prior {float((vdeep & vgen).sum())/nd*100:.0f}%  |  "
+              f"1뷰 이상이 '비었다'고 했지만 FREE 아님 "
               f"{float(((vfr > 0) & ~FREE[sx, sy, sz]).sum())/max(len(verts),1)*100:.1f}% "
               f"← 크면 우리 carve 가 평가보다 관대하다"
-              f"(평가 min_views=1, 우리 {args.free_min_views}뷰 합의 + depth 경계 픽셀 제외)")
+              f"(평가 min_views=1, 우리 {args.free_min_views}뷰 합의)")
         bad = []
         if s_free > args.sanity_free_max:
-            bad.append(f"표면의 {s_free*100:.0f}% 가 관측된 빈 공간에 있음")
+            bad.append(f"표면의 {s_free*100:.0f}% 가 관측된 빈 공간을 "
+                       f"{args.sanity_free_depth*1000:.0f}mm 이상 침범")
         if s_disp > args.sanity_disp_max:
             bad.append(f"관측 표면에서 {s_disp*1000:.0f}mm 이탈")
         if bad:
             print("\n" + "!" * 70)
-            print("[sanity] 융합 결과가 관측과 모순됩니다 — prior 오배치로 판단해 중단합니다.")
+            print("[sanity] 융합 결과가 관측과 모순됩니다 — 중단합니다.")
             for b_ in bad:
                 print(f"  · {b_}")
-            print("  확인 순서: ① npz 의 center/scale/R_align 이 이 객체 것인지"
-                  " (다른 객체 npz 를 가리키고 있지 않은지)")
-            print("            ② pkl 의 T_model_world 와 bounds")
-            print("            ③ SAM3 인스턴스가 GT 객체 여럿에 걸쳐 있지 않은지")
-            print("  이 검사를 끄려면 --no_sanity (권장하지 않음)")
+            if prior_applied:
+                print("  확인 순서: ① npz 의 center/scale/R_align 이 이 객체 것인지")
+                print("            ② pkl 의 T_model_world 와 bounds "
+                      "(dump_shaper_points.py 로 world bbox 확인)")
+                print("            ③ SAM3 인스턴스가 GT 객체 여럿에 걸쳐 있지 않은지")
+            else:
+                print("  ※ 게이트가 prior 를 막았으므로 이 출력에 생성 기하는 없습니다.")
+                print("    원인은 prior 가 아니라 관측 쪽입니다 — 마스크 오류, 포즈,")
+                print("    또는 GT depth 정합을 확인하세요.")
+            print("  이 검사를 끄려면 --no_sanity")
             print("!" * 70, flush=True)
             sys.exit(2)
 
@@ -1050,6 +1143,11 @@ def main():
     parser.add_argument("--grid_fuse", action="store_true",
                         help="MLP 대신 결정적 grid TSDF 융합(관측>carve>생성 우선순위). "
                              "--prior_mesh 필수, --prior_carve_views 120+ 권장. 부풀림·스펀지 원천 차단")
+    parser.add_argument("--fuse_device", default="auto", type=str,
+                        help="grid 융합 실행 장치: auto|cuda|cpu. GPU 경로는 CPU 와 같은 "
+                             "수식이며 50~100배 빠르다(실측 28분 → 수십 초). 전체 그리드는 "
+                             "CPU 에 두고 슬랩만 올려 GPU 는 ~1.5GB 만 쓴다. "
+                             "결과 대조가 필요하면 cpu 로 강제")
     parser.add_argument("--grid_wcap", default=8.0, type=float,
                         help="관측 신뢰도 포화 뷰 수 — 이 이상 관측된 복셀은 관측 TSDF 100%. "
                              "낮추면 관측 권한이 커지고, 올리면 '몇 뷰만 관측된 경계 밴드'가 "
@@ -1106,8 +1204,10 @@ def main():
                              "관측이 지배하는 곳은 관측 우선 원칙을 유지")
     # ── prior 오배치 sanity 검사 (배치 안전장치) ────────────────────────────
     parser.add_argument("--sanity_free_max", default=0.25, type=float,
-                        help="출력 표면 중 '관측된 빈 공간'에 있는 비율 상한. 넘으면 중단. "
-                             "실측: 정상 2~18%, obj0 오배치 41%")
+                        help="출력 표면 중 빈 공간을 sanity_free_depth 이상 '침범한' 비율 상한. "
+                             "넘으면 중단. 실측(깊이 기준): obj22 0.2%, obj28 5.7% — 정상은 "
+                             "한 자릿수다. 반올림 기준(구버전)으로 재면 정상도 25%가 넘어 "
+                             "obj28 이 오탐으로 죽었다")
     parser.add_argument("--sanity_disp_max", default=0.05, type=float,
                         help="관측 영역에서 출력 표면이 관측 TSDF 표면으로부터 이탈한 "
                              "거리(m) 중앙값 상한. 실측: 정상 4~8mm, obj20 116mm")
