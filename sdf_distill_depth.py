@@ -616,22 +616,28 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
     if _dev == "auto":
         _dev = "cuda" if torch.cuda.is_available() else "cpu"
     _gpu = _dev.startswith("cuda")
+    # [정밀도] CPU 경로는 Xw 를 float64 로 투영한다. GPU 를 float32 로 두면 1e-7 차이가
+    # 나는데, 게이트(alpha<0.25 → Wo<2)와 keep_connected 가 임계 위 통계라 그 차이가
+    # 증폭된다(실측 obj6: 배열은 0.1%p 차이인데 gate 는 34.6% vs 38.8%).
+    # A100 은 FP64 가 FP32 대비 1/2 속도뿐이므로 float64 로 두면 정확도와 속도를 모두 얻는다.
+    _dt = torch.float64 if args.fuse_dtype == "float64" else torch.float32
     if _gpu:
         _t0g = time.time()
         for b in VB:
-            b["_R"] = torch.as_tensor(b["R"], dtype=torch.float32, device=_dev)
-            b["_t"] = torch.as_tensor(b["t"], dtype=torch.float32, device=_dev)
-            b["_depth"] = torch.as_tensor(b["depth"], dtype=torch.float32, device=_dev)
+            b["_R"] = torch.as_tensor(b["R"], dtype=_dt, device=_dev)
+            b["_t"] = torch.as_tensor(b["t"], dtype=_dt, device=_dev)
+            b["_depth"] = torch.as_tensor(b["depth"], dtype=_dt, device=_dev)
             b["_mask"] = torch.as_tensor(np.ascontiguousarray(b["mask"]),
                                          dtype=torch.bool, device=_dev)
             if "obsw" in b:
-                b["_obsw"] = torch.as_tensor(b["obsw"], dtype=torch.float32, device=_dev)
+                b["_obsw"] = torch.as_tensor(b["obsw"], dtype=_dt, device=_dev)
             if b.get("dgt") is not None:
-                b["_dgt"] = torch.as_tensor(b["dgt"], dtype=torch.float32, device=_dev)
+                b["_dgt"] = torch.as_tensor(b["dgt"], dtype=_dt, device=_dev)
                 b["_dgt_ok"] = torch.as_tensor(np.ascontiguousarray(b["dgt_ok"]),
                                                dtype=torch.bool, device=_dev)
         _mb = torch.cuda.memory_allocated(_dev) / 1024**2
-        print(f"[fuse-gpu] 뷰 버퍼 {len(VB)}장 → {_dev} ({_mb:.0f}MB, {time.time()-_t0g:.1f}s)")
+        print(f"[fuse-gpu] 뷰 버퍼 {len(VB)}장 → {_dev} {args.fuse_dtype} "
+              f"({_mb:.0f}MB, {time.time()-_t0g:.1f}s)")
 
     lin = np.linspace(-1, 1, G, dtype=np.float32)
     Fo = np.zeros((G, G, G), np.float32)      # 관측 TSDF 가중합
@@ -651,10 +657,10 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
             # [GPU 경로] CPU 경로와 같은 수식·같은 순서. 누적을 float32 로 하므로
             # 부동소수 결합 순서까지 동일하고, 결과는 비트 수준까지는 아니어도
             # 1e-6 이내로 일치해야 한다(--fuse_device cpu 와 대조로 확인).
-            Xt = torch.as_tensor(Xw, dtype=torch.float32, device=_dev)
+            Xt = torch.as_tensor(Xw, dtype=_dt, device=_dev)
             N = Xt.shape[0]
-            f_ = torch.zeros(N, dtype=torch.float32, device=_dev)
-            w_ = torch.zeros(N, dtype=torch.float32, device=_dev)
+            f_ = torch.zeros(N, dtype=_dt, device=_dev)
+            w_ = torch.zeros(N, dtype=_dt, device=_dev)
             fr_ = torch.zeros(N, dtype=torch.int32, device=_dev)
             vo_ = torch.zeros(N, dtype=torch.int32, device=_dev)
             vt_ = torch.zeros(N, dtype=torch.int32, device=_dev)
@@ -676,11 +682,11 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
                 if "_obsw" in b:
                     wp = b["_obsw"][vi, ui]
                     hit = hit & (wp > 0)
-                    hm = hit.float()
+                    hm = hit.to(_dt)
                     f_ += sdf.clamp(-trunc, trunc) * wp * hm
                     w_ += wp * hm
                 else:
-                    hm = hit.float()
+                    hm = hit.to(_dt)
                     f_ += sdf.clamp(-trunc, trunc) * hm
                     w_ += hm
                 if "_dgt" in b:
@@ -692,7 +698,8 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
                     vt_ += (near & ~mi).int()
                 else:
                     fr_ += (infr & (~mi) & ((di <= 0) | (z < di - margin))).int()
-            f = f_.cpu().numpy(); w = w_.cpu().numpy()
+            f = f_.cpu().numpy().astype(np.float32)
+            w = w_.cpu().numpy().astype(np.float32)
             fr = fr_.cpu().numpy().astype(np.uint16)
             vo = vo_.cpu().numpy().astype(np.uint16); vt = vt_.cpu().numpy().astype(np.uint16)
             nfr = nfr_.cpu().numpy().astype(np.uint16); nin = nin_.cpu().numpy().astype(np.uint16)
@@ -1147,6 +1154,12 @@ def main():
     parser.add_argument("--grid_fuse", action="store_true",
                         help="MLP 대신 결정적 grid TSDF 융합(관측>carve>생성 우선순위). "
                              "--prior_mesh 필수, --prior_carve_views 120+ 권장. 부풀림·스펀지 원천 차단")
+    parser.add_argument("--fuse_dtype", default="float64", type=str,
+                        choices=["float32", "float64"],
+                        help="GPU 융합 정밀도. CPU 경로가 float64 이므로 대조하려면 float64. "
+                             "float32 는 1e-7 차이가 나는데 게이트(alpha<0.25)와 "
+                             "keep_connected 가 임계 위 통계라 증폭된다(실측 gate 34.6% vs "
+                             "38.8%). A100 은 FP64 가 FP32 의 1/2 속도뿐이라 기본 float64")
     parser.add_argument("--fuse_device", default="auto", type=str,
                         help="grid 융합 실행 장치: auto|cuda|cpu. GPU 경로는 CPU 와 같은 "
                              "수식이며 50~100배 빠르다(실측 28분 → 수십 초). 전체 그리드는 "
