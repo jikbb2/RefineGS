@@ -588,15 +588,26 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
                 d = (dg - b["depth"])[mm]
                 print(f"[gt-check] median(dgt-render)={np.median(d):+.4f}m  "
                       f"|d|중앙값={np.median(np.abs(d)):.4f}m  (마스크 {int(mm.sum())}px)")
-    # [경계 번짐 가드] GT depth 불연속(실루엣 경계) 픽셀은 free 투표 무효 —
-    # nearest 리사이즈로 먼 배경 depth 가 경계에 새어들어 얇은 구조를 갉는 것 방지.
-    for b in VB:
-        dg = b.get("dgt")
-        if dg is not None and "dgt_ok" not in b:
-            gy_, gx_ = np.gradient(dg.astype(np.float32))
-            edge = (np.abs(gx_) + np.abs(gy_)) > args.gt_edge_thr
-            edge = ndimage.binary_dilation(edge, iterations=1)
-            b["dgt_ok"] = (dg > 0.01) & ~edge
+    # [경계 번짐 가드] GT depth 불연속(실루엣 경계) 픽셀을 free 투표에서 뺀다.
+    # ⚠ 기본 off(=0). 원래는 '얇은 다리가 carve 된다'는 문제의 대증요법으로 넣었으나,
+    #   그 진범은 나중에 --unseen_open 0.015(78935복셀 삭제)로 밝혀졌다. 진범을 잡은
+    #   뒤 재측정하니 다리 보호 효과는 없고 carve 범위만 좁혀 free 위반을 늘렸다:
+    #     obj22  free 10.8% → 7.5% (끄면 -31%), unseen F@2 0.3670 → 0.3637(노이즈 폭)
+    #     obj6   free  4.9% → 4.7%,             unseen F@2 0.6586 → 0.6592(다리 무손실)
+    #   nearest 리사이즈 depth 를 쓰는 등 실제로 경계가 번지는 데이터라면 0.1 부터 시도.
+    if args.gt_edge_thr > 0:
+        for b in VB:
+            dg = b.get("dgt")
+            if dg is not None and "dgt_ok" not in b:
+                gy_, gx_ = np.gradient(dg.astype(np.float32))
+                edge = (np.abs(gx_) + np.abs(gy_)) > args.gt_edge_thr
+                edge = ndimage.binary_dilation(edge, iterations=1)
+                b["dgt_ok"] = (dg > 0.01) & ~edge
+    else:
+        for b in VB:
+            dg = b.get("dgt")
+            if dg is not None and "dgt_ok" not in b:
+                b["dgt_ok"] = dg > 0.01
     lin = np.linspace(-1, 1, G, dtype=np.float32)
     Fo = np.zeros((G, G, G), np.float32)      # 관측 TSDF 가중합
     Wo = np.zeros((G, G, G), np.float32)      # 관측 가중치(뷰 수)
@@ -1120,8 +1131,11 @@ def main():
     parser.add_argument("--free_min_views", default=2, type=int,
                         help="free 판정 최소 합의 뷰 수 — 1이면 OR(공격적), 3+ 권장. "
                              "얇은 구조가 depth 경계 노이즈로 갉히는 것 방지")
-    parser.add_argument("--gt_edge_thr", default=0.1, type=float,
-                        help="GT depth 불연속 경계 임계(m) — 경계 픽셀 free 투표 무효화")
+    parser.add_argument("--gt_edge_thr", default=0.0, type=float,
+                        help="GT depth 불연속 경계 임계(m/px) — 초과 픽셀은 free 투표 무효. "
+                             "0=off(기본). 켜면 carve 범위가 좁아져 free 위반이 늘어난다"
+                             "(obj22 7.5%→10.8%). nearest 리사이즈 depth 등 실제로 경계가 "
+                             "번지는 데이터에서만 0.1 부터 시도할 것")
     parser.add_argument("--debug_class_ply", default="", type=str,
                         help="생성 표면 샘플 분류 점군 저장 경로 — 잘림 원인 시각 진단용")
     parser.add_argument("--carve_align", action="store_true",
