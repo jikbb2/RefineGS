@@ -264,13 +264,23 @@ def classify(P, views, margin, min_views, use_mask):
 def sample(mesh_path, n, seed=0):
     """메쉬 균등 샘플. 설정 비교는 반드시 같은 시드로.
 
-    측정된 노이즈 폭 (obj6 융합 메쉬, 시드 5회, eval_noise.sh):
+    노이즈원이 둘이며, 해석 임계는 '평가 샘플링'이 지배한다.
+
+    (1) 평가 샘플링 — 메쉬 고정, 시드만 변경 (eval_noise.sh, obj6 5회)
         seen F@1cm  ±0.0001    seen acc      ±0.022mm
         seen P@1cm  ±0.0003    unseen acc    ±0.26mm
         seen R@1cm  ±0.0004    unseen P@2cm  ±0.0033
         free 위반   ±0.085%p   unseen R@2cm  ±0.0005
-    → 이 프로토콜은 재현성이 매우 높다. 위 폭보다 큰 차이는 실재하는 차이로 봐도
-      되고(예: wcap 스윕의 F@1cm 0.0075 는 노이즈의 75배), 작으면 해석하지 말 것.
+
+    (2) 융합 — 같은 설정 2회, 평가 시드 고정 (verify_gpu_fuse.sh 산출물로 측정)
+        unseen F@2cm ±0.0002   free ±0.1%p   seen 구성비 ±0.1%p
+        메쉬끼리는 Chamfer 0.0497mm 차이(2DGS 렌더가 비결정적)인데, 지표는 20만 점
+        평균이라 국소 차이가 상쇄되어 (1)보다 16배 작다.
+
+    → 해석 임계: unseen F@2cm 은 0.007(2σ) 미만, free 는 0.2%p 미만 차이를
+      해석하지 말 것. 실제로 wcap 8/16/32 의 unseen F@2 차이(0.005~0.006)와
+      gt_edge_thr 의 obj22 차이(0.0033)가 이 범위였고, 두 결정 모두 노이즈보다
+      훨씬 큰 다른 축(seen accuracy, free 위반)으로 내렸다.
     """
     m = o3d.io.read_triangle_mesh(os.path.expanduser(mesh_path))
     assert len(m.vertices), f"메쉬 로드 실패: {mesh_path}"
