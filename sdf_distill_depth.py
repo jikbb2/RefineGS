@@ -1291,7 +1291,18 @@ def main():
     parser.add_argument("--view_stride", default=1, type=int,
                         help="[속도] 학습 뷰를 이 간격으로만 사용(back-project/carve 비용 ∝ 뷰 수). "
                              "관측 점군은 어차피 서브샘플되므로 2~4 는 손실이 작다")
-    parser.add_argument("--min_unknown_frac", default=0.20, type=float,
+    # [게이트 폐기] 기본 0 = 항상 prior 적용.
+    #   ① 이 통계가 칼날 위에 있다. unknown = (alpha<0.25) & ~FREE & ~OTH 인데
+    #      alpha=Wo/wcap 이라 'Wo가 2 근처'인 복셀의 소속이 흔들리고, 그것을 |SG|<1.5vox
+    #      의 얇은 껍질에서 집계하니 증폭된다. 실측(obj6, 같은 명령 3회):
+    #      게이트 38.4 → 38.8 → 40.0%. 임계 0.20 근처 객체는 실행마다 결과가 뒤집힌다
+    #      (obj28 은 18.1% 로 임계 바로 아래였다).
+    #   ② 도입 근거였던 'obj16/28 은 이미 잘 관측돼 prior 가 손해'라는 관찰은
+    #      관측 신뢰도 가중이 켜져 있을 때의 것이다. 그 기능을 끈 지금 전제가 사라졌다.
+    #   ③ 어차피 alpha 블렌드와 carve 가 관측을 우선하므로, 잘 관측된 객체에서는
+    #      prior 가 들어와도 영향이 작아야 한다. 게이트는 그 위의 이중 안전장치였다.
+    #   되살리려면 0.20 부터. 단, 위 ①번 흔들림을 감안할 것.
+    parser.add_argument("--min_unknown_frac", default=0.0, type=float,
                         help="[적용 게이트] 생성 내부 부피 중 unknown 비율이 이 값 미만이면 "
                              "prior 를 쓰지 않는다(이미 충분히 관측된 객체). 0=항상 적용")
     parser.add_argument("--keep_connected", dest="keep_connected", action="store_true",
