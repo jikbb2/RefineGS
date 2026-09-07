@@ -890,6 +890,19 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
         SG = np.full_like(SG, trunc)
         prior_applied = False
 
+    # [필수] prior 가 없으면 alpha 블렌드를 하지 않는다.
+    #   F = alpha·Fobs + (1-alpha)·base 에서 base=trunc(빈 공간)이면
+    #   영교차가 Fobs = -(1-alpha)/alpha·trunc 로 이동한다 — 표면이 '안쪽으로' 밀린다.
+    #   alpha=0.5 면 이동량이 trunc 전체(50mm)다. 얇은 물체는 통째로 사라진다.
+    #   실측: obj16(액자) seen F@1 0.914→0.647, obj35 0.984→0.868. 둘 다 ufrac 이
+    #   낮아 prior 가 차단된 객체였고, 손실의 원인은 prior 가 아니라 이 블렌드였다.
+    #   섞을 대상이 없으면 관측을 그대로 쓰는 것이 맞다.
+    if not prior_applied and not args.no_alpha_full_wo_prior:
+        n_lift = int(((Wo > 0) & (alpha < 1.0)).sum())
+        alpha = np.where(Wo > 0, np.float32(1.0), alpha)
+        print(f"  → prior 없음: 관측 복셀 alpha=1 로 고정 ({n_lift}복셀). "
+              f"섞을 대상이 없는데 빈 공간 쪽으로 끌어당기면 표면이 침식된다")
+
     # 빈공간/타객체/hull 밖 = +trunc, 미관측 ∩ hull = 생성
     base = np.where(FREE | OTH | ~HULL, trunc, SG)
     F = alpha * Fobs + (1 - alpha) * base                  # 우선순위 블렌드
@@ -1154,6 +1167,10 @@ def main():
     parser.add_argument("--grid_fuse", action="store_true",
                         help="MLP 대신 결정적 grid TSDF 융합(관측>carve>생성 우선순위). "
                              "--prior_mesh 필수, --prior_carve_views 120+ 권장. 부풀림·스펀지 원천 차단")
+    parser.add_argument("--no_alpha_full_wo_prior", action="store_true",
+                        help="prior 가 차단된 객체에서도 alpha 블렌드를 유지(구버전 동작). "
+                             "블렌드 대상이 trunc 뿐이라 표면이 최대 trunc 만큼 안쪽으로 "
+                             "침식된다. A/B 용으로만 사용")
     parser.add_argument("--fuse_dtype", default="float64", type=str,
                         choices=["float32", "float64"],
                         help="GPU 융합 정밀도. CPU 경로가 float64 이므로 대조하려면 float64. "
