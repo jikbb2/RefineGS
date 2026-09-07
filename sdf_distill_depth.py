@@ -987,6 +987,31 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
     verts, faces, _, _ = marching_cubes(F, level=0.0, spacing=(step,) * 3)
     verts = (verts - 1.0) * scale + center
 
+    # [열린 경계] prior 가 없으면 미관측 영역을 닫지 않는다.
+    #   관측 영역은 F=Fobs(음수 가능), 미관측은 F=+trunc 로 강제되므로 그 경계에서
+    #   영교차가 생겨 '가짜 벽'이 세워진다. 물체 뒤 trunc 지점에 실제로는 없는 면이
+    #   만들어지고, 앞면만 관측되는 얇은 물체(액자 등)에서는 그것이 메쉬의 대부분이 된다.
+    #   실측 obj16: 출력의 seen 비율이 30%(베이스라인 87%), seen F@1 0.914→0.642.
+    #   obj8: sanity 침범분의 84%가 '관측지배' = 이 경계면.
+    #   표준 TSDF 는 가중치 0 복셀을 미정의로 두고 메싱하지 않는다. 우리도 채울 근거가
+    #   있을 때(=prior 적용)만 닫는다. carve/타객체 경계는 '비어 있음을 안다'는 근거가
+    #   있으므로 유지한다.
+    if not prior_applied and len(faces):
+        # ⚠ 팽창이 필요하다. 가짜 벽의 정점은 관측 복셀과 미관측 복셀 '사이'에 놓이므로
+        #   반올림하면 관측 쪽으로 들어가 검출되지 않는다(합성 검증: 팽창 없이 0% 검출,
+        #   팽창 시 50% = 앞면/뒤벽 두 장 중 한 장).
+        unk = ndimage.binary_dilation((Wo == 0) & ~FREE & ~OTH)
+        vg = np.clip(np.round(((verts - center) / scale + 1.0) / step), 0, G - 1).astype(int)
+        bad_v = unk[vg[:, 0], vg[:, 1], vg[:, 2]]
+        keep_f = ~bad_v[faces].any(axis=1)
+        n_drop = int((~keep_f).sum())
+        faces = faces[keep_f]
+        used = np.unique(faces)
+        remap = np.full(len(verts), -1, np.int64); remap[used] = np.arange(len(used))
+        verts, faces = verts[used], remap[faces]
+        print(f"[열린경계] prior 없음 → 미관측 경계의 가짜 면 {n_drop}개 제거 "
+              f"(면 {n_drop + len(faces)} → {len(faces)}). 메쉬가 열린 상태가 된다")
+
     # ══ [sanity] 출력이 관측과 모순되는지 ══════════════════════════════════
     # 배치 실측: obj0 는 seen accuracy 3.85mm → 1165mm(1.2m!) 로 멀쩡한 재구성이
     # 통째로 망가졌다. 품질 저하가 아니라 형상이 엉뚱한 곳에 놓인 것이므로 GT 없이
