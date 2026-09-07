@@ -119,16 +119,30 @@ def sample_tris(V, T, n, seed=0):
     return P, idx
 
 
-def auto_match_labels(V, T, L, ref_pts, min_share=0.10, n=300000):
+def auto_match_labels(V, T, L, ref_pts, min_share=0.10, n=300000, max_dist=0.05):
     """recon 과 겹치는 object_id 집합을 투표로 선택.
 
     SAM3 인스턴스는 데이터셋 semantic id 와 1:1 이 아니다(한 인스턴스가 여러 GT 객체를
     아우르거나 그 반대). 단일 라벨을 고르면 GT 가 과소/과대 잡히므로, 득표 비율이
     min_share 이상인 라벨을 '모두' 채택하고 구성을 출력해 사람이 검증하게 한다.
+
+    ⚠ 투표 컷오프(80% 분위)는 '상대' 기준이라, recon 이 어떤 GT 객체와도 겹치지 않아도
+      가장 가까운 라벨에 몰표가 나온다. 실측: obj21 은 id25 95.3% 로 확신에 찬 매칭인데
+      unseen completion 이 3278mm(=GT 가 3.3m 밖)였다. 그래서 절대 거리를 함께 보고한다.
+      이 값이 크면 그 행의 지표는 해석하면 안 된다 — 매칭이 아니라 recon 이 문제다.
     """
     P, idx = sample_tris(V, T, min(n, 20 * len(T) + 1000))
     lab = L[idx]
     d, j = cKDTree(P).query(ref_pts, workers=-1)
+    med = float(np.median(d))
+    print(f"[auto-match] recon→GT 거리 중앙값 {med*1000:.1f}mm "
+          f"(80% {np.percentile(d, 80)*1000:.1f}mm, 임계 {max_dist*1000:.0f}mm)")
+    if med > max_dist:
+        print(f"[auto-match] ⚠⚠ recon 이 어느 GT 객체와도 겹치지 않습니다 "
+              f"({med*1000:.0f}mm 떨어짐). 아래 득표는 '가장 가까운' 라벨일 뿐이며 "
+              f"이 객체의 지표는 해석하지 마십시오.")
+        print(f"[auto-match]    원인은 매칭이 아니라 재구성 쪽입니다 — 마스크가 다른 "
+              f"물체를 가리키는지, per-object 학습이 실패했는지 확인하세요.")
     keep = d < max(np.percentile(d, 80), 1e-6)        # 먼 점(floater) 제외
     vals, cnt = np.unique(lab[j][keep], return_counts=True)
     share = cnt / max(keep.sum(), 1)
@@ -367,6 +381,10 @@ def main():
                     help="추출할 object_id 목록(쉼표). 비우면 recon 겹침 투표로 자동 매칭 "
                          "— SAM3 인스턴스가 여러 GT 객체를 아우르는 경우까지 커버. "
                          "'all' 이면 라벨 선택 없이 씬 전체와 비교(씬 단위 평가)")
+    ap.add_argument("--match_max_dist", type=float, default=0.05,
+                    help="recon→GT 거리 중앙값이 이 값(m)을 넘으면 '매칭 무의미' 경고. "
+                         "투표 컷오프가 상대 기준이라 recon 이 3m 떨어져 있어도 95%% "
+                         "득표가 나온다(obj21 실측). 판정에 쓰지 말고 경고로만 본다")
     ap.add_argument("--match_min_share", type=float, default=0.10,
                     help="자동 매칭 시 채택할 라벨의 최소 득표 비율")
     ap.add_argument("--recon", required=True, help="비교 A (보통 fuse_post.ply)")
@@ -421,7 +439,8 @@ def main():
             labs = [int(x) for x in args.gt_labels.split(",")]
         else:
             ref = sample(args.recon, min(args.n_sample, 100000), args.seed)
-            labs = auto_match_labels(V, T, L, ref, args.match_min_share)
+            labs = auto_match_labels(V, T, L, ref, args.match_min_share,
+                                     max_dist=args.match_max_dist)
         sel = np.isin(L, labs)
         assert sel.any(), f"object_id={labs} 인 면이 없음"
         T = T[sel]
