@@ -288,6 +288,7 @@ def main():
         stems = [stems[i] for i in idx]
 
     image_data, Ts_cm, cam_params, obj_uv, vis_pts = [], [], [], [], []
+    n_infr, n_vis = [], []
     n_mask = 0
     for s in stems:
         c = cams[s]
@@ -321,6 +322,20 @@ def main():
                                   .resize((W, H), Image.NEAREST)) > 0
                 ui = np.clip(u, 0, W - 1).astype(int); vi = np.clip(v, 0, H - 1).astype(int)
                 infr &= mk[vi, ui]
+        # [가림 판정] infr 은 '이미지 안에 투영되는가'일 뿐 가림을 보지 않는다.
+        #   그대로 두면 항아리 뒷면 점도 '보인다'로 기록되어, 실측 obj10 에서 32뷰 전부
+        #   14252점 중 13133점(92%)이 가시로 잡혔다. ShapeR 에게 "이 물체는 거의 다
+        #   보인다"고 말하는 셈이라 완성할 이유를 주지 않는다.
+        #   depth 로 '그 뷰의 첫 표면'인 점만 남긴다 — 관측 필터와 같은 기준.
+        vis = infr.copy()
+        if args.depth_dir:
+            d = load_depth_map(args.depth_dir, s, args.depth_scale)
+            if d is not None:
+                if d.shape != (H, W):
+                    d = np.array(Image.fromarray(d).resize((W, H), Image.NEAREST))
+                ui = np.clip(u, 0, W - 1).astype(int); vi = np.clip(v, 0, H - 1).astype(int)
+                dv = d[vi, ui]
+                vis = infr & (dv > 0.01) & (np.abs(z - dv) < args.seen_margin)
         if infr.sum() < 20:                            # 객체가 거의 안 보이는 뷰는 제외
             continue
 
@@ -329,10 +344,17 @@ def main():
         Ts_cm.append(torch.tensor(T_cm, dtype=torch.float32))
         cam_params.append(np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], np.float32))
         obj_uv.append(torch.tensor(np.stack([u[infr], v[infr]], 1), dtype=torch.float32))
-        vis_pts.append(P_m[infr].astype(np.float32))
+        vis_pts.append(P_m[vis].astype(np.float32))
+        n_infr.append(int(infr.sum())); n_vis.append(int(vis.sum()))
     assert image_data, "유효 뷰 0개 — 마스크/포즈 확인"
+    _mv, _mi = int(np.median(n_vis)), int(np.median(n_infr))
     print(f"[views] {len(image_data)}뷰 (마스크 적용 {n_mask}), "
-          f"가시점 중앙값 {int(np.median([len(x) for x in vis_pts]))}")
+          f"가시점 중앙값 {_mv} / 시야내 {_mi} "
+          f"({_mv/max(_mi,1)*100:.0f}% — 가림 판정 "
+          f"{'적용' if args.depth_dir else '없음(⚠ depth_dir 미지정)'})")
+    if _mv / max(_mi, 1) > 0.8:
+        print("  ⚠ 가시 비율이 80%를 넘습니다. 물체 전체가 모든 뷰에서 보인다는 뜻인데, "
+              "3D 물체에서는 비정상입니다 — ShapeR 가 '완성할 것이 없다'고 판단할 수 있습니다")
 
     # ---- 4) pkl 조립 ----
     N = len(P_m)
