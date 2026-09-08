@@ -962,9 +962,13 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
     if args.free_hard:
         hard = (FREE | OTH) & (alpha < args.free_hard_alpha)
         nneg = int((hard & (F < 0)).sum())
+        nobs = int((hard & (F < 0) & (alpha > 0.5)).sum())
         F = np.where(hard, np.maximum(F, trunc), F)
-        print(f"[free-hard] 스무딩 후 carve 재적용: 빈 공간·타객체 복셀에 남아 있던 "
-              f"음수 {nneg}복셀 제거 (alpha<{args.free_hard_alpha})")
+        print(f"[free-hard] 스무딩 후 carve 재적용: 빈 공간·타객체 복셀의 음수 "
+              f"{nneg}복셀 제거 (그중 관측지배 {nobs}) [alpha<{args.free_hard_alpha}]")
+        if nneg == 0:
+            print("  ⚠ 제거된 복셀이 0 — free_hard_alpha 가 너무 낮아 발동하지 않았을 수 "
+                  "있습니다(위반은 주로 alpha>0.5 인 관측지배 복셀에서 나옵니다)")
 
     # [keep-connected] 최종 음수 볼륨 중 '이 객체의 관측 복셀과 연결된' 성분만 유지.
     # 통짜 생성(여러 객체 포함) prior 가 타 객체의 가려진 공간(unknown)에 남기는
@@ -1287,9 +1291,13 @@ def main():
                         help="grid_smooth 뒤에 carve(FREE/OTH) 제약을 다시 적용. "
                              "스무딩이 하드 제약을 뭉개 prior 가 빈 공간으로 새는 것을 막는다. "
                              "실측(obj22): free 위반의 71%가 prior 기여")
-    parser.add_argument("--free_hard_alpha", default=0.5, type=float,
-                        help="이 값보다 alpha 가 낮은(=관측이 약한) 복셀에만 재적용. "
-                             "관측이 지배하는 곳은 관측 우선 원칙을 유지")
+    parser.add_argument("--free_hard_alpha", default=1.01, type=float,
+                        help="alpha 가 이 값 미만인 복셀에 carve 를 재적용. alpha 는 [0,1] "
+                             "이므로 1.01 = 항상 적용(기본). "
+                             "⚠ 0.5 로 두면 발동하지 않는다 — free 위반의 79~84%가 "
+                             "alpha>0.5 인 '관측지배' 복셀에서 나오므로, 고치려는 대상이 "
+                             "조건에서 정확히 빠진다(실측: free 21.14%→21.2%, 무변화). "
+                             "관측 우선을 지키고 싶으면 0.5 로 되돌릴 것")
     # ── prior 오배치 sanity 검사 (배치 안전장치) ────────────────────────────
     parser.add_argument("--sanity_free_max", default=0.25, type=float,
                         help="출력 표면 중 빈 공간을 sanity_free_depth 이상 '침범한' 비율 상한. "
