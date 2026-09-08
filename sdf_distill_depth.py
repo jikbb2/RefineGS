@@ -897,11 +897,18 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
     #   실측: obj16(액자) seen F@1 0.914→0.647, obj35 0.984→0.868. 둘 다 ufrac 이
     #   낮아 prior 가 차단된 객체였고, 손실의 원인은 prior 가 아니라 이 블렌드였다.
     #   섞을 대상이 없으면 관측을 그대로 쓰는 것이 맞다.
+    #   ⚠ carve(FREE)·타객체(OTH) 복셀은 제외한다. 거기서 alpha=1 로 만들면 F=Fobs 가
+    #     되어 carve 가 통째로 무시된다. 실측(그렇게 했을 때): obj8 sanity 침범
+    #     27.9%→50.9%, obj10 free 21.9%→27.6%, 침범분의 84%가 '관측지배'였다.
+    #     객체 렌더 depth 는 "여기 표면이 있다", GT 씬 depth 는 "여기는 비었다"고
+    #     말하는 모순 상황인데, 다시점 합의인 후자가 더 믿을 만하다.
     if not prior_applied and not args.no_alpha_full_wo_prior:
-        n_lift = int(((Wo > 0) & (alpha < 1.0)).sum())
-        alpha = np.where(Wo > 0, np.float32(1.0), alpha)
-        print(f"  → prior 없음: 관측 복셀 alpha=1 로 고정 ({n_lift}복셀). "
-              f"섞을 대상이 없는데 빈 공간 쪽으로 끌어당기면 표면이 침식된다")
+        lift = (Wo > 0) & ~FREE & ~OTH
+        n_lift = int((lift & (alpha < 1.0)).sum())
+        alpha = np.where(lift, np.float32(1.0), alpha)
+        print(f"  → prior 없음: 관측 복셀 alpha=1 로 고정 ({n_lift}복셀, "
+              f"carve/타객체 제외). 섞을 대상이 없는데 빈 공간 쪽으로 끌어당기면 "
+              f"표면이 침식된다")
 
     # 빈공간/타객체/hull 밖 = +trunc, 미관측 ∩ hull = 생성
     base = np.where(FREE | OTH | ~HULL, trunc, SG)
