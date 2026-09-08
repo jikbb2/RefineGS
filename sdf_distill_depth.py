@@ -897,6 +897,23 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
     #   실측: obj16(액자) seen F@1 0.914→0.647, obj35 0.984→0.868. 둘 다 ufrac 이
     #   낮아 prior 가 차단된 객체였고, 손실의 원인은 prior 가 아니라 이 블렌드였다.
     #   섞을 대상이 없으면 관측을 그대로 쓰는 것이 맞다.
+    # [passthrough] prior 가 적용되지 않으면 관측 재구성을 그대로 반환한다.
+    #   우리 방법의 주장은 '미관측 영역을 완성한다'이다. 완성할 것이 없으면 no-op 이
+    #   정직한 결과이고, 불필요한 재융합은 손해만 남긴다. 실측(게이트 차단 4객체):
+    #     obj16 seen F@1 0.914→0.647   obj35 0.984→0.980
+    #     obj10 free 5.36%→27.12%      obj8  free 7.55%→22.33%
+    #   네 객체 모두 prior 기여가 0 이었다. 즉 아무것도 더하지 않으면서 지표만 깎았다.
+    #   (재융합의 유일한 이득인 carve 는 obj16 에서 free 2.3%→1.9% 로 미미했다)
+    if not prior_applied and args.passthrough_mesh:
+        _pm = os.path.expanduser(args.passthrough_mesh)
+        if os.path.isfile(_pm):
+            _m = o3d.io.read_triangle_mesh(_pm)
+            if len(_m.vertices):
+                print(f"[passthrough] prior 미적용 → 관측 재구성을 그대로 반환 "
+                      f"({os.path.basename(_pm)}, 정점 {len(_m.vertices)})")
+                return np.asarray(_m.vertices), np.asarray(_m.triangles)
+        print(f"[passthrough] ⚠ 파일 없음: {_pm} — 융합을 계속한다")
+
     #   ⚠ carve(FREE)·타객체(OTH) 복셀은 제외한다. 거기서 alpha=1 로 만들면 F=Fobs 가
     #     되어 carve 가 통째로 무시된다. 실측(그렇게 했을 때): obj8 sanity 침범
     #     27.9%→50.9%, obj10 free 21.9%→27.6%, 침범분의 84%가 '관측지배'였다.
@@ -1199,6 +1216,11 @@ def main():
     parser.add_argument("--grid_fuse", action="store_true",
                         help="MLP 대신 결정적 grid TSDF 융합(관측>carve>생성 우선순위). "
                              "--prior_mesh 필수, --prior_carve_views 120+ 권장. 부풀림·스펀지 원천 차단")
+    parser.add_argument("--passthrough_mesh", default="", type=str,
+                        help="게이트가 prior 를 차단했을 때 이 메쉬를 그대로 출력한다"
+                             "(보통 관측 재구성 fuse_post.ply). 완성할 미관측 영역이 "
+                             "없는 객체에서 재융합은 손해만 남긴다 — 실측 obj16 seen F@1 "
+                             "0.914→0.647, obj10 free 5.4%→27.1%. 빈 문자열이면 재융합")
     parser.add_argument("--no_alpha_full_wo_prior", action="store_true",
                         help="prior 가 차단된 객체에서도 alpha 블렌드를 유지(구버전 동작). "
                              "블렌드 대상이 trunc 뿐이라 표면이 최대 trunc 만큼 안쪽으로 "
