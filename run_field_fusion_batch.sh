@@ -72,6 +72,11 @@ MATCH_MIN_SHARE=${MATCH_MIN_SHARE:-0.03}
 #   FUSE_EXTRA="--prior_sigma_w 1.0" PHASE=fuse bash run_field_fusion_batch.sh
 FUSE_EXTRA=${FUSE_EXTRA:-}
 
+# 평가 샘플링 시드. 명시하지 않으면 서버의 eval_seen_unseen.py 버전에 따라
+# 시드가 없을 수 있고, 그러면 unseen F@2 에 ±0.0033 노이즈가 실린다
+# (배치 전체의 해석 임계가 그만큼 나빠진다). 기본값에 기대지 말고 명시한다.
+EVAL_SEED=${EVAL_SEED:-0}
+
 CSV=${CSV:-${OUT}/_field_batch.csv}
 FAILCSV=${FAILCSV:-${OUT}/_field_batch_failures.csv}
 LOGDIR=${LOGDIR:-${PRIOR}/logs}
@@ -164,7 +169,15 @@ if [ "${PHASE}" = "field" ] || [ "${PHASE}" = "all" ]; then
     # prior 를 조용히 재사용한다(파일명이 같아서 눈치채기 어렵다). 앙상블 산출물은
     # field_std 를 갖고 있으므로 그걸로 구분해 필요하면 다시 만든다.
     if [ -f "${NPZ}" ]; then
-      if [ "${ENSEMBLE}" -gt 1 ] && \
+      # [stale prior 가드] 두 가지를 본다.
+      #   ① pkl 이 npz 보다 새로우면 입력이 바뀐 것 — 반드시 재생성.
+      #      (실측: 가시성 판정을 고쳐 pkl 을 다시 만들었는데 npz 가 그대로 재사용되어
+      #       세 번의 실험 결과가 소수점까지 동일했다)
+      #   ② ENSEMBLE>1 인데 기존 npz 에 field_std 가 없으면 단일 샘플 — 재생성.
+      if [ "${PKL}" -nt "${NPZ}" ]; then
+        echo "  [${gid}] pkl 이 더 최신 — 입력이 바뀌었으므로 재생성"
+        mv -f "${NPZ}" "${NPZ%.npz}_stale.npz"
+      elif [ "${ENSEMBLE}" -gt 1 ] && \
          ! python -c "import numpy,sys; sys.exit(0 if 'field_std' in numpy.load(sys.argv[1]).files else 1)" "${NPZ}" 2>/dev/null; then
         echo "  [${gid}] 기존 필드가 단일 샘플(field_std 없음) — 앙상블로 재생성"
         mv -f "${NPZ}" "${NPZ%.npz}_single.npz"
@@ -220,6 +233,7 @@ if [ "${PHASE}" = "fuse" ] || [ "${PHASE}" = "all" ]; then
     # '아직 실험 중인 값'만 넘긴다. 실제 적용값은 로그 맨 위 [config] 표에 찍힌다.
     python sdf_distill_depth.py -m "${MDIR}" --iteration ${ITER} \
       --prior_field "${NPZ}" --gt_depth_dir "${GTD}" \
+      --passthrough_mesh "${OUTD}/fuse_post.ply" \
       --out "${OUTD}/fused_field.ply" \
       ${FUSE_EXTRA} \
       > "${LOGDIR}/fuse_${gid}.log" 2>&1 \
@@ -232,7 +246,7 @@ if [ "${PHASE}" = "fuse" ] || [ "${PHASE}" = "all" ]; then
       --colmap "${COLMAP}" --gid "${gid}" \
       --masks_root "${MASKS}" --use_mask \
       ${STEMS:+$([ -f "${STEMS}" ] && echo --stems "${STEMS}")} \
-      --match_min_share "${MATCH_MIN_SHARE}" \
+      --match_min_share "${MATCH_MIN_SHARE}" --seed "${EVAL_SEED}" \
       --tag "obj${gid}" --csv_all --csv "${CSV}" \
       > "${LOGDIR}/eval_${gid}.log" 2>&1 \
       || { echo "    평가 실패"; note_fail "${gid}" eval "eval_seen_unseen"; \
@@ -249,6 +263,13 @@ fi
 # ---------------- 요약 ----------------
 if [ -f "${CSV}" ]; then
   echo ""
+  # 융합/평가를 돌지 않은 PHASE 에서는 이 표가 '이전 실행의 잔재'다.
+  # (실측: PHASE=pkl 로 세 번 돌리고 결과가 소수점까지 같아 한참을 헤맸다)
+  if [ "${PHASE}" != "fuse" ] && [ "${PHASE}" != "all" ]; then
+    echo "⚠⚠ PHASE=${PHASE} 는 융합/평가를 돌지 않았습니다."
+    echo "   아래 표는 이전 실행의 CSV 이며 이번 변경이 반영돼 있지 않습니다."
+    echo "   ($(date -r "${CSV}" '+%m-%d %H:%M') 생성)"
+  fi
   echo "=== 객체별 seen/unseen 요약 (${CSV}) ==="
   python - "${CSV}" <<'PY'
 import csv, sys, collections
