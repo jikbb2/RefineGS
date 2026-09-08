@@ -960,7 +960,13 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
     #   → 표면 품질용 스무딩이 기하 제약을 덮어쓰고 있었다는 뜻.
     #   관측이 지배하는 곳(alpha 큰 곳)은 건드리지 않는다 — 거기선 관측이 우선이다.
     if args.free_hard:
-        hard = (FREE | OTH) & (alpha < args.free_hard_alpha)
+        # FREE 와 OTH 는 근거의 강도가 다르다.
+        #   FREE = "카메라가 그 지점을 뚫고 더 먼 것을 봤다" (GT depth, 강함)
+        #   OTH  = "더 많은 뷰가 남의 객체라고 투표" (마스크 투표, 노이즈에 취약)
+        # 실측: 둘 다 강제했더니 obj2 의 seen F@1 이 +0.042 → -0.062 로 뒤집혔다
+        # (인접 객체 경계에서 OTH 투표가 흔들려 진짜 표면을 지운 것으로 보인다).
+        # 기본은 FREE 만. OTH 까지 강제하려면 --free_hard_oth.
+        hard = (FREE | OTH if args.free_hard_oth else FREE) & (alpha < args.free_hard_alpha)
         nneg = int((hard & (F < 0)).sum())
         nobs = int((hard & (F < 0) & (alpha > 0.5)).sum())
         F = np.where(hard, np.maximum(F, trunc), F)
@@ -1291,6 +1297,10 @@ def main():
                         help="grid_smooth 뒤에 carve(FREE/OTH) 제약을 다시 적용. "
                              "스무딩이 하드 제약을 뭉개 prior 가 빈 공간으로 새는 것을 막는다. "
                              "실측(obj22): free 위반의 71%가 prior 기여")
+    parser.add_argument("--free_hard_oth", action="store_true",
+                        help="free_hard 를 타객체(OTH) 복셀에도 적용. OTH 는 마스크 투표라 "
+                             "인접 객체 경계에서 흔들려 진짜 표면을 지울 수 있다"
+                             "(실측 obj2: seen F@1 +0.042 → -0.062). 기본은 FREE 만")
     parser.add_argument("--free_hard_alpha", default=1.01, type=float,
                         help="alpha 가 이 값 미만인 복셀에 carve 를 재적용. alpha 는 [0,1] "
                              "이므로 1.01 = 항상 적용(기본). "
