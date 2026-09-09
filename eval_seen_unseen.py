@@ -232,7 +232,8 @@ def build_views(args, scene_mesh=None):
             dg = dg[::ds, ::ds] if dg is not None else None
         if dg is None:
             continue
-        m = load_mask(args.masks_root, args.gid, s) if args.masks_root else None
+        m = (load_mask(args.masks_root, args.gid, s)
+             if (args.masks_root and args.gid) else None)
         if m is not None and m.shape != dg.shape:
             m = np.array(Image.fromarray(m.astype(np.uint8))
                          .resize((dg.shape[1], dg.shape[0]), Image.NEAREST)) > 0
@@ -390,7 +391,9 @@ def main():
     ap.add_argument("--recon", required=True, help="비교 A (보통 fuse_post.ply)")
     ap.add_argument("--recon2", default="", help="비교 B (보통 fused_prior.ply)")
     ap.add_argument("--colmap", required=True)
-    ap.add_argument("--gid", required=True)
+    ap.add_argument("--gid", default="",
+                    help="객체 id. 마스크(--masks_root/--use_mask)를 쓸 때만 필요하다. "
+                         "씬 단위 평가(--gt_labels all)에는 지정하지 않는다")
     ap.add_argument("--masks_root", default="")
     ap.add_argument("--stems", default="")
     ap.add_argument("--vis_source", default="gt_mesh", choices=["gt_mesh", "gt_depth"],
@@ -423,6 +426,12 @@ def main():
     thr = [float(x) for x in args.thresholds.split(",")]
     if args.vis_source == "gt_depth" and not args.gt_depth_dir:
         ap.error("--vis_source gt_depth 에는 --gt_depth_dir 가 필요합니다")
+    # 씬 단위 평가에는 gid 가 없다. 마스크를 쓰려면 반드시 gid 가 있어야 하므로
+    # 조용히 마스크 없이 도는 대신 명시적으로 막는다.
+    if args.use_mask and not args.gid:
+        ap.error("--use_mask 는 --gid 가 필요합니다 — 씬 단위 평가라면 --use_mask 를 빼세요")
+    if args.gt_labels.strip().lower() == "all" and args.gid:
+        print("[경고] --gt_labels all 인데 --gid 가 지정됐습니다 — gid 는 무시됩니다")
 
     # --- GT 로드 + 대상 객체 추출 ---
     V, T, L = load_mesh_labeled(args.gt_mesh)
