@@ -1293,21 +1293,34 @@ def main():
                         help="cos 가중 해제(기본값)")
     # ── free-space 하드 제약 재적용 ────────────────────────────────────────
     # ⚠ 기본 off — 검증 전. A/B 로 free 위반과 seen/unseen 을 함께 볼 것.
-    parser.add_argument("--free_hard", action="store_true",
-                        help="grid_smooth 뒤에 carve(FREE/OTH) 제약을 다시 적용. "
-                             "스무딩이 하드 제약을 뭉개 prior 가 빈 공간으로 새는 것을 막는다. "
-                             "실측(obj22): free 위반의 71%가 prior 기여")
+    parser.add_argument("--free_hard", dest="free_hard", action="store_true",
+                        default=True,
+                        help="carve(FREE) 제약을 블렌드 뒤에 다시 적용 (기본 on). "
+                             "블렌드에서 base 는 (1-alpha) 몫뿐이라 관측이 강한 곳에서는 "
+                             "carve 가 무시된다. 4객체 실측: free 위반 +2.23%p → +0.33%p, "
+                             "obj10 은 21.1%→5.8% 이면서 unseen F@2 0.593→0.679 로 동시 개선")
+    parser.add_argument("--no_free_hard", dest="free_hard", action="store_false",
+                        help="carve 재적용 해제 — 관측이 항상 이긴다(구버전 동작)")
     parser.add_argument("--free_hard_oth", action="store_true",
                         help="free_hard 를 타객체(OTH) 복셀에도 적용. OTH 는 마스크 투표라 "
                              "인접 객체 경계에서 흔들려 진짜 표면을 지울 수 있다"
                              "(실측 obj2: seen F@1 +0.042 → -0.062). 기본은 FREE 만")
-    parser.add_argument("--free_hard_alpha", default=1.01, type=float,
-                        help="alpha 가 이 값 미만인 복셀에 carve 를 재적용. alpha 는 [0,1] "
-                             "이므로 1.01 = 항상 적용(기본). "
-                             "⚠ 0.5 로 두면 발동하지 않는다 — free 위반의 79~84%가 "
-                             "alpha>0.5 인 '관측지배' 복셀에서 나오므로, 고치려는 대상이 "
-                             "조건에서 정확히 빠진다(실측: free 21.14%→21.2%, 무변화). "
-                             "관측 우선을 지키고 싶으면 0.5 로 되돌릴 것")
+    parser.add_argument("--free_hard_alpha", default=0.95, type=float,
+                        help="alpha 가 이 값 미만인 복셀에만 carve 를 재적용. "
+                             "0.95 = 완전 포화(Wo ≥ grid_wcap)한 복셀만 제외 = 기본")
+    # [free_hard_alpha 근거] 4객체 스윕. 관측가중이 꺼져 있으면 Wo 는 정수 뷰 수이고
+    #   alpha=Wo/wcap 이므로 임계는 '몇 뷰까지 carve 를 강제할 것인가'와 같다.
+    #     임계   대상        seen acc  seen F@1  uns F@2  free%
+    #     0.50   Wo ≤ 3뷰      3.836    0.947    0.527   6.350
+    #     0.80   Wo ≤ 6뷰      3.855    0.947    0.529   5.915
+    #     0.95   Wo ≤ 7뷰      3.908    0.947    0.530   5.275   ← 채택
+    #     1.01   Wo ≤ 8뷰(전부) 4.655    0.923    0.532   4.505   ← 절벽
+    #   0.5~0.95 는 seen 손상 0 인 채 free 만 단조 감소한다. 1.01 에서만 무너지는데
+    #   전부 obj2 한 객체다(0.924→0.864). 즉 8뷰 이상이 '표면 있음'이라 말하면
+    #   그 관측이 옳다. alpha 는 {0, 1/8, ..., 1} 이산값이라 0.95~0.99 는 동일하다.
+    #
+    #   규칙: carve 가 관측을 이긴다. 단 관측이 완전 포화(Wo ≥ wcap)한 곳은 예외.
+    #   ⚠ grid_wcap 을 바꾸면 이 임계의 의미도 바뀐다(둘은 묶여 있다).
     # ── prior 오배치 sanity 검사 (배치 안전장치) ────────────────────────────
     parser.add_argument("--sanity_free_max", default=0.25, type=float,
                         help="출력 표면 중 빈 공간을 sanity_free_depth 이상 '침범한' 비율 상한. "
@@ -1481,6 +1494,8 @@ def main():
         ("min_unknown_frac", args.min_unknown_frac, "prior 적용 게이트"),
         ("hull_min_frac",   args.hull_min_frac,    "visual hull 게이트(0=off)"),
         ("keep_connected",  args.keep_connected,   "연결성분 필터"),
+        ("free_hard",       args.free_hard,        "블렌드 뒤 carve 재적용"),
+        ("free_hard_alpha", args.free_hard_alpha,  "완전 포화 관측은 제외(0.95)"),
         ("voxel_size",      args.voxel_size,       "복셀 크기(m)"),
         ("gt_depth_dir",    args.gt_depth_dir,     "GT depth(carve 기준)"),
         ("pts_seed",        args.pts_seed,         "점군 샘플링 시드(재현성)"),
