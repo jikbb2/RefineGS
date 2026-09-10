@@ -124,7 +124,13 @@ class LabelLoader:
 class LabelHead(nn.Module):
     """Learnable prototypes over the rendered 3-D embedding."""
 
-    def __init__(self, K, lo=0.15, hi=0.85, temp=0.1, seed=0):
+    def __init__(self, K, lo=0.15, hi=0.85, temp=0.1, seed=0,
+                 learn_temp=False, temp_min=0.02, repel=0.1):
+        """learn_temp: a free temperature collapses -- measured T 0.1 -> 0.0164 and
+        proto_min_dist 0.225 -> 0.048 within 1000 iters, driving CE to 0.041 by
+        sharpening the logits rather than by separating classes. Fixed by default.
+        repel: penalty pulling prototypes apart, so nearby classes stay decodable.
+        """
         super().__init__()
         C = K + 1                                # class 0 = background
         # Farthest-point init: random placement leaves close pairs that are hard to
@@ -140,8 +146,9 @@ class LabelHead(nn.Module):
         p = pool[idx]
         # store in logit space so the sigmoid below keeps prototypes inside [lo,hi]
         self.raw = nn.Parameter(torch.logit((p - lo) / (hi - lo)))
-        self.log_t = nn.Parameter(torch.tensor(float(np.log(temp))))
-        self.lo, self.hi = lo, hi
+        self.log_t = nn.Parameter(torch.tensor(float(np.log(temp))),
+                                  requires_grad=bool(learn_temp))
+        self.lo, self.hi, self.temp_min, self.repel = lo, hi, temp_min, repel
 
     @property
     def proto(self):
@@ -150,7 +157,14 @@ class LabelHead(nn.Module):
     def logits(self, E):
         """E: (3,H,W) rendered embedding -> (C,H,W) logits."""
         d2 = ((E[None] - self.proto[:, :, None, None]) ** 2).sum(1)      # (C,H,W)
-        return -d2 / self.log_t.exp().clamp_min(1e-3)
+        return -d2 / self.log_t.exp().clamp_min(self.temp_min)
+
+    def repel_loss(self, margin=0.15):
+        """Hinge on the closest prototype pair. Without it, classes that rarely
+        co-occur in a view drift together and become undecodable in 3-D."""
+        P = self.proto
+        d = torch.cdist(P, P) + torch.eye(len(P), device=P.device) * 9
+        return F.relu(margin - d).pow(2).mean()
 
     def loss(self, E, target):
         """0 (not nan) when every pixel is IGNORE -- cross_entropy would divide by
@@ -159,7 +173,8 @@ class LabelHead(nn.Module):
         if not bool(valid.any()):
             return E.sum() * 0.0                       # keeps the graph, contributes 0
         lg = self.logits(E)
-        return F.cross_entropy(lg[None], target[None], ignore_index=IGNORE)
+        ce = F.cross_entropy(lg[None], target[None], ignore_index=IGNORE)
+        return ce + self.repel * self.repel_loss() if self.repel > 0 else ce
 
     @torch.no_grad()
     def assign(self, ids):
@@ -176,4 +191,4 @@ class LabelHead(nn.Module):
         P = self.proto
         d = torch.cdist(P, P) + torch.eye(len(P), device=P.device) * 9
         return {"sat": sat, "proto_min_dist": d.min().item(),
-                "temp": self.log_t.exp().item()}
+                "temp": self.log_t.exp().clamp_min(self.temp_min).item()}
