@@ -115,6 +115,9 @@ class GaussianModel:
         self._rotation = torch.empty(0)
         self._opacity = torch.empty(0)
         self._id = torch.empty(0)            # [S&S] 인스턴스 id (N,3)
+        # [scene] lr for using _id as a learnable label embedding.
+        # 0 keeps the original behaviour (constant per-object color).
+        self._label_lr = 0.0
         self._desc_test = torch.empty(0)     # [S&S] CLIP 디스크립터 (N,384)
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
@@ -262,6 +265,25 @@ class GaussianModel:
         self._desc_test = torch.full((self._xyz.shape[0], 384), float('nan'), device="cuda")
         print("ID: R: %f G: %f B: %f" % (self._id[0][0].item(), self._id[0][1].item(), self._id[0][2].item()))
 
+    def enable_label_learning(self, lr, init_std=0.3):
+        """[scene] Turn _id into a learnable label embedding. Call before training_setup.
+
+        We reuse _id because it is already (N,3) and already flows through
+        prune / densify / save_ply / capture, and the renderer rasterizes it via
+        get_id_color into render_pkg["mask"]. A new tensor would need all of that
+        plumbing rebuilt.
+
+        Rendered value is E = clamp(C0*_id + 0.5, 0, 1) with C0~0.2821, so a small
+        init keeps E near 0.5 (cube center) and avoids clamp saturation.
+        """
+        assert self._id.numel(), "call after create_from_pcd / load_ply"
+        self._label_lr = float(lr)
+        if not isinstance(self._id, nn.Parameter):
+            self._id = nn.Parameter(
+                (torch.randn_like(self._id) * init_std).requires_grad_(True))
+        print(f"[label] _id -> learnable embedding (lr={lr}, init_std={init_std}, "
+              f"N={self._id.shape[0]})")
+
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -275,6 +297,12 @@ class GaussianModel:
             {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
             {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
         ]
+        # [scene] Label embedding. Adding the group makes prune/densify handle it
+        # through the optimizer, so the two sites below use that result.
+        if self._label_lr > 0:
+            assert isinstance(self._id, nn.Parameter), \
+                "call enable_label_learning() before training_setup"
+            l.append({'params': [self._id], 'lr': self._label_lr, "name": "id"})
 
         # [2DGS] plain Adam (SparseGaussianAdam 제거)
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
@@ -441,7 +469,10 @@ class GaussianModel:
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
 
-        self._id = self._id[valid_points_mask]                  # [S&S]
+        # [scene] When learning labels, _id is an optimizer group -- use its result.
+        # Manual indexing would desync param and Adam state and fail silently.
+        self._id = (optimizable_tensors["id"] if self._label_lr > 0
+                    else self._id[valid_points_mask])           # [S&S]
         self._desc_test = self._desc_test[valid_points_mask]    # [S&S]
 
     def cat_tensors_to_optimizer(self, tensors_dict):
@@ -471,6 +502,10 @@ class GaussianModel:
              "opacity": new_opacities,
              "scaling": new_scaling,
              "rotation": new_rotation}
+        # [scene] If the group exists it must be in the dict:
+        # cat_tensors_to_optimizer iterates param_groups and looks up by name.
+        if self._label_lr > 0:
+            d["id"] = new_id
 
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
         self._xyz = optimizable_tensors["xyz"]
@@ -480,7 +515,8 @@ class GaussianModel:
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
 
-        self._id = torch.cat((self._id, new_id))                  # [S&S]
+        self._id = (optimizable_tensors["id"] if self._label_lr > 0
+                    else torch.cat((self._id, new_id)))           # [S&S]
         self._desc_test = torch.cat((self._desc_test, new_desc))  # [S&S]
 
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
