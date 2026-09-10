@@ -300,27 +300,39 @@ def sample(mesh_path, n, seed=0):
     m = o3d.io.read_triangle_mesh(os.path.expanduser(mesh_path))
     assert len(m.vertices), f"메쉬 로드 실패: {mesh_path}"
     if len(m.triangles) == 0:
-        return np.asarray(m.vertices)
+        return np.asarray(m.vertices), None
     try:                                    # o3d >= 0.16 전역 RNG
         o3d.utility.random.seed(int(seed))
     except Exception:
         pass
+    m.compute_vertex_normals()              # NC 용 — 샘플 점에 법선이 실린다
     try:                                    # 일부 버전은 seed 인자를 받는다
         pc = m.sample_points_uniformly(number_of_points=n, seed=int(seed))
     except TypeError:
         pc = m.sample_points_uniformly(number_of_points=n)
-    return np.asarray(pc.points)
+    N = np.asarray(pc.normals) if pc.has_normals() else None
+    return np.asarray(pc.points), N
 
 
 def _stat(d):
     return (float(d.mean() * 1000), float(np.median(d) * 1000)) if len(d) else (float("nan"),) * 2
 
 
-def report(name, R, G, gs, gf, thresholds, views, args):
-    """recon 점군 R, GT 점군 G, GT 라벨(gs=seen) 로 영역별 지표 출력 + dict 반환."""
+def report(name, RN, G, gs, gf, thresholds, views, args, GN=None):
+    """recon (점,법선) RN, GT 점군 G, GT 라벨(gs=seen) 로 영역별 지표 출력 + dict 반환."""
+    R, RNn = RN if isinstance(RN, tuple) else (RN, None)
     rs, rf = classify(R, views, args.margin, args.min_views, args.use_mask)
-    dR = cKDTree(G).query(R, workers=-1)[0]          # accuracy 용 (recon→GT)
-    dG = cKDTree(R).query(G, workers=-1)[0]          # completion 용 (GT→recon)
+    dR, jR = cKDTree(G).query(R, workers=-1)         # accuracy 용 (recon→GT)
+    dG, jG = cKDTree(R).query(G, workers=-1)         # completion 용 (GT→recon)
+
+    # [NC] Normal Consistency — 대응점 법선의 |cos| 평균(0~1, 높을수록 좋음).
+    #   CD 는 '위치'만 본다. 표면이 울퉁불퉁하거나 방향이 뒤집혀도 위치가 맞으면 통과한다.
+    #   DP-Recon 등이 함께 보고하는 지표이므로 같은 축을 갖춘다.
+    #   부호는 무시한다(|cos|) — 메쉬 방향(winding)이 파이프라인마다 다르기 때문.
+    ncR = ncG = None
+    if RNn is not None and GN is not None and len(RNn) == len(R):
+        ncR = np.abs((RNn * GN[jR]).sum(1))          # recon 점 기준
+        ncG = np.abs((GN * RNn[jG]).sum(1))          # GT 점 기준
 
     print(f"\n===== {name} =====")
     print(f"  점 구성  recon: seen {rs.mean()*100:5.1f}%  free위반 {rf.mean()*100:5.1f}%  "
@@ -336,8 +348,14 @@ def report(name, R, G, gs, gf, thresholds, views, args):
         am, amd = _stat(dR[rm]); cm, cmd = _stat(dG[gm])
         M[f"{key}_acc"] = am; M[f"{key}_acc_med"] = amd
         M[f"{key}_comp"] = cm; M[f"{key}_comp_med"] = cmd
+        nc = float("nan")
+        if ncR is not None:
+            v = [x for x in (ncR[rm], ncG[gm]) if len(x)]
+            nc = float(np.mean([x.mean() for x in v])) if v else float("nan")
+        M[f"{key}_NC"] = nc
         print(f"  [{lab}] accuracy {am:7.2f}mm (med {amd:6.2f})   "
-              f"completion {cm:7.2f}mm (med {cmd:6.2f})")
+              f"completion {cm:7.2f}mm (med {cmd:6.2f})"
+              + (f"   NC {nc:.4f}" if nc == nc else ""))
         for thr in thresholds:
             p = float((dR[rm] < thr).mean()) if rm.sum() else float("nan")
             r = float((dG[gm] < thr).mean()) if gm.sum() else float("nan")
@@ -447,7 +465,7 @@ def main():
         if args.gt_labels:
             labs = [int(x) for x in args.gt_labels.split(",")]
         else:
-            ref = sample(args.recon, min(args.n_sample, 100000), args.seed)
+            ref, _ = sample(args.recon, min(args.n_sample, 100000), args.seed)
             labs = auto_match_labels(V, T, L, ref, args.match_min_share,
                                      max_dist=args.match_max_dist)
         sel = np.isin(L, labs)
@@ -465,7 +483,11 @@ def main():
             o3d.utility.Vector3iVector(Ts.astype(np.int32)))
     views = build_views(args, scene_mesh)
 
-    G, _ = sample_tris(V, T, args.n_sample)
+    G, gidx = sample_tris(V, T, args.n_sample)
+    # [NC] GT 점의 면 법선 — 위치는 맞는데 표면이 울퉁불퉁한 경우를 CD 는 못 잡는다
+    _e1 = V[T[gidx, 1]] - V[T[gidx, 0]]; _e2 = V[T[gidx, 2]] - V[T[gidx, 0]]
+    GN = np.cross(_e1, _e2)
+    GN /= np.maximum(np.linalg.norm(GN, axis=1, keepdims=True), 1e-12)
     gs, _ = classify(G, views, args.margin, args.min_views, args.use_mask)
     print(f"[GT] {len(G)}점 — seen {gs.mean()*100:.1f}% / unseen {(~gs).mean()*100:.1f}%")
     if gs.mean() > 0.98:
@@ -473,11 +495,11 @@ def main():
 
     rows = []
     a = report("A: " + args.recon, sample(args.recon, args.n_sample, args.seed),
-               G, gs, None, thr, views, args)
+               G, gs, None, thr, views, args, GN)
     rows.append(a)
     if args.recon2:
         b = report("B: " + args.recon2, sample(args.recon2, args.n_sample, args.seed),
-                   G, gs, None, thr, views, args)
+                   G, gs, None, thr, views, args, GN)
         rows.append(b)
         print("\n===== A → B 변화 (원하는 방향: seen acc 유지, unseen comp 감소) =====")
         print(f"  seen accuracy      {a['seen_acc']:7.2f} → {b['seen_acc']:7.2f} mm  "
