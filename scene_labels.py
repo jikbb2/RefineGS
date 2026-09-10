@@ -125,7 +125,7 @@ class LabelHead(nn.Module):
     """Learnable prototypes over the rendered 3-D embedding."""
 
     def __init__(self, K, lo=0.15, hi=0.85, temp=0.1, seed=0,
-                 learn_temp=False, temp_min=0.02, repel=0.1):
+                 learn_temp=False, temp_min=0.02, repel=10.0, emb_w=1.0):
         """learn_temp: a free temperature collapses -- measured T 0.1 -> 0.0164 and
         proto_min_dist 0.225 -> 0.048 within 1000 iters, driving CE to 0.041 by
         sharpening the logits rather than by separating classes. Fixed by default.
@@ -148,7 +148,8 @@ class LabelHead(nn.Module):
         self.raw = nn.Parameter(torch.logit((p - lo) / (hi - lo)))
         self.log_t = nn.Parameter(torch.tensor(float(np.log(temp))),
                                   requires_grad=bool(learn_temp))
-        self.lo, self.hi, self.temp_min, self.repel = lo, hi, temp_min, repel
+        self.lo, self.hi = lo, hi
+        self.temp_min, self.repel, self.emb_w = temp_min, repel, emb_w
 
     @property
     def proto(self):
@@ -160,21 +161,39 @@ class LabelHead(nn.Module):
         return -d2 / self.log_t.exp().clamp_min(self.temp_min)
 
     def repel_loss(self, margin=0.15):
-        """Hinge on the closest prototype pair. Without it, classes that rarely
-        co-occur in a view drift together and become undecodable in 3-D."""
+        """Hinge over prototype pairs. Without it, classes that rarely co-occur in a
+        view drift together and become undecodable in 3-D.
+
+        Scale matters: .mean() over the full CxC matrix divides one collapsed pair
+        by ~1200, giving 1.8e-5 -- invisible next to a CE of ~1. Measured effect:
+        proto_min_dist went to 0.000 anyway. Sum over unordered pairs instead, so
+        one fully collapsed pair costs margin^2 = 0.0225 and repel=10 makes it 0.22.
+        """
         P = self.proto
         d = torch.cdist(P, P) + torch.eye(len(P), device=P.device) * 9
-        return F.relu(margin - d).pow(2).mean()
+        return F.relu(margin - d).pow(2).sum() / 2
 
-    def loss(self, E, target):
+    @staticmethod
+    def emb_reg(ids, lim=1.24):
+        """Keep _id inside the linear range of E = clamp(C0*_id + 0.5, 0, 1).
+        lim = (hi - 0.5) / C0 with hi = 0.85. Past it the clamp kills the gradient;
+        measured 40% of rendered pixels saturated without this."""
+        return F.relu(ids.abs() - lim).pow(2).mean()
+
+    def loss(self, E, target, ids=None):
         """0 (not nan) when every pixel is IGNORE -- cross_entropy would divide by
-        zero there, and one nan poisons total_loss and every Adam state after it."""
+        zero there, and one nan poisons total_loss and every Adam state after it.
+        ids: gaussian _id (N,3), needed for the saturation regulariser."""
         valid = target != IGNORE
         if not bool(valid.any()):
             return E.sum() * 0.0                       # keeps the graph, contributes 0
         lg = self.logits(E)
-        ce = F.cross_entropy(lg[None], target[None], ignore_index=IGNORE)
-        return ce + self.repel * self.repel_loss() if self.repel > 0 else ce
+        out = F.cross_entropy(lg[None], target[None], ignore_index=IGNORE)
+        if self.repel > 0:
+            out = out + self.repel * self.repel_loss()
+        if self.emb_w > 0 and ids is not None:
+            out = out + self.emb_w * self.emb_reg(ids)
+        return out
 
     @torch.no_grad()
     def assign(self, ids):
@@ -191,4 +210,5 @@ class LabelHead(nn.Module):
         P = self.proto
         d = torch.cdist(P, P) + torch.eye(len(P), device=P.device) * 9
         return {"sat": sat, "proto_min_dist": d.min().item(),
-                "temp": self.log_t.exp().clamp_min(self.temp_min).item()}
+                "temp": self.log_t.exp().clamp_min(self.temp_min).item(),
+                "repel": self.repel * self.repel_loss().item()}
