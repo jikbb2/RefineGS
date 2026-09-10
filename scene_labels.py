@@ -43,7 +43,27 @@ class LabelLoader:
         self.n_class = self.K + 1
         self.meta = meta
         self._c = {} if cache else None
-        print(f"[label] K={self.K} (+background) from {self.root}")
+        self._hit = self._miss = 0
+        self._warned = False
+        self._have = {os.path.splitext(f)[0]
+                      for f in os.listdir(os.path.join(self.root, "labels"))}
+        print(f"[label] K={self.K} (+background), {len(self._have)} label maps "
+              f"from {self.root}")
+
+    def check_stems(self, names):
+        """Camera image_name vs label file stem. A mismatch makes every target
+        all-IGNORE, which silently yields nan CE and zero gradient."""
+        names = list(names)
+        hit = sum(n in self._have for n in names)
+        print(f"[label] stem match {hit}/{len(names)} cameras")
+        if hit < len(names) * 0.5:
+            ex_c = [n for n in names if n not in self._have][:3]
+            ex_l = sorted(self._have)[:3]
+            raise SystemExit(
+                f"[label] stems do not match.\n"
+                f"  camera image_name : {ex_c}\n"
+                f"  label file stems  : {ex_l}\n"
+                f"  Rename the label maps or fix --label_dir.")
 
     def _read(self, stem):
         if self._c is not None and stem in self._c:
@@ -64,10 +84,16 @@ class LabelLoader:
         return np.array(Image.fromarray(a).resize((W, H), m))
 
     def target(self, stem, H, W):
-        """(H,W) int64 label map on cuda. Missing view -> all IGNORE (loss skips it)."""
+        """(H,W) int64 label map on cuda. Missing view -> all IGNORE (loss returns 0)."""
         lab, _ = self._read(stem)
         if lab is None:
+            self._miss += 1
+            if not self._warned and self._miss > 20:
+                self._warned = True
+                print(f"[label] WARN {self._miss} views have no label map "
+                      f"(e.g. '{stem}'); those get no CE at all")
             return torch.full((H, W), IGNORE, dtype=torch.long, device="cuda")
+        self._hit += 1
         lab = self._resize(lab.astype(np.int32), H, W, True)
         return torch.from_numpy(lab.astype(np.int64)).cuda()
 
@@ -112,6 +138,11 @@ class LabelHead(nn.Module):
         return -d2 / self.log_t.exp().clamp_min(1e-3)
 
     def loss(self, E, target):
+        """0 (not nan) when every pixel is IGNORE -- cross_entropy would divide by
+        zero there, and one nan poisons total_loss and every Adam state after it."""
+        valid = target != IGNORE
+        if not bool(valid.any()):
+            return E.sum() * 0.0                       # keeps the graph, contributes 0
         lg = self.logits(E)
         return F.cross_entropy(lg[None], target[None], ignore_index=IGNORE)
 

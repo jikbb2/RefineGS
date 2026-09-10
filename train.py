@@ -108,6 +108,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         _lab = LabelLoader(args.label_dir)
         _head = LabelHead(_lab.K).cuda()
         _hopt = torch.optim.Adam(_head.parameters(), lr=args.proto_lr)
+        # A stem mismatch makes every target all-IGNORE: CE becomes nan and no
+        # gradient reaches the head. Fail loudly here instead.
+        _lab.check_stems(c.image_name for c in scene.getTrainCameras())
         gaussians.enable_label_learning(args.label_lr)   # must precede training_setup
     gaussians.training_setup(opt)
     # [NV] load novel-view soft-weighted supervision (+ optional [v2] normal_%04d.png)
