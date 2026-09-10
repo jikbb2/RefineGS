@@ -51,21 +51,36 @@ class LabelLoader:
               f"from {self.root}")
 
     def check_stems(self, names):
-        """Camera image_name vs label file stem. A mismatch makes every target
-        all-IGNORE, which silently yields nan CE and zero gradient."""
-        names = list(names)
+        """Camera image_name vs label file stem. A total mismatch makes every target
+        all-IGNORE, which silently yields nan CE and zero gradient.
+
+        Partial coverage is fine and expected: masks are often generated on every
+        other frame. Views without a label map keep their RGB / depth supervision
+        and simply contribute no CE.
+        """
+        names = [self._norm(n) for n in names]
         hit = sum(n in self._have for n in names)
-        print(f"[label] stem match {hit}/{len(names)} cameras")
-        if hit < len(names) * 0.5:
-            ex_c = [n for n in names if n not in self._have][:3]
-            ex_l = sorted(self._have)[:3]
+        print(f"[label] stem match {hit}/{len(names)} cameras "
+              f"({hit / max(len(names), 1) * 100:.0f}%)")
+        if hit == 0:
+            ex_c, ex_l = names[:3], sorted(self._have)[:3]
             raise SystemExit(
-                f"[label] stems do not match.\n"
+                f"[label] no stem matches.\n"
                 f"  camera image_name : {ex_c}\n"
                 f"  label file stems  : {ex_l}\n"
                 f"  Rename the label maps or fix --label_dir.")
+        if hit < len(names) * 0.9:
+            print(f"[label]   {len(names) - hit} views have no label map "
+                  f"-- CE only on the rest")
 
-    def _read(self, stem):
+    @staticmethod
+    def _norm(name):
+        """Camera image_name may carry an extension ('frame001748.jpg') while the
+        label files do not. Normalise both sides to the bare stem."""
+        return os.path.splitext(os.path.basename(str(name)))[0]
+
+    def _read(self, name):
+        stem = self._norm(name)
         if self._c is not None and stem in self._c:
             return self._c[stem]
         lp = os.path.join(self.root, "labels", stem + ".png")
