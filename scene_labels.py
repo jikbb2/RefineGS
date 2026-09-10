@@ -125,7 +125,8 @@ class LabelHead(nn.Module):
     """Learnable prototypes over the rendered 3-D embedding."""
 
     def __init__(self, K, lo=0.15, hi=0.85, temp=0.1, seed=0,
-                 learn_temp=False, temp_min=0.02, repel=10.0, emb_w=1.0):
+                 learn_temp=False, temp_min=0.02, repel=10.0, emb_w=1.0,
+                 knn_w=1.0):
         """learn_temp: a free temperature collapses -- measured T 0.1 -> 0.0164 and
         proto_min_dist 0.225 -> 0.048 within 1000 iters, driving CE to 0.041 by
         sharpening the logits rather than by separating classes. Fixed by default.
@@ -150,6 +151,8 @@ class LabelHead(nn.Module):
                                   requires_grad=bool(learn_temp))
         self.lo, self.hi = lo, hi
         self.temp_min, self.repel, self.emb_w = temp_min, repel, emb_w
+        self.knn_w = knn_w
+        self._knn_cache, self._knn_val = {}, torch.zeros(())
 
     @property
     def proto(self):
@@ -174,13 +177,44 @@ class LabelHead(nn.Module):
         return F.relu(margin - d).pow(2).sum() / 2
 
     @staticmethod
+    def knn_reg(ids, xyz, cache, k=8, n_anchor=4096, rebuild_every=500, it=0):
+        """Spatial smoothness of the embedding: a gaussian should agree with its
+        k nearest neighbours in 3-D.
+
+        Why this is the missing term: CE supervises the ALPHA-COMPOSITED embedding
+        along a ray, not individual gaussians. A composite can land on the right
+        prototype while the individual embeddings are arbitrary -- which is exactly
+        what we measured (CE 0.02-0.4, yet only 6 of 34 classes were spatially
+        compact). This constrains the gaussians themselves.
+
+        cache: dict, reused across iterations. Rebuilt when the gaussian count
+        changes (densify/prune) or every rebuild_every iterations.
+        """
+        n = xyz.shape[0]
+        if (cache.get("n") != n or cache.get("it", -10 ** 9) + rebuild_every <= it):
+            g = torch.Generator(device="cpu").manual_seed(it)
+            a = torch.randperm(n, generator=g)[:min(n_anchor, n)].to(xyz.device)
+            with torch.no_grad():
+                # chunked: a full (A,N) distance matrix is 10 GB at A=4096, N=628k,
+                # which does not fit the 20 GB MIG slice
+                nbr = []
+                for i in range(0, len(a), 256):
+                    d = torch.cdist(xyz[a[i:i + 256]], xyz)
+                    nbr.append(d.topk(k + 1, largest=False).indices[:, 1:])
+                    del d
+                cache["nbr"] = torch.cat(nbr)
+            cache["anchor"], cache["n"], cache["it"] = a, n, it
+        e = ids[cache["anchor"]][:, None, :]                 # (A,1,3)
+        return (e - ids[cache["nbr"]]).pow(2).sum(-1).mean()
+
+    @staticmethod
     def emb_reg(ids, lim=1.24):
         """Keep _id inside the linear range of E = clamp(C0*_id + 0.5, 0, 1).
         lim = (hi - 0.5) / C0 with hi = 0.85. Past it the clamp kills the gradient;
         measured 40% of rendered pixels saturated without this."""
         return F.relu(ids.abs() - lim).pow(2).mean()
 
-    def loss(self, E, target, ids=None):
+    def loss(self, E, target, ids=None, xyz=None, it=0):
         """0 (not nan) when every pixel is IGNORE -- cross_entropy would divide by
         zero there, and one nan poisons total_loss and every Adam state after it.
         ids: gaussian _id (N,3), needed for the saturation regulariser."""
@@ -193,6 +227,9 @@ class LabelHead(nn.Module):
             out = out + self.repel * self.repel_loss()
         if self.emb_w > 0 and ids is not None:
             out = out + self.emb_w * self.emb_reg(ids)
+        if self.knn_w > 0 and ids is not None and xyz is not None:
+            self._knn_val = self.knn_reg(ids, xyz, self._knn_cache, it=it)
+            out = out + self.knn_w * self._knn_val
         return out
 
     @torch.no_grad()
@@ -211,4 +248,5 @@ class LabelHead(nn.Module):
         d = torch.cdist(P, P) + torch.eye(len(P), device=P.device) * 9
         return {"sat": sat, "proto_min_dist": d.min().item(),
                 "temp": self.log_t.exp().clamp_min(self.temp_min).item(),
-                "repel": self.repel * self.repel_loss().item()}
+                "repel": self.repel * self.repel_loss().item(),
+                "knn": self.knn_w * float(self._knn_val)}

@@ -247,7 +247,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         _lab_val = 0.0
         if _lab is not None and iteration > args.label_from_iter:
             _tgt = _lab.target(viewpoint_cam.image_name, *image.shape[-2:])
-            _lab_loss = _head.loss(mask, _tgt, gaussians._id)
+            _lab_loss = _head.loss(mask, _tgt, gaussians._id,
+                                   gaussians.get_xyz.detach(), iteration)
             total_loss = total_loss + args.lambda_label * _lab_loss
             _lab_val = _lab_loss.item()
 
@@ -338,7 +339,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 r = _head.report(mask)
                 print(f"\n[label] iter {iteration}  CE {ema_lab_for_log:.3f}  "
                       f"sat {r['sat']*100:.1f}%  proto_min_dist {r['proto_min_dist']:.3f}  "
-                      f"repel {r['repel']:.4f}  T {r['temp']:.4f}")
+                      f"repel {r['repel']:.4f}  knn {r['knn']:.4f}  "
+                      f"T {r['temp']:.4f}")
             if iteration == opt.iterations:
                 progress_bar.close()
 
