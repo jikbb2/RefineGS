@@ -44,6 +44,17 @@ def assign(ids, head):
     return torch.cdist(E, P).argmin(1).numpy(), P.numpy()
 
 
+def link_radius(pts, k=3.0):
+    """Connectivity radius scaled to this class's own point spacing.
+
+    A fixed radius is confounded by density: a sparse class fragments even when it
+    is a single correct object (measured: 208 points over a 1.8 m radius scored
+    0.029 at a fixed 5 cm). Use k x the median nearest-neighbour distance instead.
+    """
+    d, _ = cKDTree(pts).query(pts, k=2)
+    return float(k * np.median(d[:, 1]))
+
+
 def largest_component_frac(pts, radius):
     """Fraction of points in the biggest connected blob (union-find over a radius graph)."""
     n = len(pts)
@@ -69,8 +80,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ply", required=True)
     ap.add_argument("--head", required=True)
-    ap.add_argument("--radius", type=float, default=0.05,
-                    help="connectivity radius (m) for the compactness test")
+    ap.add_argument("--link_k", type=float, default=3.0,
+                    help="connectivity radius = link_k x median NN distance of the class")
     ap.add_argument("--max_pts", type=int, default=20000,
                     help="subsample per class before the O(n log n) graph")
     ap.add_argument("--min_pts", type=int, default=200)
@@ -95,7 +106,12 @@ def main():
         r = float(np.linalg.norm(pts - cen[c], axis=1).mean())
         if n > args.max_pts:
             pts = pts[rng.choice(n, args.max_pts, replace=False)]
-        frac = largest_component_frac(pts, args.radius) if n >= args.min_pts else np.nan
+        if n >= args.min_pts:
+            frac = largest_component_frac(pts, link_radius(pts, args.link_k))
+        else:
+            frac = np.nan
+        # extent relative to the scene: density-free, and an object with a
+        # room-sized extent is wrong regardless of how it clusters
         rows.append((c, n, frac, r))
 
     # nearest other centroid, relative to own radius
