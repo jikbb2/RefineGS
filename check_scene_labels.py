@@ -79,7 +79,8 @@ def largest_component_frac(pts, radius):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ply", required=True)
-    ap.add_argument("--head", required=True)
+    ap.add_argument("--head", default="", help="label_head_*.pth (learned labels)")
+    ap.add_argument("--labels", default="", help="labels.npy from vote_labels.py")
     ap.add_argument("--link_k", type=float, default=3.0,
                     help="connectivity radius = link_k x median NN distance of the class")
     ap.add_argument("--max_pts", type=int, default=20000,
@@ -87,11 +88,21 @@ def main():
     ap.add_argument("--min_pts", type=int, default=200)
     args = ap.parse_args()
 
-    xyz, ids = load_ids(args.ply)
-    head = torch.load(os.path.expanduser(args.head), map_location="cpu")
-    lab, P = assign(ids, head)
-    K = int(head["K"])
-    print(f"[model] {len(xyz):,} gaussians, K={K} (+background)")
+    assert args.head or args.labels, "give --head (learned) or --labels (voted)"
+    if args.labels:
+        xyz = load_ids(args.ply)[0]
+        lab = np.load(os.path.expanduser(args.labels))
+        K = int(lab.max())
+        src = "voted"
+    else:
+        xyz, ids = load_ids(args.ply)
+        head = torch.load(os.path.expanduser(args.head), map_location="cpu")
+        lab, _ = assign(ids, head)
+        K = int(head["K"])
+        src = "learned"
+    print(f"[model] {len(xyz):,} gaussians, K={K} (+background), labels={src}")
+    if (lab < 0).any():
+        print(f"        {(lab < 0).sum():,} unassigned (never visible) -- excluded")
 
     rng = np.random.default_rng(0)
     rows = []
