@@ -144,14 +144,26 @@ def main():
     n_split = sum(1 for v in split.values() if len(v) > 1)
     n_merge = sum(1 for v in merge.values() if len(v) > 1)
 
-    print(f"\n{'GT id':>7}{'GT점':>9}{'IoU':>8}  매칭 인스턴스")
+    # IoU 가 아주 낮은 것은 '매칭'이 아니라 옆 물체에 스친 것이다 — 번호를 감춘다
+    MIN_SHOW = 0.05
+    print(f"\n{'GT id':>7}{'GT점':>9}{'IoU':>8}  매칭 인스턴스 (IoU<{MIN_SHOW} 은 미매칭)")
+    n_hidden = 0
     for g in sorted(gt_ids, key=lambda x: -best[x][0]):
         iou, pid = best[g]
+        if iou < MIN_SHOW:
+            n_hidden += 1
+            if n_hidden > 5:                    # 목록이 길어지면 접는다
+                continue
+            pid = None
         extra = f"  (쪼개짐 {len(split[g])}개)" if len(split.get(g, ())) > 1 else ""
-        print(f"{g:>7}{gt_cnt[g]:>9}{iou:>8.3f}  {pid if pid is not None else '-'}{extra}")
+        print(f"{g:>7}{gt_cnt[g]:>9}{iou:>8.3f}  {pid if pid is not None else '미매칭'}{extra}")
+    if n_hidden > 5:
+        print(f"{'...':>7}{'':>9}{'':>8}  미매칭 {n_hidden}개 (일부 생략)")
 
     ious = np.array([best[g][0] for g in gt_ids])
     print(f"\n=== 요약 (인스턴스 {len(gt_ids)}개, tau={args.tau*1000:.0f}mm) ===")
+    print(f"  커버리지  재구성 {len(used)}개 / GT {len(gt_ids)}개 "
+          f"({len(used)/max(len(gt_ids),1)*100:.0f}%)  ← recall 의 상한")
     print(f"  mIoU                 {ious.mean():.4f}")
     print(f"  mIoU (매칭된 것만)     {ious[ious > 0].mean() if (ious > 0).any() else 0:.4f}"
           f"  ({int((ious > 0).sum())}개)")
