@@ -18,6 +18,7 @@ complete two objects as one.
 import argparse
 import json
 import os
+import re
 import shutil
 
 import numpy as np
@@ -58,6 +59,11 @@ def main():
                     help="id_map.json from make_label_maps.py. With it, output dirs are "
                          "named by the ORIGINAL gid, so <masks>/<gid>/masks keeps working "
                          "and results line up with the per-object baseline")
+    ap.add_argument("--source_root", default="",
+                    help="per-gid data root, e.g. data/<scene>/masks. cfg_args copied "
+                         "from the scene has source_path=<scene root>, so --mask_dir auto "
+                         "resolves to <root>/masks which holds gid folders, not PNGs -- "
+                         "every view is then skipped. Rewrite it to <source_root>/<gid>.")
     ap.add_argument("--out", required=True)
     ap.add_argument("--iter", type=int, default=30000)
     ap.add_argument("--min_pts", type=int, default=500, help="skip labels smaller than this")
@@ -104,8 +110,18 @@ def main():
             os.path.join(d, "point_cloud.ply"))
         for f in ("cfg_args", "cameras.json"):
             s = os.path.join(sd, f)
-            if os.path.isfile(s):
-                shutil.copy(s, os.path.join(od, name, f))
+            if not os.path.isfile(s):
+                continue
+            dst = os.path.join(od, name, f)
+            if f == "cfg_args" and args.source_root:
+                txt = open(s).read()
+                sp = os.path.join(os.path.expanduser(args.source_root), name)
+                txt = re.sub(r"source_path='[^']*'", f"source_path='{sp}'", txt)
+                txt = re.sub(r"model_path='[^']*'",
+                             f"model_path='{os.path.join(od, name)}'", txt)
+                open(dst, "w").write(txt)
+            else:
+                shutil.copy(s, dst)
         kept.append((c, name, len(idx), note))
 
     print(f"[extract] {len(kept)} objects -> {od}")
