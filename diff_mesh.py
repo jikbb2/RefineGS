@@ -53,15 +53,19 @@ def main():
     ap.add_argument("--a", default="fuse_post.ply")
     ap.add_argument("--b", default="fused_field_post.ply")
     ap.add_argument("--n", type=int, default=200000, help="surface samples per mesh")
-    ap.add_argument("--lost_tol", type=float, default=0.01,
-                    help="A sample with no B surface within this is lost (m)")
+    ap.add_argument("--tols", type=float, nargs="*", default=[0.002, 0.005, 0.01, 0.02, 0.04],
+                    help="report unmatched %% of the observed surface at each radius (m). "
+                         "A smooth fall-off means the surface is DISPLACED; a plateau "
+                         "means it is genuinely DELETED.")
     args = ap.parse_args()
 
     od = os.path.expanduser(args.out)
     gids = args.gids or sorted(g for g in os.listdir(od) if g.isdigit())
-    print(f"{args.n:,} surface samples/mesh   lost_tol={args.lost_tol * 1000:.0f}mm\n")
-    print(f"{'gid':>5}{'dBA_med':>9}{'dBA_p95':>9}{'dAB_med':>9}"
-          f"{'lost%':>7}{'bias_mm':>9}{'areaB/A':>9}  note")
+    tm = [f"{t * 1000:g}mm" for t in args.tols]
+    print(f"{args.n:,} surface samples/mesh\n")
+    print(f"{'gid':>5}{'dAB_med':>9}{'dAB_p95':>9}"
+          + "".join(f"{t:>8}" for t in tm)
+          + f"{'bias_mm':>9}{'areaB/A':>9}")
     rows = []
     for gid in gids:
         d = os.path.join(od, str(gid), "train", f"ours_{args.iter}")
@@ -74,28 +78,24 @@ def main():
         dAB = tB.query(A, workers=-1)[0]            # observed -> fused
         # signed offset of the fused surface along the observed normal
         bias = float(np.median(((B - A[iBA]) * AN[iBA]).sum(1))) * 1000
-        lost = (dAB > args.lost_tol).mean() * 100
-        note = []
-        if abs(bias) > 2:
-            note.append("INSIDE" if bias < 0 else "OUTSIDE")
-        if lost > 10:
-            note.append("lost surface")
-        if aA > 0 and aB / aA < 0.85:
-            note.append("eroded")
-        print(f"{gid:>5}{np.median(dBA) * 1000:>9.2f}{np.percentile(dBA, 95) * 1000:>9.2f}"
-              f"{np.median(dAB) * 1000:>9.2f}{lost:>7.1f}{bias:>9.2f}"
-              f"{(aB / aA if aA else np.nan):>9.2f}  {', '.join(note)}")
-        rows.append((np.median(dBA) * 1000, lost, bias, aB / aA if aA else np.nan))
+        unm = [(dAB > t).mean() * 100 for t in args.tols]
+        print(f"{gid:>5}{np.median(dAB) * 1000:>9.2f}{np.percentile(dAB, 95) * 1000:>9.2f}"
+              + "".join(f"{u:>8.1f}" for u in unm)
+              + f"{bias:>9.2f}{(aB / aA if aA else np.nan):>9.2f}")
+        rows.append([np.median(dAB) * 1000] + unm + [bias, aB / aA if aA else np.nan])
 
     if rows:
         r = np.array(rows, float)
-        print(f"\nmedian over {len(r)} objects:  d(B->A) {np.median(r[:, 0]):.2f}mm"
-              f"   lost {np.median(r[:, 1]):.1f}%"
-              f"   bias {np.median(r[:, 2]):+.2f}mm"
-              f"   areaB/A {np.median(r[:, 3]):.2f}")
-        print("bias clearly negative -> the alpha blend is pulling the isosurface in; "
-              "raise grid_wcap or lift alpha where Wo > 0.")
-        print("bias ~0 but lost high -> carve / boundary removal is deleting surface.")
+        act = r[r[:, 0] > 0]                         # drop passthrough identity rows
+        m = np.median(act, axis=0)
+        print(f"\nmedian over {len(act)} fused objects (of {len(r)}):")
+        print(f"  d(A->B) {m[0]:.2f}mm   bias {m[-2]:+.2f}mm   areaB/A {m[-1]:.2f}")
+        print("  unmatched observed surface: "
+              + "  ".join(f"{t} {v:.1f}%" for t, v in zip(tm, m[1:1 + len(tm)])))
+        print("\nfalls off smoothly -> the surface is DISPLACED, not deleted: look at "
+              "voxel size, truncation and any smoothing of the observed field.")
+        print("plateaus above ~10%%  -> that fraction is genuinely missing: look at "
+              "carve, boundary removal and connected-component pruning.")
 
 
 if __name__ == "__main__":
