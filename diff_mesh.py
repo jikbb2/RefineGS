@@ -26,12 +26,21 @@ import open3d as o3d
 from scipy.spatial import cKDTree
 
 
+def _seed(v=0):
+    """open3d >= 0.16 seeds globally; older builds take no seed at all."""
+    try:
+        o3d.utility.random.seed(v)
+    except AttributeError:
+        pass
+
+
 def load(path, n):
     m = o3d.io.read_triangle_mesh(path)
     if not len(m.triangles):
         return None, None, 0.0
     m.compute_vertex_normals()
-    pc = m.sample_points_uniformly(number_of_points=n, seed=0)
+    _seed(0)
+    pc = m.sample_points_uniformly(number_of_points=n)
     return (np.asarray(pc.points), np.asarray(pc.normals),
             float(m.get_surface_area()))
 
