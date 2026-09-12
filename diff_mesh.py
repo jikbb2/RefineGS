@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
-"""Bidirectional diff between the observed mesh and the fused mesh.
+"""Bidirectional surface diff between the observed mesh and the fused mesh.
 
-seen F1 can fall for three different reasons and the summary CSV cannot tell them
-apart. This does, by measuring both directions against a tolerance:
+Compare SURFACES, not vertices. A and B come from different voxel grids (render.py
+uses 0.004, the fusion 0.005), so marching-cubes puts their vertices in different
+places even where the surface is identical -- a vertex-to-vertex test at a few mm
+reports ~100% mismatch for two meshes that agree perfectly. Sample both surfaces
+uniformly instead.
 
-  lost     A vertex with no B vertex within --tol   -> fusion DELETED surface
-                                                       (carve / open-boundary /
-                                                        largest-connected-component)
-  new      B vertex with no A vertex within --tol   -> fusion INVENTED surface
-  shifted  matched pairs, but the median distance is large
-                                                       -> voxel quantisation
+Reported:
+  d(B->A)   how far the fused surface sits from the observed one
+  d(A->B)   observed surface with nothing fused near it = genuinely lost
+  bias      mean signed offset along A's normal. Negative = B sits INSIDE A.
+            A systematic inward bias is the signature of the alpha blend:
+            F = alpha*Fobs + (1-alpha)*base with base = +trunc pulls the zero
+            crossing toward the interior wherever alpha < 1 (alpha = Wo/grid_wcap).
+  area      total triangle area, B/A. Erosion shows up here independent of sampling.
 
-Measured context: with the prior fully disabled, seen F@1 still fell 0.821 -> 0.659,
-so whatever this finds is in the grid machinery, not in ShapeR.
-
-  python diff_mesh.py --out OUT/objects_voted --gids 0 5 7 6 --iter 30000
+  python diff_mesh.py --out OUT/objects_voted
 """
 import argparse
 import os
@@ -24,61 +26,67 @@ import open3d as o3d
 from scipy.spatial import cKDTree
 
 
-def verts(path):
+def load(path, n):
     m = o3d.io.read_triangle_mesh(path)
-    return np.asarray(m.vertices), len(m.triangles)
+    if not len(m.triangles):
+        return None, None, 0.0
+    m.compute_vertex_normals()
+    pc = m.sample_points_uniformly(number_of_points=n, seed=0)
+    return (np.asarray(pc.points), np.asarray(pc.normals),
+            float(m.get_surface_area()))
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
-    ap.add_argument("--gids", nargs="*", default=[], help="default: every dir found")
+    ap.add_argument("--gids", nargs="*", default=[])
     ap.add_argument("--iter", type=int, default=30000)
     ap.add_argument("--a", default="fuse_post.ply")
     ap.add_argument("--b", default="fused_field_post.ply")
-    ap.add_argument("--tol", type=float, default=0.002, help="match radius (m)")
+    ap.add_argument("--n", type=int, default=200000, help="surface samples per mesh")
+    ap.add_argument("--lost_tol", type=float, default=0.01,
+                    help="A sample with no B surface within this is lost (m)")
     args = ap.parse_args()
 
     od = os.path.expanduser(args.out)
     gids = args.gids or sorted(g for g in os.listdir(od) if g.isdigit())
-    print(f"tol={args.tol * 1000:.0f}mm   A={args.a}  B={args.b}\n")
-    print(f"{'gid':>5}{'|A|':>9}{'|B|':>9}{'dB/A':>8}"
-          f"{'lost%':>8}{'new%':>7}{'shift_mm':>10}{'p95_mm':>8}  verdict")
+    print(f"{args.n:,} surface samples/mesh   lost_tol={args.lost_tol * 1000:.0f}mm\n")
+    print(f"{'gid':>5}{'dBA_med':>9}{'dBA_p95':>9}{'dAB_med':>9}"
+          f"{'lost%':>7}{'bias_mm':>9}{'areaB/A':>9}  note")
     rows = []
     for gid in gids:
         d = os.path.join(od, str(gid), "train", f"ours_{args.iter}")
-        pa, pb = os.path.join(d, args.a), os.path.join(d, args.b)
-        if not (os.path.isfile(pa) and os.path.isfile(pb)):
+        A, AN, aA = load(os.path.join(d, args.a), args.n)
+        B, _, aB = load(os.path.join(d, args.b), args.n)
+        if A is None or B is None:
             continue
-        A, fa = verts(pa)
-        B, fb = verts(pb)
-        if not len(A) or not len(B):
-            continue
-        dA = cKDTree(B).query(A, workers=-1)[0]      # A -> nearest B
-        dB = cKDTree(A).query(B, workers=-1)[0]      # B -> nearest A
-        lost = (dA > args.tol).mean() * 100
-        new = (dB > args.tol).mean() * 100
-        m = dB[dB <= args.tol]
-        shift = float(np.median(dB)) * 1000
-        p95 = float(np.percentile(dA, 95)) * 1000
-        v = []
-        if lost > 5:
-            v.append("DELETED surface")
-        if new > 5:
-            v.append("INVENTED surface")
-        if not v and shift > args.tol * 1000 * 0.5:
-            v.append("quantised")
-        print(f"{gid:>5}{len(A):>9,}{len(B):>9,}{len(B) / len(A):>8.2f}"
-              f"{lost:>8.1f}{new:>7.1f}{shift:>10.2f}{p95:>8.1f}  {', '.join(v)}")
-        rows.append((lost, new, shift))
+        tA, tB = cKDTree(A), cKDTree(B)
+        dBA, iBA = tA.query(B, workers=-1)          # fused -> observed
+        dAB = tB.query(A, workers=-1)[0]            # observed -> fused
+        # signed offset of the fused surface along the observed normal
+        bias = float(np.median(((B - A[iBA]) * AN[iBA]).sum(1))) * 1000
+        lost = (dAB > args.lost_tol).mean() * 100
+        note = []
+        if abs(bias) > 2:
+            note.append("INSIDE" if bias < 0 else "OUTSIDE")
+        if lost > 10:
+            note.append("lost surface")
+        if aA > 0 and aB / aA < 0.85:
+            note.append("eroded")
+        print(f"{gid:>5}{np.median(dBA) * 1000:>9.2f}{np.percentile(dBA, 95) * 1000:>9.2f}"
+              f"{np.median(dAB) * 1000:>9.2f}{lost:>7.1f}{bias:>9.2f}"
+              f"{(aB / aA if aA else np.nan):>9.2f}  {', '.join(note)}")
+        rows.append((np.median(dBA) * 1000, lost, bias, aB / aA if aA else np.nan))
 
     if rows:
-        r = np.array(rows)
-        print(f"\nmean  lost {r[:, 0].mean():.1f}%   new {r[:, 1].mean():.1f}%   "
-              f"shift {r[:, 2].mean():.2f}mm")
-        print("lost >> new  -> the carve / boundary logic is eating observed surface.")
-        print("new  >> lost -> the grid is adding surface the observation never had.")
-        print("both small   -> pure voxel quantisation; raise the grid resolution.")
+        r = np.array(rows, float)
+        print(f"\nmedian over {len(r)} objects:  d(B->A) {np.median(r[:, 0]):.2f}mm"
+              f"   lost {np.median(r[:, 1]):.1f}%"
+              f"   bias {np.median(r[:, 2]):+.2f}mm"
+              f"   areaB/A {np.median(r[:, 3]):.2f}")
+        print("bias clearly negative -> the alpha blend is pulling the isosurface in; "
+              "raise grid_wcap or lift alpha where Wo > 0.")
+        print("bias ~0 but lost high -> carve / boundary removal is deleting surface.")
 
 
 if __name__ == "__main__":
