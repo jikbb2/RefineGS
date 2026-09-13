@@ -11,7 +11,7 @@ from an implicit SDF (IGR-style) instead of Open3D. Pipeline:
   3) fit an IGR SDF MLP (manifold + normal + eikonal + signed off-surface)
   4) evaluate on a grid, keep observed voxels only (drops the box of unobserved empty
      space; small holes are filled by interpolation)
-     → marching cubes(zero level set)
+     -> marching cubes(zero level set)
   5) safe_post_process_mesh for num_cluster (same logic as the TSDF path, clamped)
 
 Run from the RefineGS repo root, next to render.py:
@@ -527,7 +527,7 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
     margin = args.prior_carve_margin
     G = args.grid if args.grid > 0 else int(round(2 * scale / args.voxel_size))
     G = int(min(G, args.max_grid))
-    print(f"[grid-fuse] G={G} voxel≈{2*scale/(G-1):.4f}m trunc={trunc}m views={len(VB)}")
+    print(f"[grid-fuse] G={G} voxel~{2*scale/(G-1):.4f}m trunc={trunc}m views={len(VB)}")
     # [obs confidence] Observations near the silhouette are unreliable: grazing angles
     # give large depth error, and mask-border pixels flicker between fg and bg. Integrating
     # every pixel with weight 1 smeared the surface at the seen/unseen boundary.
@@ -861,8 +861,8 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
         x0 = np.zeros(9); l0 = _loss(x0)
         res = _pmin(_loss, x0, method="Powell", options={"maxiter": 250, "xtol": 1e-4})
         R_, t_, s_ = _unpack(res.x)
-        print(f"[carve-align] loss {l0:.4f}→{res.fun:.4f}  dt={np.round(res.x[3:6]*scale, 3)}m  "
-              f"scale={np.round(s_, 3)}  rot={np.rad2deg(np.linalg.norm(res.x[:3])):.1f}°")
+        print(f"[carve-align] loss {l0:.4f}->{res.fun:.4f}  dt={np.round(res.x[3:6]*scale, 3)}m  "
+              f"scale={np.round(s_, 3)}  rot={np.rad2deg(np.linalg.norm(res.x[:3])):.1f}deg")
         sm = float(s_.mean())
         for k0 in range(0, G, 8):                          # recompute the generated SDF with the correction
             k1 = min(k0 + 8, G)
@@ -898,7 +898,7 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
     unknown = (alpha < 0.25) & ~FREE & ~OTH
     ufrac = float((prior_surf & unknown).sum()) / max(int(prior_surf.sum()), 1)
     print(f"[gate] generated surface in unknown space {ufrac*100:.1f}% "
-          f"(threshold {args.min_unknown_frac*100:.0f}%)")
+          f"(threshold {args.min_unknown_frac*100:.1f}%)")
     prior_applied = True
 
     # [obs gate] The gate above asks whether the GENERATED surface sits in unknown space.
@@ -906,7 +906,7 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
     # With almost nothing observed the prior invents the object: measured obj31 at 1.0%
     # observed voxels went 2.16 -> 69.88mm seen accuracy and obj28 at 2.1% went 3.84 ->
     # 77.55mm, while obj22 at 7.7% improved 0.971 -> 0.992 seen F@1. The distribution has
-    # a clean gap at 4.6-7.7%. Both failures pass min_unknown_frac (46.4% / 67.3% vs a 10%
+    # a clean gap at 4.6-7.7%. Both failures pass min_unknown_frac (46.4% / 67.3% vs a 12.5%
     # threshold), so this is a second, independent condition.
     obs_frac = float((Wo > 0).mean())
     if obs_frac < args.min_obs_frac:
@@ -929,8 +929,8 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
     #   The claim of this method is that it completes UNOBSERVED regions. With nothing to
     #   complete, a no-op is the honest result and re-fusing only costs quality.
     #   Measured on the 4 gate-blocked objects:
-    #     obj16 seen F@1 0.914→0.647   obj35 0.984→0.980
-    #     obj10 free 5.36%→27.12%      obj8  free 7.55%→22.33%
+    #     obj16 seen F@1 0.914->0.647   obj35 0.984->0.980
+    #     obj10 free 5.36%->27.12%      obj8  free 7.55%->22.33%
     #   The prior contributed nothing in all four, so re-fusion only lowered the metrics.
     #   (Its one benefit, the carve, moved obj16 free from 2.3% to 1.9% -- negligible.)
     if not prior_applied and args.passthrough_mesh:
@@ -1130,7 +1130,7 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
             print("\n" + "!" * 70)
             print("[sanity] the fused result contradicts the observation -- aborting.")
             for b_ in bad:
-                print(f"  · {b_}")
+                print(f"  - {b_}")
             if prior_applied:
                 print("  check, in order: 1) npz center/scale/R_align belong to this object")
                 print("                   2) pkl T_model_world and bounds "
@@ -1483,31 +1483,37 @@ def main():
     #   Why it was restored: with it off, exactly the objects it used to block collapsed.
     #     obj16 (picture frame)  unseen F@2 0.358 -> 0.073,  seen F@1 0.914 -> 0.646
     #     obj8  (vase)           unseen F@2 0.070 -> 0.025,  free 7.6 -> 33.6%
-    #     obj10        unseen F@2 0.584→0.564,  free 5.4→21.9%
+    #     obj10                  unseen F@2 0.584 -> 0.564,  free 5.4 -> 21.9%
     #   The decision was right; only the statistic was noisy.
     #
-    #   Threshold choice (gate_stat_check.py, 21 objects):
-    #     thr    applied-ok  wasted  blocked-ok  missed  net gain d(unsF2)
-    #     0.05      15      2      2       0      +2.229
-    #     0.10      15      1      3       0      +2.269   <- chosen
-    #     0.20      15      1      3       0      +2.269   (same decisions)
-    #     0.25      13      1      3       2      +1.734
-    #   Both decide identically, so take the one with more margin. Against obj14 (22.2%),
-    #   the lowest ufrac among objects that improve, 0.20 leaves 2.2%p -- inside the +-1.6%p
-    #   run-to-run drift -- while 0.10 leaves 12.2%p. Give the threshold margin rather than
-    #   trying to stabilise the statistic.
+    #   Threshold, re-measured on prior_carve_ds=1 inputs (gate_stat_check.py, 23 objects).
+    #   The earlier 0.10 was chosen on ds=2 data; fixing the view buffers shifted every
+    #   ufrac, so the threshold had to be re-picked.
+    #     thr    applied-ok  wasted  blocked-ok  missed  net d(unsF2)
+    #     0.10      13      3      0       0      +1.240
+    #     0.125     13      2      1       0      +1.525   <- chosen
+    #     0.15      12      2      1       1      +1.345
+    #     0.30      10      2      1       3      +0.877
+    #   The decision rests on two adjacent objects:
+    #     obj16 (picture frame)  ufrac 10.2%  d unsF2 -0.287  d seenF1 -0.210   block it
+    #     obj14                  ufrac 14.7%  d unsF2 +0.182  d seenF1 +0.011   keep it
+    #   0.10 lets obj16 through and 0.15 sits 0.3%p from obj14 -- both inside the +-1.6%p
+    #   run-to-run drift, i.e. a coin flip. 0.125 is the midpoint and leaves 2.2%p on each
+    #   side. Effect on the 23-object mean: seen F@1 +0.010 -> +0.020, seen accuracy
+    #   -0.021 -> -0.173mm, unseen F@2 +0.052 -> +0.065, free +0.455 -> +0.520%p.
     #
-    #   The alternative, "unobserved fraction of the generated INTERIOR volume", was worse
-    #   (14/2/2/1, +2.111): it misses obj14's improvement.
-    #   Remaining error: obj24 (ufrac 42.0%, d unsF2 -0.026) is not separable by any
-    #   threshold.
+    #   The alternative statistic, "unobserved fraction of the generated INTERIOR volume",
+    #   is worse at every threshold (best net +0.713 vs +1.525) and is not even printed for
+    #   gate-blocked objects, since fusion returns before that line.
+    #   Remaining errors, not separable by any threshold: obj24 (ufrac 55.7%, d unsF2
+    #   -0.073) and obj12 (67.3%, -0.022).
     parser.add_argument("--min_obs_frac", default=0.05, type=float,
                         help="minimum fraction of observed voxels for the prior to apply. "
                              "Below it the prior is unconstrained and invents the object: "
                              "obj31 at 1.0%% and obj28 at 2.1%% blew up to 69.9 / 77.6mm seen "
                              "accuracy, while obj22 at 7.7%% improved. 0 disables the gate; "
                              "a blocked object falls through to --passthrough_mesh.")
-    parser.add_argument("--min_unknown_frac", default=0.10, type=float,
+    parser.add_argument("--min_unknown_frac", default=0.125, type=float,
                         help="skip the prior when the unknown fraction of the generated surface "
                              "is below this (the object is already well observed). "
                              "0 = always apply")
@@ -1598,8 +1604,8 @@ def main():
         ("fuse_device",     args.fuse_device,      "fusion device"),
     ]:
         _src = "set" if f"--{_k}" in _given or f"--no_{_k}" in _given else "default"
-        print(f"│ {_k:<17} = {str(_v):<28} [{_src}] {_note}")
-    print("└" + "─" * 62)
+        print(f"| {_k:<17} = {str(_v):<28} [{_src}] {_note}")
+    print("+" + "-" * 62)
     if args.unseen_open > 0:
         print("[config] WARN unseen_open > 0: morphological opening will delete thin "
               "structure in unobserved regions (table legs). Confirm this is intended.")
@@ -1763,7 +1769,7 @@ def main():
             if sat > 1e-9 and abs(sat - args.prior_trunc) / args.prior_trunc > 0.2:
                 Ffield = (Ffield * (args.prior_trunc / sat)).astype(np.float32)
                 print(f"  -> truncation rescale: saturation {sat*1000:.1f}mm -> "
-                      f"{args.prior_trunc*1000:.0f}mm (×{args.prior_trunc/sat:.2f})")
+                      f"{args.prior_trunc*1000:.0f}mm (x{args.prior_trunc/sat:.2f})")
         args.prior_watertight = True          # disable sign-fix; the field is already signed
 
         # [ensemble sigma weighting] Past ~50% unobserved there is no single right answer.
