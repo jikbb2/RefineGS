@@ -36,6 +36,8 @@ import glob
 import json
 import os
 
+import re
+
 import numpy as np
 import open3d as o3d
 from plyfile import PlyData
@@ -79,6 +81,33 @@ def load_class_names(path):
     return out
 
 
+def _tok(name):
+    """Class name -> token set. 'indoor-plant' -> {indoor, plant, indoor-plant}."""
+    parts = [t for t in re.split(r"[^a-z0-9]+", name.lower()) if t]
+    return set(parts) | {name.lower().strip()}
+
+
+def _hits(name, terms):
+    """True when a term matches the whole name or one of its tokens.
+
+    Substring matching is wrong here: 'door' is a substring of 'indoor-plant', which
+    silently removed a reconstructable object from the evaluation. Multi-word terms
+    ('light switch') are compared against the full name, and a trailing 's' is ignored so
+    'blind' still matches 'blinds'.
+    """
+    tk = _tok(name)
+    for t in terms:
+        t = t.strip().lower()
+        if not t:
+            continue
+        if " " in t or "-" in t:
+            if t.replace("-", " ") in name.lower().replace("-", " "):
+                return True
+        elif t in tk or t + "s" in tk or (t.endswith("s") and t[:-1] in tk):
+            return True
+    return False
+
+
 def load_gt(path):
     """GT mesh plus a per-face object_id; quads are fan-triangulated."""
     p = PlyData.read(os.path.expanduser(path))
@@ -113,8 +142,9 @@ def main():
                          "class-based exclusion happens and recall is measured against "
                          "every GT instance, including walls and floors we never build")
     ap.add_argument("--exclude_classes", default=DEFAULT_EXCLUDE_CLASSES,
-                    help="comma-separated GT class names to drop from the evaluation "
-                         "entirely. 'none' keeps them. Substring match, case-insensitive")
+                    help="comma-separated GT class names to drop entirely. 'none' keeps "
+                         "them. Matching is on whole tokens, not substrings: a plain "
+                         "substring test made 'door' swallow 'indoor-plant'")
     ap.add_argument("--root", required=True, help="parent of the per-object model dirs")
     ap.add_argument("--mesh", default="fused_field_post.ply")
     ap.add_argument("--fallback", default="fuse_post.ply",
@@ -141,8 +171,7 @@ def main():
         c.strip().lower() for c in args.exclude_classes.split(",") if c.strip()}
     dropped = collections.Counter()
     if cls_of and drop_cls:
-        bad = {o for o, nm in cls_of.items()
-               if nm and any(c in nm for c in drop_cls)}
+        bad = {o for o, nm in cls_of.items() if nm and _hits(nm, drop_cls)}
         for o in bad:
             n = int((GL == o).sum())
             if n:
