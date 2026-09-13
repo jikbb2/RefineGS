@@ -1,29 +1,31 @@
 #!/usr/bin/env python3
-"""RefineGS — depth 렌더 기반 SDF distillation (TSDF 대체, whole scene).
+"""RefineGS - SDF distillation from rendered depth (replaces Open3D TSDF).
 
-render.py의 TSDF fusion과 '동일한 입력·옵션'을 쓰되, Open3D TSDF 대신 implicit SDF(IGR류)로
-watertight 메쉬를 뽑는다. 파이프라인:
+Same inputs and options as render.py's TSDF fusion, but the watertight mesh comes
+from an implicit SDF (IGR-style) instead of Open3D. Pipeline:
 
-  1) render()로 뷰별 surf_depth + rend_normal + rend_alpha + render(rgb) 를 얻음
-  2) to_cam_open3d와 동일한 intrinsic/extrinsic으로 depth를 월드 점군으로 back-project
-     → 법선은 카메라 방향으로 자동 정렬(부호 일관) : 기존 sdf_distill.py 스펀지의 근본원인 제거
-  3) 정렬된 oriented point cloud에 IGR SDF(MLP) 피팅 (manifold+normal+eikonal+signed off-surface)
-  4) 그리드 SDF 평가 → '관측된 복셀만' 마스킹(미관측 빈 공간의 박스 제거, 작은 구멍은 보간 채움)
+  1) render() per view -> surf_depth, rend_normal, rend_alpha, rgb
+  2) back-project depth to world points with to_cam_open3d's intrinsics/extrinsics.
+     Normals are flipped toward the camera so the SDF sign is globally consistent
+     (the root cause of the sponge artefacts in the old sdf_distill.py)
+  3) fit an IGR SDF MLP (manifold + normal + eikonal + signed off-surface)
+  4) evaluate on a grid, keep observed voxels only (drops the box of unobserved empty
+     space; small holes are filled by interpolation)
      → marching cubes(zero level set)
-  5) safe_post_process_mesh 로 num_cluster 후처리(기존 TSDF 경로와 동일 로직 + 클램프)
+  5) safe_post_process_mesh for num_cluster (same logic as the TSDF path, clamped)
 
-RefineGS repo 루트(render.py 옆)에 두고 실행:
+Run from the RefineGS repo root, next to render.py:
 
   python sdf_distill_depth.py -m output/replica_room0_v2/scene_whole_orbit -s data/replica_room0_v2 \
     --iteration 7000 --depth_ratio 0 --depth_trunc 6.0 --voxel_size 0.01 \
     --sdf_trunc 0.04 --num_cluster 10000 \
     --sdf_iters 10000 --pts_per_view 40000
 
-  # 위 render.py TSDF 명령과 동일 옵션 매핑:
-  #   --depth_ratio, --depth_trunc  : render()/back-project에 그대로 사용
-  #   --voxel_size                  : marching cubes 그리드 해상도 산출(2*scale/voxel_size)
-  #   --sdf_trunc                   : (참고) — SDF 경로에선 미사용. 마스킹은 --mask_dist로 제어
-  #   --num_cluster                 : safe_post_process_mesh 로 재사용(클러스터 수 클램프)
+  # option mapping against the render.py TSDF command above:
+  #   --depth_ratio, --depth_trunc  : passed straight to render() / back-projection
+  #   --voxel_size                  : marching-cubes resolution (2*scale/voxel_size)
+  #   --sdf_trunc                   : unused on the SDF path; masking is --mask_dist
+  #   --num_cluster                 : reused by safe_post_process_mesh (count clamped)
 """
 import os
 import sys
@@ -39,13 +41,13 @@ from gaussian_renderer import render, GaussianModel
 from arguments import ModelParams, PipelineParams, get_combined_args
 import open3d as o3d
 
-# GT depth 기본 경로 — 환경변수 REFINEGS_GT_DEPTH 로 덮어쓸 수 있고, 폴더가 없으면
-# 조용히 무시된다(다른 머신에서 실행해도 깨지지 않게).
+# Default GT depth path. Override with REFINEGS_GT_DEPTH; a missing folder is ignored
+# silently so the script still runs on another machine.
 DEFAULT_GT_DEPTH_DIR = "/home/elicer/nice-slam/Datasets/Replica/room0/results"
 
 
 # ---------------------------------------------------------------------------
-# 카메라 intrinsic/extrinsic — to_cam_open3d(mesh_utils.py)와 완전히 동일한 규약
+# Camera intrinsics/extrinsics - exactly the to_cam_open3d (mesh_utils.py) convention.
 # ---------------------------------------------------------------------------
 def cam_intrinsics(cam):
     W, H = cam.image_width, cam.image_height
@@ -56,18 +58,18 @@ def cam_intrinsics(cam):
         intrins = (cam.projection_matrix @ ndc2pix)[:3, :3].T
         fx, fy = intrins[0, 0].item(), intrins[1, 1].item()
         cx, cy = intrins[0, 2].item(), intrins[1, 2].item()
-    else:  # MiniCam (extra_poses) — FoV에서 직접 산출
+    else:  # MiniCam (extra_poses): derive from FoV
         fx = W / (2.0 * np.tan(cam.FoVx / 2))
         fy = H / (2.0 * np.tan(cam.FoVy / 2))
         cx, cy = (W - 1) / 2.0, (H - 1) / 2.0
-    extrinsic = cam.world_view_transform.T  # world->camera (w2c), CV 규약(+Z forward)
+    extrinsic = cam.world_view_transform.T  # world->camera (w2c), CV convention (+Z forward)
     return fx, fy, cx, cy, W, H, extrinsic
 
 
 # ---------------------------------------------------------------------------
-# utils.mesh_utils.post_process_mesh 의 안전 버전.
-# 원본은 sorted[-cluster_to_keep] 인덱싱이라 연결성분 수 < num_cluster 이면
-# IndexError 발생(깨끗한 SDF 메쉬에서 실제로 터짐). 클러스터 수로 클램프한다.
+# Safe version of utils.mesh_utils.post_process_mesh. The original indexes
+# sorted[-cluster_to_keep] and raises IndexError when there are fewer components than
+# num_cluster -- which actually happens on clean SDF meshes. Clamp to the count.
 # ---------------------------------------------------------------------------
 def safe_post_process_mesh(mesh, cluster_to_keep=1000):
     print(f"post processing the mesh to have {cluster_to_keep} clusters (clamped)")
@@ -76,7 +78,7 @@ def safe_post_process_mesh(mesh, cluster_to_keep=1000):
         triangle_clusters, cluster_n_triangles, cluster_area = mesh_0.cluster_connected_triangles()
     triangle_clusters = np.asarray(triangle_clusters)
     cluster_n_triangles = np.asarray(cluster_n_triangles)
-    keep = min(cluster_to_keep, len(cluster_n_triangles))  # ← 클램프 (원본 버그 수정)
+    keep = min(cluster_to_keep, len(cluster_n_triangles))  # clamp (fixes the original bug)
     n_cluster = np.sort(cluster_n_triangles.copy())[-keep]
     n_cluster = max(n_cluster, 50)  # filter meshes smaller than 50
     triangles_to_remove = cluster_n_triangles[triangle_clusters] < n_cluster
@@ -89,7 +91,7 @@ def safe_post_process_mesh(mesh, cluster_to_keep=1000):
 
 
 # ---------------------------------------------------------------------------
-# IGR-style SDF MLP (geometric init). PE는 기본 off — off-surface 진동/스펀지 방지.
+# IGR-style SDF MLP (geometric init). PE off by default: it causes off-surface ringing.
 # ---------------------------------------------------------------------------
 class SDFNet(nn.Module):
     def __init__(self, d_hidden=256, n_layers=8, skip_in=(4,), pe_L=0, radius=0.5):
@@ -140,11 +142,12 @@ def grad(y, x):
 
 def load_carve_points(carve_dir, center, scale, n_max=2000000, margin=0.02,
                       px_per_view=20000, samples_per_ray=4):
-    """전체 씬 depth 덤프(dump_scene_depth.py)에서 free-space 샘플 생성.
-    각 픽셀 광선의 (카메라 → depth-margin) 구간에서 샘플 → 객체 bbox(정규화 |x|<1.2) 안만 유지."""
+    """Free-space samples from a whole-scene depth dump (dump_scene_depth.py).
+    Sample each pixel ray over [camera, depth - margin]; keep what lands inside the
+    object bbox (normalised |x| < 1.2)."""
     import glob as _glob
     files = sorted(_glob.glob(os.path.join(os.path.expanduser(carve_dir), "*.npz")))
-    assert files, f"carve depth 없음: {carve_dir}"
+    assert files, f"no carve depth under: {carve_dir}"
     pts = []
     for f in files:
         z = np.load(f)
@@ -160,8 +163,9 @@ def load_carve_points(carve_dir, center, scale, n_max=2000000, margin=0.02,
         dirs = np.stack([(u - cx) / fx, (v - cy) / fy, np.ones_like(u, np.float32)], -1) @ c2w[:3, :3].T
         dnorm = np.linalg.norm(dirs, axis=-1)
         dn = dirs / dnorm[:, None]
-        on = (c2w[:3, 3] - center) / scale                       # 정규화 좌표 카메라 중심
-        # 광선-구(반경 1.2) 교차 구간(chord)에서만 샘플 → 전 샘플이 bbox 내부·표면 앞
+        on = (c2w[:3, 3] - center) / scale                       # camera centre, normalised
+        # sample only the ray/sphere(r=1.2) chord, so every sample is inside the bbox
+        # and in front of the surface
         b = (on[None] * dn).sum(-1)
         disc = b * b - ((on * on).sum() - 1.44)
         hit = disc > 0
@@ -170,7 +174,7 @@ def load_carve_points(carve_dir, center, scale, n_max=2000000, margin=0.02,
         sq = np.sqrt(disc[hit])
         t_in = np.maximum(-b[hit] - sq, 0.02)
         t_out = -b[hit] + sq
-        tmax_n = (d[hit] * dnorm[hit] - margin) / scale          # depth까지(단위방향·정규화), margin 여유
+        tmax_n = (d[hit] * dnorm[hit] - margin) / scale          # up to depth (unit dir, normalised) with margin
         hi = np.minimum(t_out, tmax_n)
         ok = hi > t_in
         if not ok.any():
@@ -192,7 +196,7 @@ _C0 = 0.28209479177387814
 
 
 def _set_label_color(gaussians, label):
-    """gaussian 색을 라벨 값으로 교체(label-buffer 렌더용). render_hole_novel과 동일 트릭."""
+    """Swap gaussian colour for a label value (label-buffer render), as render_hole_novel."""
     fdc, frest = gaussians._features_dc, gaussians._features_rest
     saved = (fdc.detach().clone(), frest.detach().clone(), int(gaussians.active_sh_degree))
     dc = (label - 0.5) / _C0
@@ -213,7 +217,7 @@ def _restore_color(gaussians, saved):
 
 @torch.no_grad()
 def render_extra_masks(extra_cams, gaussians, pipe, background, label, thr=0.3):
-    """extra 포즈에서 객체 라벨을 렌더해 per-view 객체 마스크 생성 (base/바닥 유입 차단)."""
+    """Render object labels at extra poses to get per-view masks (blocks floor bleed)."""
     from gaussian_renderer import render as _render
     saved = _set_label_color(gaussians, label)
     masks = {}
@@ -228,10 +232,10 @@ _mask_info_printed = False
 
 
 def load_view_mask(mask_dir, image_name, H, W):
-    """뷰별 객체 마스크 로드(없으면 None). 값 규약 자동 판별:
-    - 0/1 바이너리      → >0 이 객체
-    - amodal(188/0/255) → 188(visible)만 객체 (255=bg, 0=occluded 제외)
-    - 0/255 바이너리    → >127 이 객체
+    """Load a per-view object mask (None if absent). The value convention is detected:
+    - 0/1 binary          -> object is > 0
+    - amodal (188/0/255)  -> 188 (visible) only; 255 = bg, 0 = occluded
+    - 0/255 binary        -> object is > 127
     """
     global _mask_info_printed
     from PIL import Image
@@ -242,28 +246,29 @@ def load_view_mask(mask_dir, image_name, H, W):
             img = Image.open(p).resize((W, H), Image.NEAREST)
             a = np.array(img)
             if a.ndim == 3 and a.shape[2] == 4:
-                a = a[..., 3]          # RGBA: 객체 마스크는 알파 채널 (RGB는 인스턴스 색 코드)
+                a = a[..., 3]          # RGBA: the mask is alpha (RGB is the instance colour code)
             elif a.ndim == 3:
                 a = np.array(img.convert("L"))
             if a.max() <= 1:
                 mm = a > 0
             elif (a == 188).any():
-                mm = a == 188          # amodal 규약: 188=visible
+                mm = a == 188          # amodal convention: 188 = visible
             else:
                 mm = a > 127
             if not _mask_info_printed:
                 u, c = np.unique(a, return_counts=True)
-                print(f"마스크 값 분포(첫 뷰 {os.path.basename(p)}, 채널 처리 후): "
-                      f"{dict(zip(u.tolist()[:6], c.tolist()[:6]))} → 객체 픽셀 {int(mm.sum())}")
+                print(f"[mask] values in {os.path.basename(p)} after channel handling: "
+                      f"{dict(zip(u.tolist()[:6], c.tolist()[:6]))} -> object px {int(mm.sum())}")
                 _mask_info_printed = True
             return torch.from_numpy(mm).cuda()
     return None
 
 
 def load_gt_depth(depth_dir, image_name, H, W, scale):
-    """GT(데이터셋) depth 로드 — '씬 전체 기하' 기준 free-space carve 용.
-    렌더 depth(다리 없는 가우시안)와 달리 실제 occlusion 을 반영 → 다리 절단 방지.
-    stem 매칭: frame000918 → depth000918.png / frame000918.png / frame000918.npy"""
+    """Load dataset GT depth, used to carve free space against the WHOLE scene.
+    Unlike the rendered depth (the gaussian model has no table legs) it reflects real
+    occlusion, so legs survive the carve.
+    stem matching: frame000918 -> depth000918.png / frame000918.png / frame000918.npy"""
     from PIL import Image
     stem = os.path.splitext(image_name)[0]
     for c in (stem.replace("frame", "depth"), stem, stem + "_depth"):
@@ -284,22 +289,23 @@ def load_gt_depth(depth_dir, image_name, H, W, scale):
 @torch.no_grad()
 def collect_oriented_points(scene, gaussians, pipe, background, args, mask_dir=None,
                             require_mask=False, extra_cams=None, extra_masks=None):
-    """뷰별 depth를 월드 점군으로 back-project. 법선은 카메라 방향으로 정렬.
-    mask_dir: 객체 마스크 밖 픽셀 제외(TSDF 경로와 동일 철학).
-    require_mask: 마스크 없는 학습 뷰는 통째로 skip (composed 200뷰 모델 + 객체 마스크 8뷰 케이스).
-    extra_cams: 추가 novel 카메라(MiniCam) — 마스크 미적용(ROI crop으로 제한 권장).
-                See3D 정제된 unseen은 orbit 포즈에서만 보이므로 추출에 필수."""
-    # [속도] 학습 뷰가 수천 장이면 back-project 가 지배적 비용이 된다. 관측 점군은
-    # --pts_per_view/--n_pts 로 어차피 서브샘플되므로 뷰를 성기게 써도 손실이 작다.
+    """Back-project per-view depth to world points; normals are flipped toward the camera.
+    mask_dir:     drop pixels outside the object mask (same policy as the TSDF path).
+    require_mask: skip training views that have no mask (composed 200-view model with
+                  masks for only 8 views).
+    extra_cams:   extra novel cameras (MiniCam), unmasked -- constrain with an ROI crop.
+                  See3D-refined unseen geometry is visible only at orbit poses."""
+    # [speed] with thousands of training views back-projection dominates. The point cloud
+    # is subsampled by --pts_per_view/--n_pts anyway, so striding views costs little.
     _stride = max(1, int(getattr(args, "view_stride", 1)))
     views = [(c, True) for c in scene.getTrainCameras()[::_stride]]
     if _stride > 1:
-        print(f"[속도] view_stride={_stride} → 학습뷰 {len(views)}장 사용")
+        print(f"[speed] view_stride={_stride} -> using {len(views)} training views")
     if extra_cams:
         views += [(c, False) for c in extra_cams]
     P_all, N_all, C_all, O_all = [], [], [], []
     EO_all, ED_all = [], []
-    VB = []          # [prior carve] 뷰 버퍼(다운스케일 depth+mask) — prior 샘플 visual-hull/freespace 검증용
+    VB = []  # view buffers (depth+mask). NOTE: grid_fuse builds the OBSERVED TSDF from these too
     n_tr = sum(1 for _, u in views if u)
     n_carve_views = getattr(args, "prior_carve_views", 0)
     keep_every = max(1, n_tr // max(n_carve_views, 1)) if n_carve_views > 0 else 0
@@ -335,13 +341,13 @@ def collect_oriented_points(scene, gaussians, pipe, background, args, mask_dir=N
                 n_masked_views += 1
             elif require_mask:
                 n_skipped += 1
-                continue          # 마스크 없는 학습 뷰 제외 (씬 전체 점 유입 방지)
+                continue          # skip training views without a mask (keeps whole-scene points out)
 
-        # [prior carve] 균등 간격 뷰의 depth+mask 버퍼 저장
+        # store depth+mask buffers for evenly spaced views
         if use_mask and keep_every and m_obj is not None:
             ti += 1
             if ti % keep_every == 0:
-                ds = max(1, int(getattr(args, "prior_carve_ds", 2)))
+                ds = max(1, int(getattr(args, "prior_carve_ds", 1)))
                 dbuf = torch.where(alpha > args.alpha_thr, depth,
                                    torch.zeros_like(depth))[::ds, ::ds].cpu().numpy()
                 mbuf = m_obj[::ds, ::ds].cpu().numpy()
@@ -357,12 +363,12 @@ def collect_oriented_points(scene, gaussians, pipe, background, args, mask_dir=N
                         b["dgt"] = dg[::ds, ::ds]
                 VB.append(b)
         if not use_mask and extra_masks is not None and cam.image_name in extra_masks:
-            valid &= extra_masks[cam.image_name]   # extra 포즈: label-buffer 객체 마스크
+            valid &= extra_masks[cam.image_name]   # extra poses: label-buffer object mask
         pts_w = pts_w[valid]
         n = nrm[valid]
         c = rgb[valid].clamp(0, 1)
 
-        # 법선을 카메라 쪽으로 정렬(부호 일관) — SDF sign이 전역적으로 정의됨
+        # flip normals toward the camera so the SDF sign is globally defined
         view_dir = cam_center[None] - pts_w
         flip = (n * view_dir).sum(-1) < 0
         n[flip] = -n[flip]
@@ -373,11 +379,12 @@ def collect_oriented_points(scene, gaussians, pipe, background, args, mask_dir=N
             pts_w, n, c = pts_w[sel], n[sel], c[sel]
 
         P_all.append(pts_w.cpu()); N_all.append(n.cpu()); C_all.append(c.cpu())
-        O_all.append(cam_center[None].expand(len(pts_w), 3).cpu())  # 점별 관측 카메라 중심
+        O_all.append(cam_center[None].expand(len(pts_w), 3).cpu())  # per-point observing camera centre
 
-        # 빈 광선 수집: alpha≈0 픽셀 = "이 광선 위엔 아무것도 없음"이 관측된 것
-        # [FIX Step4-C] 실제 학습 뷰(use_mask=True)에서만 수집. extra/novel 뷰의 alpha≈0 은
-        # "모델에 기하가 없음"이지 "빈 공간이 관측됨"이 아님 — 생성 다리를 carve로 지우는 원인.
+        # empty rays: alpha ~ 0 means "nothing observed along this ray".
+        # Collect only from real training views. At extra/novel poses alpha ~ 0 means
+        # "the model has no geometry here", not "empty space was observed" -- that
+        # distinction is what stopped the carve from deleting generated legs.
         if args.empty_per_view > 0 and use_mask:
             em = alpha < args.empty_alpha
             eidx = em.nonzero(as_tuple=False)
@@ -390,28 +397,29 @@ def collect_oriented_points(scene, gaussians, pipe, background, args, mask_dir=N
                 ED_all.append(de.cpu())
 
     if mask_dir is not None:
-        print(f"객체 마스크 적용: {n_masked_views}/{len(views)} 뷰, skip {n_skipped}뷰 (경로 {mask_dir})")
+        print(f"[mask] applied to {n_masked_views}/{len(views)} views, skipped {n_skipped} ({mask_dir})")
     if extra_cams:
-        print(f"extra 포즈 렌더: {len(extra_cams)}뷰 (마스크 미적용)")
+        print(f"[extra] rendered {len(extra_cams)} poses (unmasked)")
     P = torch.cat(P_all).numpy().astype(np.float64)
     N = torch.cat(N_all).numpy().astype(np.float64)
     C = torch.cat(C_all).numpy().astype(np.float64)
     O = torch.cat(O_all).numpy().astype(np.float64)
     EO = torch.cat(EO_all).numpy().astype(np.float64) if EO_all else np.zeros((0, 3))
     ED = torch.cat(ED_all).numpy().astype(np.float64) if ED_all else np.zeros((0, 3))
-    print(f"빈 광선(empty ray) {len(EO)}개 수집, prior-carve 뷰 버퍼 {len(VB)}개")
+    print(f"[rays] {len(EO)} empty rays, {len(VB)} view buffers")
     return P, N, C, O, EO, ED, VB
 
 
 def train_sdf(P, N, O, EO, ED, args, CV=None, W=None, OBS=None, PV=None, PS=None):
-    """정규화된 oriented point cloud에 IGR SDF 피팅.
-    O = 점별 관측 카메라 중심(정규화 좌표) — 표면 근처 free-space carving.
-    EO/ED = 빈 광선(alpha≈0 픽셀)의 카메라 중심/방향 — empty-ray carving.
-    CV = 전체 씬 depth 기반 free-space 샘플 풀(carve_depth_dir) — 있으면 empty-ray 대신 사용.
-    OBS = [FIX Step4-B] 점별 '관측점' 마스크(bool). l_free 는 관측점에서만 —
-          prior 점의 가짜 원점(O=center)이 객체 내부를 carve하던 버그 제거.
-    PV/PS = [Step2] prior mesh 볼륨 샘플 좌표 / target SDF(정규화). truncated L1 회귀 —
-            얇은 다리 양쪽 빈 공간이 양수로 명시 감독되어 팽창을 원리적으로 차단."""
+    """Fit an IGR SDF to a normalised oriented point cloud.
+    O      per-point observing camera centre (normalised): free-space carving near the surface.
+    EO/ED  camera centre/direction of empty rays (alpha ~ 0 pixels): empty-ray carving.
+    CV     free-space sample pool from whole-scene depth (carve_depth_dir); replaces
+           empty-ray carving when present.
+    OBS    bool mask marking real observed points. l_free applies only to them: prior
+           points carry a fake origin (O = center) and used to carve the object interior.
+    PV/PS  prior-mesh volume sample coords / target SDF (normalised), truncated-L1.
+           Supervising both sides of a thin leg as positive blocks inflation by construction."""
     dev = "cuda"
     Pt = torch.tensor(P, dtype=torch.float32, device=dev)
     Nt = torch.tensor(N, dtype=torch.float32, device=dev)
@@ -424,7 +432,7 @@ def train_sdf(P, N, O, EO, ED, args, CV=None, W=None, OBS=None, PV=None, PS=None
     if OBS is not None:
         obs_idx = torch.tensor(np.nonzero(OBS)[0], dtype=torch.long, device=dev)
         if len(obs_idx) == len(Pt):
-            obs_idx = None                       # 전부 관측점이면 게이팅 불필요
+            obs_idx = None                       # all points observed: no gating needed
     PVt = torch.tensor(PV, dtype=torch.float32, device=dev) if PV is not None and len(PV) else None
     PSt = torch.tensor(PS, dtype=torch.float32, device=dev) if PVt is not None else None
     net = SDFNet(pe_L=args.pe_L).to(dev)
@@ -449,10 +457,10 @@ def train_sdf(P, N, O, EO, ED, args, CV=None, W=None, OBS=None, PV=None, PS=None
             pp = Pt[bi] + delta * nrm; pm = Pt[bi] - delta * nrm
             l_sign = (net(pp) - delta).abs().mean() + (net(pm) + delta).abs().mean()
 
-        # free-space carving (표면 근처): 관측점 p에서 카메라 방향으로 s∈[2δ, free_range] 후퇴한
-        # 점은 빈 공간 → SDF ≥ 0. (bbox 안 표면 근처를 집중 샘플 — 멀리 카메라 쪽은 정보 없음)
-        # [FIX Step4-B] 관측점만 사용(obs_idx). prior 점은 O=center 가짜 원점이라
-        # 객체 내부를 '빈 공간'으로 carve → l_sign 과 충돌 → 표면 뒤틀림의 원인이었음.
+        # free-space carving near the surface: stepping back from an observed point p
+        # toward its camera by s in [2d, free_range] lands in empty space -> SDF >= 0.
+        # Observed points only: prior points have a fake origin (O = center), so they
+        # carved the object interior and fought l_sign, warping the surface.
         l_free = torch.tensor(0.0, device=dev)
         if args.w_free > 0:
             bf = (obs_idx[torch.randint(0, len(obs_idx), (args.batch,), device=dev)]
@@ -465,8 +473,8 @@ def train_sdf(P, N, O, EO, ED, args, CV=None, W=None, OBS=None, PV=None, PS=None
             xf = Pt[bf] - dirn * s
             l_free = torch.relu(-net(xf)).mean()
 
-        # empty-ray carving: 렌더 alpha≈0 픽셀의 광선은 '아무것도 없음'이 관측된 것 →
-        # 광선이 반경 1.2 구(=bbox) 를 지나는 chord 구간 안에서만 샘플해 SDF ≥ 0 강제.
+        # empty-ray carving: a rendered alpha ~ 0 pixel means nothing was observed along
+        # that ray. Sample only the chord inside the r=1.2 sphere (bbox) and force SDF >= 0.
         l_empty = torch.tensor(0.0, device=dev)
         if args.w_empty > 0 and CVt is not None:
             bj = torch.randint(0, len(CVt), (args.batch,), device=dev)
@@ -474,21 +482,21 @@ def train_sdf(P, N, O, EO, ED, args, CV=None, W=None, OBS=None, PV=None, PS=None
         elif args.w_empty > 0 and EOt is not None and len(EOt) > 0:
             bj = torch.randint(0, len(EOt), (args.batch,), device=dev)
             o, dn = EOt[bj], EDt[bj]
-            t0 = -(o * dn).sum(-1, keepdim=True)                 # 원점 최근접 파라미터
+            t0 = -(o * dn).sum(-1, keepdim=True)                 # ray parameter closest to the origin
             cp = o + dn * t0
             half = (1.44 - (cp * cp).sum(-1, keepdim=True)).clamp(min=0.0).sqrt()
             t = (t0 + (torch.rand_like(t0) * 2 - 1) * half).clamp(min=0.05)
             xe = o + dn * t
-            l_empty = torch.relu(-net(xe)).mean()                         # 음수(내부)만 벌점
+            l_empty = torch.relu(-net(xe)).mean()                         # penalise negative (inside) only
 
-        # [Step2] prior mesh 볼륨 SDF distillation — truncated L1 회귀.
-        # 표면점만 주입하던 기존 방식과 달리 다리 '양쪽' 빈 공간이 명시적으로 양수 감독됨.
+        # prior-mesh volume SDF distillation, truncated L1. Unlike injecting surface
+        # points only, the empty space on BOTH sides of a leg is supervised as positive.
         l_prior = torch.tensor(0.0, device=dev)
         if PVt is not None and args.w_prior_sdf > 0:
             bp = torch.randint(0, len(PVt), (args.batch,), device=dev)
             l_prior = (net(PVt[bp]).squeeze(-1) - PSt[bp]).abs().mean()
 
-        # eikonal: 표면 근처 + 균등 랜덤
+        # eikonal: near-surface plus uniform random
         rp = torch.cat([Pt[torch.randint(0, len(Pt), (args.batch,), device=dev)]
                         + 0.02 * torch.randn(args.batch, 3, device=dev),
                         torch.rand(args.batch, 3, device=dev) * 2 - 1], 0).requires_grad_(True)
@@ -508,10 +516,11 @@ def train_sdf(P, N, O, EO, ED, args, CV=None, W=None, OBS=None, PV=None, PS=None
 
 
 def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
-    """[grid-fuse] MLP 없는 결정적 SDF 융합 — 모순을 '평균'이 아닌 '우선순위'로 해소:
-        관측 TSDF > 관측된 빈 공간(occlusion-aware carve, +trunc) > 생성 SDF(미관측만).
-    MLP 보간 병리(부풀림·스펀지)가 구조적으로 없음. 품질은 정합·생성 품질에만 의존.
-    occlusion-aware: 관측 표면 '뒤'(다리 영역 등)는 판단 보류 → 생성이 채움."""
+    """Deterministic SDF fusion, no MLP. Conflicts are resolved by PRIORITY, not averaging:
+        observed TSDF > observed free space (occlusion-aware carve, +trunc) > generated SDF.
+    This removes MLP interpolation pathologies (inflation, sponge) by construction; quality
+    then depends only on alignment and generation. Occlusion-aware: space BEHIND an observed
+    surface (leg regions) is left undecided so the prior can fill it."""
     from skimage.measure import marching_cubes
     from scipy import ndimage
     trunc = args.prior_trunc
@@ -519,18 +528,18 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
     G = args.grid if args.grid > 0 else int(round(2 * scale / args.voxel_size))
     G = int(min(G, args.max_grid))
     print(f"[grid-fuse] G={G} voxel≈{2*scale/(G-1):.4f}m trunc={trunc}m views={len(VB)}")
-    # [관측 신뢰도] 실루엣 근처 관측은 믿을 수 없다 — grazing angle 이라 depth 오차가 크고,
-    # 마스크 경계 픽셀은 뷰마다 흔들리며 전경/배경이 섞인다. 지금까지는 모든 뷰·픽셀에
-    # 가중치 1 로 적분해서, seen/unseen 경계에서 표면이 퍼지고 물체 밖으로 삐져나갔다.
-    #   w_pix = (마스크를 erode 한 내부) × (|cos(시선, 법선)| ≥ cos_min) × (|cos| or 1)
-    # 법선은 depth 맵에서 직접 계산한다. depth 불연속 픽셀은 법선이 시선과 직교해
-    # cos≈0 이 되므로 cos_min 만으로 자동 배제된다.
-    # ⚠ 기본 off — 이전에 unseen_open 기본값이 결과를 조용히 바꾼 전례가 있어,
-    #    켤 때는 반드시 명시적으로 플래그를 준다.
+    # [obs confidence] Observations near the silhouette are unreliable: grazing angles
+    # give large depth error, and mask-border pixels flicker between fg and bg. Integrating
+    # every pixel with weight 1 smeared the surface at the seen/unseen boundary.
+    #   w_pix = (eroded mask interior) x (|cos(view, normal)| >= cos_min) x (|cos| or 1)
+    # Normals come from the depth map; at a depth discontinuity the normal is orthogonal to
+    # the view, so cos ~ 0 and cos_min excludes those pixels on its own.
+    # Off by default -- an unseen_open default once changed results silently, so this must
+    # be requested explicitly.
     _obs_on = args.obs_erode > 0 or args.obs_cos_min > 0 or args.obs_cos_weight
 
     def _cos_map(b):
-        """depth 맵에서 |cos(시선, 표면법선)| 를 계산. 메모리 절약을 위해 저장하지 않는다."""
+        """|cos(view, surface normal)| from the depth map; not cached, to save memory."""
         d = b["depth"].astype(np.float32)
         H_, W_ = d.shape
         uu_, vv_ = np.meshgrid(np.arange(W_, dtype=np.float32),
@@ -543,9 +552,9 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
 
     if _obs_on:
         VBo = [b for b in VB if "depth" in b and "obsw" not in b]
-        # [배제율 가드] 침식은 화면에서 큰 객체엔 싸지만 얇은/작은 객체엔 치명적이다.
-        # (실측 obj6: 화면 3.4% 객체에 erode=2 → 배제 16%. 화면 0.5% 객체면 40%+)
-        # 대표 뷰로 배제율을 먼저 재고, 임계를 넘으면 erode 를 자동으로 낮춘다.
+        # [reject guard] Erosion is cheap on screen-large objects and fatal on thin ones
+        # (measured obj6: 3.4% of screen, erode=2 -> 16% rejected; at 0.5% it exceeds 40%).
+        # Measure the reject rate on a sample view first and back erode off if it is high.
         probe = VBo[:: max(1, len(VBo) // 20)][:20]
         er = int(args.obs_erode)
         while er >= 0:
@@ -558,12 +567,12 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
             rej = 1.0 - kp / max(tot, 1.0)
             if rej <= args.obs_max_reject or er == 0:
                 break
-            print(f"[관측신뢰도] 배제율 {rej*100:.0f}% > 임계 {args.obs_max_reject*100:.0f}% "
-                  f"→ erode {er}→{er-1} (얇은 구조 보호)")
+            print(f"[obs-conf] reject {rej*100:.0f}% > {args.obs_max_reject*100:.0f}% "
+                  f"-> erode {er}->{er-1} (protects thin structure)")
             er -= 1
         if rej > args.obs_max_reject:
-            print(f"[관측신뢰도] ⚠ erode=0 에서도 배제율 {rej*100:.0f}% — cos_min 이 이 객체엔 "
-                  f"과하다(대부분 grazing 관측). 관측 근거가 얕아지니 결과를 눈으로 확인할 것")
+            print(f"[obs-conf] WARN reject {rej*100:.0f}% even at erode=0 -- cos_min is too "
+                  f"strict here (mostly grazing views). Inspect the result visually.")
         for b in VBo:
             m = b["mask"] & (b["depth"] > 0)
             if er > 0:
@@ -572,14 +581,14 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
             ok = m & (c >= args.obs_cos_min)
             b["obsw"] = np.where(ok, c if args.obs_cos_weight else 1.0, 0.0).astype(np.float32)
         args.obs_erode_used = er
-        print(f"[관측신뢰도] erode={er}px(요청 {args.obs_erode}) cos_min={args.obs_cos_min} "
-              f"cos_weight={args.obs_cos_weight} → 배제 {rej*100:.0f}%")
+        print(f"[obs-conf] erode={er}px (asked {args.obs_erode}) cos_min={args.obs_cos_min} "
+              f"cos_weight={args.obs_cos_weight} -> rejected {rej*100:.0f}%")
 
     n_gt = sum(1 for b in VB if "dgt" in b)
-    print(f"[grid-fuse] GT depth 버퍼 {n_gt}/{len(VB)}뷰"
-          + ("" if n_gt else "  ⚠ GT depth 없음 — (구)실루엣 carve 사용, 다리 절단 위험"))
-    # [gt-check] GT depth ↔ 렌더 depth 정합 검증 — 값이 크면(수 cm↑) 스케일/프레임
-    # 매칭 오류이며 free 판정 전체가 무효. 0 에 가까워야 정상.
+    print(f"[grid-fuse] GT depth buffers {n_gt}/{len(VB)} views"
+          + ("" if n_gt else "  WARN no GT depth -- falling back to silhouette carve, legs at risk"))
+    # [gt-check] GT depth vs rendered depth. A large value (cm scale) means a scale or
+    # frame-matching error, which invalidates every free-space decision. Expect ~0.
     for b in VB[:5]:
         dg = b.get("dgt")
         if dg is not None:
@@ -587,14 +596,14 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
             if mm.sum() > 100:
                 d = (dg - b["depth"])[mm]
                 print(f"[gt-check] median(dgt-render)={np.median(d):+.4f}m  "
-                      f"|d|중앙값={np.median(np.abs(d)):.4f}m  (마스크 {int(mm.sum())}px)")
-    # [경계 번짐 가드] GT depth 불연속(실루엣 경계) 픽셀을 free 투표에서 뺀다.
-    # ⚠ 기본 off(=0). 원래는 '얇은 다리가 carve 된다'는 문제의 대증요법으로 넣었으나,
-    #   그 진범은 나중에 --unseen_open 0.015(78935복셀 삭제)로 밝혀졌다. 진범을 잡은
-    #   뒤 재측정하니 다리 보호 효과는 없고 carve 범위만 좁혀 free 위반을 늘렸다:
-    #     obj22  free 10.8% → 7.5% (끄면 -31%), unseen F@2 0.3670 → 0.3637(노이즈 폭)
-    #     obj6   free  4.9% → 4.7%,             unseen F@2 0.6586 → 0.6592(다리 무손실)
-    #   nearest 리사이즈 depth 를 쓰는 등 실제로 경계가 번지는 데이터라면 0.1 부터 시도.
+                      f"median |d|={np.median(np.abs(d)):.4f}m  (mask {int(mm.sum())}px)")
+    # [edge-bleed guard] Drop GT-depth discontinuity (silhouette) pixels from the free vote.
+    # Off (=0) by default. It was added to treat "thin legs get carved", but the real cause
+    # turned out to be --unseen_open 0.015 (78935 voxels deleted). Re-measured after fixing
+    # that, it protects nothing and only narrows the carve, raising free violations:
+    #   obj22  free 10.8% -> 7.5% when off (-31%), unseen F@2 0.3670 -> 0.3637 (noise)
+    #   obj6   free  4.9% -> 4.7%,                 unseen F@2 0.6586 -> 0.6592 (legs intact)
+    # Try 0.1 only on data where edges genuinely bleed, e.g. nearest-resized depth.
     if args.gt_edge_thr > 0:
         for b in VB:
             dg = b.get("dgt")
@@ -608,18 +617,18 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
             dg = b.get("dgt")
             if dg is not None and "dgt_ok" not in b:
                 b["dgt_ok"] = dg > 0.01
-    # ══ [GPU] 뷰 버퍼를 한 번만 GPU 로 올린다 ═══════════════════════════════
-    # 슬랩당 200뷰 × 2.1M 복셀 투영을 64슬랩 반복하면 270억 회다. numpy 로 28분,
-    # GPU 로 수십 초. 수식은 그대로이므로 결과가 같아야 한다(--fuse_device cpu 로 대조).
-    # 전체 그리드(512³ 기준 5GB)는 CPU 에 두고 슬랩만 주고받아 GPU 는 ~1.5GB 만 쓴다.
+    # [GPU] Upload the view buffers once. 200 views x 2.1M voxels x 64 slabs is 27e9
+    # projections: 28 min in numpy, tens of seconds on GPU. The formulas are unchanged, so
+    # results must match (--fuse_device cpu to compare). The full grid (5GB at 512^3) stays
+    # on CPU and only slabs are exchanged, so the GPU holds ~1.5GB.
     _dev = args.fuse_device
     if _dev == "auto":
         _dev = "cuda" if torch.cuda.is_available() else "cpu"
     _gpu = _dev.startswith("cuda")
-    # [정밀도] CPU 경로는 Xw 를 float64 로 투영한다. GPU 를 float32 로 두면 1e-7 차이가
-    # 나는데, 게이트(alpha<0.25 → Wo<2)와 keep_connected 가 임계 위 통계라 그 차이가
-    # 증폭된다(실측 obj6: 배열은 0.1%p 차이인데 gate 는 34.6% vs 38.8%).
-    # A100 은 FP64 가 FP32 대비 1/2 속도뿐이므로 float64 로 두면 정확도와 속도를 모두 얻는다.
+    # [precision] The CPU path projects Xw in float64. float32 on GPU differs by 1e-7, but
+    # the gate (alpha<0.25 -> Wo<2) and keep_connected are threshold statistics, which
+    # amplify it (measured obj6: arrays differ 0.1%p, the gate reads 34.6% vs 38.8%).
+    # FP64 is only 2x slower than FP32 on A100, so float64 costs little and keeps accuracy.
     _dt = torch.float64 if args.fuse_dtype == "float64" else torch.float32
     if _gpu:
         _t0g = time.time()
@@ -636,27 +645,27 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
                 b["_dgt_ok"] = torch.as_tensor(np.ascontiguousarray(b["dgt_ok"]),
                                                dtype=torch.bool, device=_dev)
         _mb = torch.cuda.memory_allocated(_dev) / 1024**2
-        print(f"[fuse-gpu] 뷰 버퍼 {len(VB)}장 → {_dev} {args.fuse_dtype} "
+        print(f"[fuse-gpu] {len(VB)} view buffers -> {_dev} {args.fuse_dtype} "
               f"({_mb:.0f}MB, {time.time()-_t0g:.1f}s)")
 
     lin = np.linspace(-1, 1, G, dtype=np.float32)
-    Fo = np.zeros((G, G, G), np.float32)      # 관측 TSDF 가중합
-    Wo = np.zeros((G, G, G), np.float32)      # 관측 가중치(뷰 수)
-    FRc = np.zeros((G, G, G), np.uint16)      # 관측된 빈 공간 '투표 수'(합의제)
-    VOb = np.zeros((G, G, G), np.uint16)      # 씬 표면 근방 'obj6' 투표
-    VOt = np.zeros((G, G, G), np.uint16)      # 씬 표면 근방 '타 객체' 투표
-    NFR = np.zeros((G, G, G), np.uint16)      # [visual hull] 시야에 든 뷰 수
-    NIN = np.zeros((G, G, G), np.uint16)      # [visual hull] 객체 마스크 안으로 투영된 뷰 수
-    SG = np.empty((G, G, G), np.float32)      # 생성 SDF (truncated)
+    Fo = np.zeros((G, G, G), np.float32)      # observed TSDF, weighted sum
+    Wo = np.zeros((G, G, G), np.float32)      # observation weight (view count)
+    FRc = np.zeros((G, G, G), np.uint16)      # votes for observed empty space (consensus)
+    VOb = np.zeros((G, G, G), np.uint16)      # votes: this object, near a scene surface
+    VOt = np.zeros((G, G, G), np.uint16)      # votes: another object, near a scene surface
+    NFR = np.zeros((G, G, G), np.uint16)      # [visual hull] views with this voxel in frustum
+    NIN = np.zeros((G, G, G), np.uint16)      # [visual hull] views projecting inside the mask
+    SG = np.empty((G, G, G), np.float32)      # generated SDF (truncated)
     for k0 in range(0, G, 8):
         k1 = min(k0 + 8, G)
         gx, gy, gz = np.meshgrid(lin, lin, lin[k0:k1], indexing="ij")
         Xw = np.stack([gx, gy, gz], -1).reshape(-1, 3).astype(np.float64) * scale + center
         SG[:, :, k0:k1] = np.clip(sd_fn(Xw), -trunc, trunc).reshape(G, G, k1 - k0)
         if _gpu:
-            # [GPU 경로] CPU 경로와 같은 수식·같은 순서. 누적을 float32 로 하므로
-            # 부동소수 결합 순서까지 동일하고, 결과는 비트 수준까지는 아니어도
-            # 1e-6 이내로 일치해야 한다(--fuse_device cpu 와 대조로 확인).
+            # [GPU] Same formulas in the same order as the CPU path; accumulation stays
+            # float32 so the association order matches too. Results agree to within 1e-6
+            # (verify against --fuse_device cpu).
             Xt = torch.as_tensor(Xw, dtype=_dt, device=_dev)
             N = Xt.shape[0]
             f_ = torch.zeros(N, dtype=_dt, device=_dev)
@@ -724,14 +733,14 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
             ui = np.clip(u, 0, b["W"] - 1).astype(int)
             vi = np.clip(v, 0, b["H"] - 1).astype(int)
             di = b["depth"][vi, ui]; mi = b["mask"][vi, ui]
-            # [visual hull] 마스크 원뿔의 교집합 — 가림 판정 불필요.
-            # 바닥/인접 객체 위 복셀은 대부분의 뷰에서 객체 마스크 밖으로 투영되어 배제되고,
-            # 객체 뒷면(미관측)은 마스크 안이라 보존된다.
+            # [visual hull] Intersection of mask cones; no occlusion test needed. Voxels on
+            # the floor or on a neighbouring object project outside the mask in most views
+            # and are dropped, while the object's unobserved back stays inside the mask.
             nfr += infr.astype(np.uint16)
             nin += (infr & mi).astype(np.uint16)
-            sdf = di - z                                   # 양수 = 관측 표면 앞(밖)
-            hit = infr & mi & (di > 0) & (sdf > -trunc)    # 표면 뒤 trunc 초과는 미적용(occlusion)
-            # [관측 신뢰도] 실루엣/grazing 픽셀은 가중치가 낮거나 0 — 경계 번짐의 주원인.
+            sdf = di - z                                   # positive = in front of the surface
+            hit = infr & mi & (di > 0) & (sdf > -trunc)    # beyond trunc behind the surface: skip (occlusion)
+            # [obs confidence] silhouette/grazing pixels get low or zero weight.
             if "obsw" in b:
                 wp = b["obsw"][vi, ui]
                 hit &= wp > 0
@@ -740,9 +749,10 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
                 f[hit] += np.clip(sdf[hit], -trunc, trunc); w[hit] += 1
             dg = b.get("dgt")
             if dg is not None:
-                # [GT-depth carve] 마스크 무관, 실제 씬 기하 기준:
-                #   z < d_gt - margin → 관측된 빈 공간 '투표'(합의제, 경계 픽셀 제외)
-                #   씬 표면 근방      → obj6/타 객체 소속 투표(마스크 노이즈에 강건)
+                # [GT-depth carve] Mask-independent, against real scene geometry:
+                #   z < d_gt - margin  -> vote "observed empty" (consensus, edges excluded)
+                #   near a scene surface -> vote this-object / other-object (robust to
+                #   mask noise)
                 dgt = dg[vi, ui]
                 vgt = infr & b["dgt_ok"][vi, ui]
                 fr += (vgt & (z < dgt - margin)).astype(np.uint16)
@@ -750,8 +760,8 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
                 vo += (near & mi).astype(np.uint16)
                 vt += (near & ~mi).astype(np.uint16)
             else:
-                # (구) 실루엣 carve — GT depth 없을 때만. 렌더 depth 는 다리가 없어
-                # occlusion 판단이 불완전하므로 다리 절단 위험 있음.
+                # Legacy silhouette carve, only without GT depth. The rendered depth has
+                # no legs, so its occlusion test is incomplete and legs can be cut.
                 fr += (infr & (~mi) & ((di <= 0) | (z < di - margin))).astype(np.uint16)
         sh = (G, G, k1 - k0)
         Fo[:, :, k0:k1] += f.reshape(sh); Wo[:, :, k0:k1] += w.reshape(sh)
@@ -760,30 +770,31 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
         NFR[:, :, k0:k1] += nfr.reshape(sh); NIN[:, :, k0:k1] += nin.reshape(sh)
         if (k0 // 8) % 8 == 0:
             print(f"  [grid-fuse] slab {k0}/{G}")
-    if _gpu:   # 슬랩 루프가 끝나면 뷰 버퍼를 즉시 반납 — 이후 단계는 CPU 배열만 쓴다
+    if _gpu:   # release the view buffers once the slab loop ends; the rest is CPU-only
         for b in VB:
             for k in ("_R", "_t", "_depth", "_mask", "_obsw", "_dgt", "_dgt_ok"):
                 b.pop(k, None)
         torch.cuda.empty_cache()
-        print(f"[fuse-gpu] 뷰 버퍼 반납 (잔여 {torch.cuda.memory_allocated(_dev)/1024**2:.0f}MB)")
+        print(f"[fuse-gpu] buffers freed ({torch.cuda.memory_allocated(_dev)/1024**2:.0f}MB left)")
 
     Fobs = Fo / np.maximum(Wo, 1e-6)
-    alpha = np.clip(Wo / args.grid_wcap, 0, 1)             # 관측 신뢰도(뷰 수 기반)
-    # [seam] 관측/생성 전이를 부드럽게 — alpha 를 흐리면 경계에 blend band 가 생겨
-    # '끊긴 듯한' 계단이 사라진다(F 를 나중에 흐리는 것과 달리 단차를 만들지 않음).
+    alpha = np.clip(Wo / args.grid_wcap, 0, 1)             # observation confidence, from view count
+    # [seam] Blur alpha, not F: this creates a blend band at the observed/generated
+    # boundary and removes the step, without introducing a discontinuity of its own.
     if getattr(args, "alpha_smooth", 0) > 0:
         alpha = ndimage.gaussian_filter(alpha, sigma=args.alpha_smooth)
-    FREE = FRc >= args.free_min_views                      # 합의제: N뷰 이상이 '빈 공간' 투표
-    OTH = VOt > VOb                                        # 타 객체 표면(과반 투표) → obj6 밖
+    FREE = FRc >= args.free_min_views                      # consensus: >= N views voted empty
+    OTH = VOt > VOb                                        # another object's surface (majority vote)
     step = 2.0 / (G - 1)
 
-    # [sign-fix] non-watertight 생성 mesh(multi-material glb 등)는 winding-number 부호가
-    # 깨져 내부가 음수가 아님 → 표면은 분류상 keep 인데 marching cubes 에 안 나오는 원인.
-    # |SG| 를 unsigned 로 보고, 표면 셸을 경계로 그리드 외곽 flood-fill = 밖, 나머지 = 안.
+    # [sign-fix] A non-watertight generated mesh (multi-material glb) has a broken
+    # winding-number sign, so its interior is not negative: the surface is kept by the
+    # classifier yet never appears in marching cubes. Treat |SG| as unsigned, then
+    # flood-fill from the grid border across the surface shell: reached = outside.
     def _fix_sign(SGv):
         vox = 2 * scale / (G - 1)
         UD = np.abs(SGv)
-        # (1) flood-fill 부호: 닫힌 부위의 내부 복원 (셸에 구멍 있으면 누수 가능)
+        # (1) flood-fill sign: recovers the interior of closed parts (leaks through holes)
         shell = UD <= 1.5 * vox
         openv = ~shell
         lab, _ = ndimage.label(openv)
@@ -793,17 +804,18 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
         outside = np.isin(lab, bl[bl > 0]) & openv
         inside = openv & ~outside
         flood = np.where(inside, -UD, UD)
-        # (2) '적응형' 오프셋 셸 UD-δ(x): 제로 두께 시트도 두께 2δ 볼륨이 되되,
-        #     δ 는 관측 표면 거리로 조절 — 관측 근처(테이블 테두리)는 δ_min 으로
-        #     부풀음·이중표면 방지, 깊은 미관측(다리)은 δ_max 로 도톰하게.
+        # (2) Adaptive offset shell UD - d(x): a zero-thickness sheet becomes a 2d volume,
+        #     with d driven by distance to the observed surface -- d_min near observations
+        #     (table rim) to avoid inflation and double surfaces, d_max deep in unobserved
+        #     space (legs) so they come out solid.
         dmin = max(1.5 * vox, args.shell_delta_min)
         dmax = max(dmin, args.shell_delta)
         Dobs = ndimage.distance_transform_edt(~(alpha > 0.25)).astype(np.float32) * vox
         dmap = np.clip(dmin + (dmax - dmin) * (Dobs / max(args.shell_ramp, 1e-6)),
                        dmin, dmax)
-        out = np.minimum(flood, UD - dmap).astype(np.float32)    # 볼륨 합집합
-        print(f"[sign-fix] flood 내부 {inside.mean()*100:.2f}%  최종 SG<0 {(out < 0).mean()*100:.2f}%  "
-              f"(수정 전 {(SGv < 0).mean()*100:.2f}%, δ {dmin*1000:.0f}→{dmax*1000:.0f}mm "
+        out = np.minimum(flood, UD - dmap).astype(np.float32)    # volume union
+        print(f"[sign-fix] flood inside {inside.mean()*100:.2f}%  final SG<0 {(out < 0).mean()*100:.2f}%  "
+              f"(before {(SGv < 0).mean()*100:.2f}%, d {dmin*1000:.0f}->{dmax*1000:.0f}mm "
               f"ramp {args.shell_ramp}m)")
         return out
 
@@ -811,9 +823,10 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
     if need_sign_fix:
         SG = _fix_sign(SG)
 
-    # [carve-align] 정합 보정: 생성이 관측된 free 공간을 피해 unknown(미관측 그림자,
-    # 실제 unseen 기하가 존재할 수 있는 유일한 영역) 속으로 들어가도록 9-DoF 재최적화.
-    # 앵커: 관측 지배 영역에 붙은 생성 표면(상판)은 관측 TSDF zero-set 에 유지.
+    # [carve-align] 9-DoF re-optimisation so the generated geometry avoids observed free
+    # space and settles into unknown space -- the only region where unseen geometry can
+    # actually exist. Anchor: generated surface touching observation-dominated voxels is
+    # held on the observed TSDF zero-set.
     if getattr(args, "carve_align", False) and debug_pts is not None:
         from scipy.optimize import minimize as _pmin
         from scipy.spatial.transform import Rotation as _Rot
@@ -835,12 +848,12 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
         def _loss(x):
             R_, t_, s_ = _unpack(x)
             q = ((pn - c0) * s_) @ R_.T + c0 + t_
-            L_free = _interp(freef, q).mean()                       # free 점유 벌점
+            L_free = _interp(freef, q).mean()                       # penalty for occupying free space
             if anch.any():
                 qa = q[anch]
                 ai = _interp(alpha, qa) > 0.25
                 fo = np.abs(_interp(Fobs, qa))
-                L_anch = float(np.where(ai, fo, trunc).mean()) / trunc   # 관측 이탈 벌점
+                L_anch = float(np.where(ai, fo, trunc).mean()) / trunc   # penalty for leaving the observed surface
             else:
                 L_anch = 0.0
             return L_free + args.carve_align_w * L_anch + 0.05 * float(np.abs(x).sum())
@@ -851,7 +864,7 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
         print(f"[carve-align] loss {l0:.4f}→{res.fun:.4f}  dt={np.round(res.x[3:6]*scale, 3)}m  "
               f"scale={np.round(s_, 3)}  rot={np.rad2deg(np.linalg.norm(res.x[:3])):.1f}°")
         sm = float(s_.mean())
-        for k0 in range(0, G, 8):                          # 보정 반영해 생성 SDF 재계산
+        for k0 in range(0, G, 8):                          # recompute the generated SDF with the correction
             k1 = min(k0 + 8, G)
             gx, gy, gz = np.meshgrid(lin, lin, lin[k0:k1], indexing="ij")
             Xn = np.stack([gx, gy, gz], -1).reshape(-1, 3).astype(np.float64)
@@ -859,83 +872,101 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
             SG[:, :, k0:k1] = np.clip(sd_fn(q * scale + center) * sm,
                                       -trunc, trunc).reshape(G, G, k1 - k0)
         if need_sign_fix:
-            SG = _fix_sign(SG)                             # 재계산된 SG 도 부호 복원
+            SG = _fix_sign(SG)                             # restore the sign of the recomputed SG
         debug_pts = (((pn_all - c0) * s_) @ R_.T + c0 + res.x[3:6]) * scale + center
 
-    # [visual hull] prior 를 객체 자신의 마스크 원뿔 교집합 안으로 제한.
-    # carve 는 '관측 표면보다 앞'만 지우므로, 생성 기하가 바닥이나 인접 객체 '속'으로
-    # 파고들면 살아남아 seen accuracy 가 폭발한다(배치 실측: obj20 2.1→107mm).
-    # hull 은 가림 판정 없이 이를 차단한다.
+    # [visual hull] Restrict the prior to the intersection of the object's own mask cones.
+    # The carve only deletes space IN FRONT of an observed surface, so generated geometry
+    # that burrows into the floor or a neighbour survives and seen accuracy explodes
+    # (measured obj20: 2.1 -> 107mm). The hull blocks that without an occlusion test.
     HULL = np.ones((G, G, G), bool)
     if args.hull_min_frac > 0:
         HULL = (NIN >= args.hull_min_frac * np.maximum(NFR, 1)) & (NFR >= args.hull_min_views)
-        print(f"[hull] 마스크 원뿔 통과 {HULL.mean()*100:.1f}%  "
-              f"(frac≥{args.hull_min_frac}, 최소 {args.hull_min_views}뷰)  "
-              f"→ 생성 표면 중 hull 밖 {(np.abs(SG) < 2*2*scale/(G-1))[~HULL].mean()*100 if (~HULL).any() else 0:.1f}% 제거")
+        print(f"[hull] inside the mask cones {HULL.mean()*100:.1f}%  "
+              f"(frac>={args.hull_min_frac}, min {args.hull_min_views} views)  "
+              f"-> removed {(np.abs(SG) < 2*2*scale/(G-1))[~HULL].mean()*100 if (~HULL).any() else 0:.1f}% of the generated surface")
 
-    # [적용 게이트] 미관측이 거의 없는 객체에는 prior 가 얻을 게 없고 잃기만 한다
-    # (배치 실측: baseline unseen completion 15mm 대 객체들에서 unseen F@2cm 이 0.68→0.21 로 붕괴).
-    # 판정은 GT 없이 — '생성 **표면** 중 unknown 에 놓인 비율'.
-    # ※ 내부 부피로 재면 안 된다: 물체 내부는 어떤 경우에도 미관측이라 완전 관측 객체도
-    #   높게 나온다(구 검증: 완전 관측 67% vs 절반 미관측 91% — 변별력 없음).
+    # [apply gate] An object with almost no unobserved region has nothing to gain from the
+    # prior and everything to lose (measured: objects with baseline unseen completion ~15mm
+    # collapsed from unseen F@2cm 0.68 to 0.21). Decide without GT, from the fraction of the
+    # generated SURFACE that sits in unknown space.
+    # Do NOT measure interior volume: an object's interior is unobserved in every case, so
+    # even a fully observed object scores high (67% fully observed vs 91% half unobserved --
+    # no discriminative power).
     vox_g = 2 * scale / (G - 1)
     prior_surf = np.abs(SG) < 1.5 * vox_g
     unknown = (alpha < 0.25) & ~FREE & ~OTH
     ufrac = float((prior_surf & unknown).sum()) / max(int(prior_surf.sum()), 1)
-    print(f"[gate] 생성 표면 중 unknown 비율 {ufrac*100:.1f}% "
-          f"(임계 {args.min_unknown_frac*100:.0f}%)")
+    print(f"[gate] generated surface in unknown space {ufrac*100:.1f}% "
+          f"(threshold {args.min_unknown_frac*100:.0f}%)")
     prior_applied = True
-    if ufrac < args.min_unknown_frac:
-        print("  → 미관측이 충분치 않음: prior 미적용(관측만으로 재구성)")
+
+    # [obs gate] The gate above asks whether the GENERATED surface sits in unknown space.
+    # It does not ask whether there is enough observation to constrain the prior at all.
+    # With almost nothing observed the prior invents the object: measured obj31 at 1.0%
+    # observed voxels went 2.16 -> 69.88mm seen accuracy and obj28 at 2.1% went 3.84 ->
+    # 77.55mm, while obj22 at 7.7% improved 0.971 -> 0.992 seen F@1. The distribution has
+    # a clean gap at 4.6-7.7%. Both failures pass min_unknown_frac (46.4% / 67.3% vs a 10%
+    # threshold), so this is a second, independent condition.
+    obs_frac = float((Wo > 0).mean())
+    if obs_frac < args.min_obs_frac:
+        print(f"[gate] observed voxels {obs_frac*100:.1f}% < {args.min_obs_frac*100:.0f}% "
+              f"-> prior skipped (observation cannot constrain it)")
+        SG = np.full_like(SG, trunc)
+        prior_applied = False
+    elif ufrac < args.min_unknown_frac:
+        print("  -> not enough unobserved space: prior skipped, observation only")
         SG = np.full_like(SG, trunc)
         prior_applied = False
 
-    # [필수] prior 가 없으면 alpha 블렌드를 하지 않는다.
-    #   F = alpha·Fobs + (1-alpha)·base 에서 base=trunc(빈 공간)이면
-    #   영교차가 Fobs = -(1-alpha)/alpha·trunc 로 이동한다 — 표면이 '안쪽으로' 밀린다.
-    #   alpha=0.5 면 이동량이 trunc 전체(50mm)다. 얇은 물체는 통째로 사라진다.
-    #   실측: obj16(액자) seen F@1 0.914→0.647, obj35 0.984→0.868. 둘 다 ufrac 이
-    #   낮아 prior 가 차단된 객체였고, 손실의 원인은 prior 가 아니라 이 블렌드였다.
-    #   섞을 대상이 없으면 관측을 그대로 쓰는 것이 맞다.
-    # [passthrough] prior 가 적용되지 않으면 관측 재구성을 그대로 반환한다.
-    #   우리 방법의 주장은 '미관측 영역을 완성한다'이다. 완성할 것이 없으면 no-op 이
-    #   정직한 결과이고, 불필요한 재융합은 손해만 남긴다. 실측(게이트 차단 4객체):
+    # Without a prior there must be no alpha blend. In F = alpha*Fobs + (1-alpha)*base
+    # with base = trunc (empty), the zero crossing moves to Fobs = -(1-alpha)/alpha*trunc,
+    # i.e. the surface is pushed inward; at alpha=0.5 the shift is a full trunc (50mm) and
+    # thin objects vanish entirely. Measured: obj16 (picture frame) seen F@1 0.914 -> 0.647,
+    # obj35 0.984 -> 0.868. Both had the prior blocked by a low ufrac, so the loss came from
+    # this blend, not from the prior. With nothing to blend, use the observation as is.
+    # [passthrough] If the prior is not applied, return the observed reconstruction as is.
+    #   The claim of this method is that it completes UNOBSERVED regions. With nothing to
+    #   complete, a no-op is the honest result and re-fusing only costs quality.
+    #   Measured on the 4 gate-blocked objects:
     #     obj16 seen F@1 0.914→0.647   obj35 0.984→0.980
     #     obj10 free 5.36%→27.12%      obj8  free 7.55%→22.33%
-    #   네 객체 모두 prior 기여가 0 이었다. 즉 아무것도 더하지 않으면서 지표만 깎았다.
-    #   (재융합의 유일한 이득인 carve 는 obj16 에서 free 2.3%→1.9% 로 미미했다)
+    #   The prior contributed nothing in all four, so re-fusion only lowered the metrics.
+    #   (Its one benefit, the carve, moved obj16 free from 2.3% to 1.9% -- negligible.)
     if not prior_applied and args.passthrough_mesh:
         _pm = os.path.expanduser(args.passthrough_mesh)
         if os.path.isfile(_pm):
             _m = o3d.io.read_triangle_mesh(_pm)
             if len(_m.vertices):
-                print(f"[passthrough] prior 미적용 → 관측 재구성을 그대로 반환 "
-                      f"({os.path.basename(_pm)}, 정점 {len(_m.vertices)})")
+                print(f"[passthrough] prior skipped -> returning the observed mesh "
+                      f"({os.path.basename(_pm)}, {len(_m.vertices)} verts)")
                 return np.asarray(_m.vertices), np.asarray(_m.triangles)
-        print(f"[passthrough] ⚠ 파일 없음: {_pm} — 융합을 계속한다")
+        print(f"[passthrough] WARN missing file: {_pm} -- continuing with fusion")
 
-    #   ⚠ carve(FREE)·타객체(OTH) 복셀은 제외한다. 거기서 alpha=1 로 만들면 F=Fobs 가
-    #     되어 carve 가 통째로 무시된다. 실측(그렇게 했을 때): obj8 sanity 침범
-    #     27.9%→50.9%, obj10 free 21.9%→27.6%, 침범분의 84%가 '관측지배'였다.
-    #     객체 렌더 depth 는 "여기 표면이 있다", GT 씬 depth 는 "여기는 비었다"고
-    #     말하는 모순 상황인데, 다시점 합의인 후자가 더 믿을 만하다.
+    #   Exclude carve (FREE) and other-object (OTH) voxels. Setting alpha=1 there makes
+    #   F = Fobs and the carve is ignored outright. Measured when that was done: obj8 sanity
+    #   violation 27.9% -> 50.9%, obj10 free 21.9% -> 27.6%, and 84% of the violation was
+    #   observation-dominated. The object's rendered depth says "there is a surface here"
+    #   while the GT scene depth says "this is empty"; the latter is a multi-view consensus
+    #   and is the more trustworthy of the two.
     if not prior_applied and not args.no_alpha_full_wo_prior:
         lift = (Wo > 0) & ~FREE & ~OTH
         n_lift = int((lift & (alpha < 1.0)).sum())
         alpha = np.where(lift, np.float32(1.0), alpha)
-        print(f"  → prior 없음: 관측 복셀 alpha=1 로 고정 ({n_lift}복셀, "
-              f"carve/타객체 제외). 섞을 대상이 없는데 빈 공간 쪽으로 끌어당기면 "
-              f"표면이 침식된다")
+        print(f"  -> no prior: alpha=1 on observed voxels ({n_lift} voxels, "
+              f"carve/other-object excluded). Pulling toward empty space with "
+              f"nothing to blend erodes the surface.")
 
-    # 빈공간/타객체/hull 밖 = +trunc, 미관측 ∩ hull = 생성
+    # free / other-object / outside hull = +trunc;  unobserved and inside hull = generated
     base = np.where(FREE | OTH | ~HULL, trunc, SG)
-    F = alpha * Fobs + (1 - alpha) * base                  # 우선순위 블렌드
+    F = alpha * Fobs + (1 - alpha) * base                  # priority blend
 
-    # [opening] 미관측 영역의 '뾰족한 돌출' 제거. 소파 뒷면처럼 어떤 카메라도 관통해
-    # 보지 못한 곳은 carve 제약이 없어 생성 스파이크가 그대로 남는다. erosion→dilation
-    # 은 구조요소보다 얇은 돌기만 지우고 굵은 몸통·다리는 보존한다(관측 영역은 미적용).
-    # 반경은 '미터'로 지정 — 셸 팽창(2δ) 때문에 실제 돌기 두께 T 는 T+2δ 로 부푼다.
-    # opening 반경 r 은 (T/2 + δ) 보다 커야 지워지므로 δ 를 자동 반영한다.
+    # [opening] Remove spikes in unobserved regions. Behind a sofa no camera sees through,
+    # so there is no carve constraint and generated spikes survive. Erosion then dilation
+    # deletes only protrusions thinner than the structuring element and keeps the body and
+    # legs (observed regions are untouched). The radius is in metres: the shell offset (2d)
+    # inflates a spike of true thickness T to T + 2d, and removal needs r > T/2 + d, so d is
+    # folded in automatically.
     if getattr(args, "unseen_open", 0) > 0:
         vox = 2 * scale / (G - 1)
         k = max(1, int(round(args.unseen_open / vox)))
@@ -945,40 +976,42 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
             ndimage.binary_erosion(neg, st, iterations=k), st, iterations=k)
         rm = neg & ~op & (alpha < 0.5)
         F = np.where(rm, trunc, F)
-        print(f"[opening] 미관측 뾰족 구조 제거 {int(rm.sum())}복셀 "
-              f"(r={args.unseen_open*1000:.0f}mm → k={k}복셀, "
-              f"두께 {2*args.unseen_open*1000:.0f}mm 이하 돌기)")
+        print(f"[opening] removed {int(rm.sum())} spike voxels "
+              f"(r={args.unseen_open*1000:.0f}mm -> k={k} voxels, "
+              f"protrusions up to {2*args.unseen_open*1000:.0f}mm thick)")
 
     if args.grid_smooth > 0:
         F = ndimage.gaussian_filter(F, sigma=args.grid_smooth)
 
-    # [free-hard] 스무딩 뒤 carve 제약을 다시 건다.
-    #   base = np.where(FREE|OTH|~HULL, trunc, SG) 로 하드 제약을 걸어놓고도
-    #   그 다음 줄에서 가우시안을 돌리면, prior 몸통(-trunc)과 carve 된 빈 공간
-    #   (+trunc)이 맞닿은 경계에서 영교차가 빈 공간 쪽으로 밀린다.
-    #   실측(obj22): free 위반의 71% 가 prior, 20% 가 관측, carve 관대함은 3.7% 뿐이었다.
-    #   → 표면 품질용 스무딩이 기하 제약을 덮어쓰고 있었다는 뜻.
-    #   관측이 지배하는 곳(alpha 큰 곳)은 건드리지 않는다 — 거기선 관측이 우선이다.
+    # [free-hard] Re-apply the carve constraint after smoothing. base = where(FREE|OTH|
+    #   ~HULL, trunc, SG) is a hard constraint, but the gaussian blur on the next line
+    #   pushes the zero crossing into empty space wherever the prior body (-trunc) meets
+    #   carved free space (+trunc). Measured (obj22): 71% of free violations came from the
+    #   prior, 20% from observation and only 3.7% from a lenient carve -- i.e. smoothing for
+    #   surface quality was overwriting a geometric constraint. Voxels where observation
+    #   dominates (high alpha) are left alone; there observation wins.
     if args.free_hard:
-        # FREE 와 OTH 는 근거의 강도가 다르다.
-        #   FREE = "카메라가 그 지점을 뚫고 더 먼 것을 봤다" (GT depth, 강함)
-        #   OTH  = "더 많은 뷰가 남의 객체라고 투표" (마스크 투표, 노이즈에 취약)
-        # 실측: 둘 다 강제했더니 obj2 의 seen F@1 이 +0.042 → -0.062 로 뒤집혔다
-        # (인접 객체 경계에서 OTH 투표가 흔들려 진짜 표면을 지운 것으로 보인다).
-        # 기본은 FREE 만. OTH 까지 강제하려면 --free_hard_oth.
+        # FREE and OTH are not equally strong evidence.
+        #   FREE = a camera saw THROUGH this point to something farther (GT depth, strong)
+        #   OTH  = more views voted "another object" (mask vote, noisy)
+        # Measured: forcing both flipped obj2's seen F@1 from +0.042 to -0.062, apparently
+        # because the OTH vote wavers at a neighbour boundary and deletes real surface.
+        # FREE only by default; use --free_hard_oth to include OTH.
         hard = (FREE | OTH if args.free_hard_oth else FREE) & (alpha < args.free_hard_alpha)
         nneg = int((hard & (F < 0)).sum())
         nobs = int((hard & (F < 0) & (alpha > 0.5)).sum())
         F = np.where(hard, np.maximum(F, trunc), F)
-        print(f"[free-hard] 스무딩 후 carve 재적용: 빈 공간·타객체 복셀의 음수 "
-              f"{nneg}복셀 제거 (그중 관측지배 {nobs}) [alpha<{args.free_hard_alpha}]")
+        print(f"[free-hard] carve re-applied after smoothing: cleared "
+              f"{nneg} negative free/other voxels ({nobs} observation-dominated) "
+              f"[alpha<{args.free_hard_alpha}]")
         if nneg == 0:
-            print("  ⚠ 제거된 복셀이 0 — free_hard_alpha 가 너무 낮아 발동하지 않았을 수 "
-                  "있습니다(위반은 주로 alpha>0.5 인 관측지배 복셀에서 나옵니다)")
+            print("  WARN nothing was cleared -- free_hard_alpha may be too low to fire; "
+                  "violations sit mostly in observation-dominated voxels with alpha>0.5.")
 
-    # [keep-connected] 최종 음수 볼륨 중 '이 객체의 관측 복셀과 연결된' 성분만 유지.
-    # 통짜 생성(여러 객체 포함) prior 가 타 객체의 가려진 공간(unknown)에 남기는
-    # 잔해를 구조적으로 차단 — 다리는 상판/하판을 통해 관측부와 연결되므로 보존.
+    # [keep-connected] Keep only the negative components connected to this object's
+    # observed voxels. A prior generated as one blob over several objects leaves debris in
+    # a neighbour's occluded (unknown) space; this removes it structurally. Legs survive
+    # because they connect to the observed part through the top or bottom plate.
     if getattr(args, "keep_connected", False):
         neg = F < 0
         lab, ncomp = ndimage.label(neg)
@@ -987,18 +1020,20 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
         keepm = np.isin(lab, seeds)
         removed = int(neg.sum() - keepm.sum())
         F = np.where(neg & ~keepm, trunc, F)
-        print(f"[keep-connected] 음수성분 {ncomp}개 → 관측 연결 {len(seeds)}개 유지, "
-              f"{removed}복셀({removed/max(neg.sum(),1)*100:.1f}%) 제거")
+        print(f"[keep-connected] {ncomp} negative components -> kept {len(seeds)} touching "
+              f"observation, removed {removed} voxels "
+              f"({removed/max(neg.sum(),1)*100:.1f}%)")
 
-    # [probe] 지정 박스(world 좌표) 안의 복셀 분류 통계 — "다리가 왜 없는가"를 국소 계측.
-    # 사용: --probe_box "x0,y0,z0,x1,y1,z1" (사라진 다리 주변, 뷰어에서 좌표 읽기)
+    # [probe] Voxel-class statistics inside a world-coordinate box, to answer "why is this
+    # leg missing" locally. Usage: --probe_box "x0,y0,z0,x1,y1,z1" (read the coords off a
+    # viewer, around the missing part).
     if getattr(args, "probe_box", ""):
         try:
             v = [float(x) for x in args.probe_box.split(",")]
             assert len(v) == 6
         except (ValueError, AssertionError):
-            print(f"[probe] ⚠ 잘못된 형식: '{args.probe_box}' — 숫자 6개 필요 "
-                  f'(예: --probe_box "1.2,-0.5,0.0,1.5,-0.2,0.6"). probe 생략.')
+            print(f"[probe] bad format: '{args.probe_box}' -- needs 6 numbers "
+                  f'(e.g. --probe_box "1.2,-0.5,0.0,1.5,-0.2,0.6"). Skipping probe.')
             v = None
     else:
         v = None
@@ -1009,31 +1044,33 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
         i1, j1, k1p = np.clip(np.ceil(np.maximum(lo_n, hi_n)), 0, G - 1).astype(int)
         sub = np.s_[i0:i1 + 1, j0:j1 + 1, k0p:k1p + 1]
         nvox = FREE[sub].size
-        print(f"[probe] {v} ({nvox}복셀): FREE {FREE[sub].mean()*100:.0f}%  "
+        print(f"[probe] {v} ({nvox} voxels): FREE {FREE[sub].mean()*100:.0f}%  "
               f"FRc>0 {(FRc[sub] > 0).mean()*100:.0f}%  obs {(alpha[sub] > 0.5).mean()*100:.0f}%  "
               f"OTH {OTH[sub].mean()*100:.0f}%  SG<0 {(SG[sub] < 0).mean()*100:.0f}%  "
-              f"최종 F<0 {(F[sub] < 0).mean()*100:.0f}%")
-    print(f"[grid-fuse] 관측복셀 {(Wo > 0).mean()*100:.1f}%  "
-          f"free {(FREE & (Wo == 0)).mean()*100:.1f}% (합의 {args.free_min_views}뷰, "
-          f"1뷰라도 {((FRc > 0) & (Wo == 0)).mean()*100:.1f}%)  타객체 {OTH.mean()*100:.2f}%  "
-          f"생성 내부(미관측) {((SG < 0) & (Wo == 0) & ~FREE & ~OTH).mean()*100:.2f}%")
+              f"final F<0 {(F[sub] < 0).mean()*100:.0f}%")
+    print(f"[grid-fuse] observed {(Wo > 0).mean()*100:.1f}%  "
+          f"free {(FREE & (Wo == 0)).mean()*100:.1f}% ({args.free_min_views}-view consensus, "
+          f"any-view {((FRc > 0) & (Wo == 0)).mean()*100:.1f}%)  "
+          f"other-obj {OTH.mean()*100:.2f}%  "
+          f"generated-interior {((SG < 0) & (Wo == 0) & ~FREE & ~OTH).mean()*100:.2f}%")
     step = 2.0 / (G - 1)
     verts, faces, _, _ = marching_cubes(F, level=0.0, spacing=(step,) * 3)
     verts = (verts - 1.0) * scale + center
 
-    # [열린 경계] prior 가 없으면 미관측 영역을 닫지 않는다.
-    #   관측 영역은 F=Fobs(음수 가능), 미관측은 F=+trunc 로 강제되므로 그 경계에서
-    #   영교차가 생겨 '가짜 벽'이 세워진다. 물체 뒤 trunc 지점에 실제로는 없는 면이
-    #   만들어지고, 앞면만 관측되는 얇은 물체(액자 등)에서는 그것이 메쉬의 대부분이 된다.
-    #   실측 obj16: 출력의 seen 비율이 30%(베이스라인 87%), seen F@1 0.914→0.642.
-    #   obj8: sanity 침범분의 84%가 '관측지배' = 이 경계면.
-    #   표준 TSDF 는 가중치 0 복셀을 미정의로 두고 메싱하지 않는다. 우리도 채울 근거가
-    #   있을 때(=prior 적용)만 닫는다. carve/타객체 경계는 '비어 있음을 안다'는 근거가
-    #   있으므로 유지한다.
+    # [open boundary] Without a prior, do not close the unobserved region.
+    #   Observed voxels hold F = Fobs (can be negative) while unobserved ones are forced to
+    #   F = +trunc, so a zero crossing appears at their boundary and builds a fake wall: a
+    #   face at trunc behind the object that does not exist. On a thin object seen only from
+    #   the front (a picture frame) that wall becomes most of the mesh.
+    #   Measured obj16: the output was 30% seen (baseline 87%), seen F@1 0.914 -> 0.642.
+    #   obj8: 84% of the sanity violation was observation-dominated -- this same surface.
+    #   Standard TSDF leaves weight-0 voxels undefined and does not mesh them. Close the
+    #   region only when there is evidence to fill it (= the prior applied). Carve and
+    #   other-object boundaries are kept: there we DO know the space is empty.
     if not prior_applied and len(faces):
-        # ⚠ 팽창이 필요하다. 가짜 벽의 정점은 관측 복셀과 미관측 복셀 '사이'에 놓이므로
-        #   반올림하면 관측 쪽으로 들어가 검출되지 않는다(합성 검증: 팽창 없이 0% 검출,
-        #   팽창 시 50% = 앞면/뒤벽 두 장 중 한 장).
+        # Dilation is required: a fake-wall vertex lies BETWEEN an observed and an
+        # unobserved voxel, so rounding puts it on the observed side and it is missed.
+        # Synthetic check: 0% detected without dilation, 50% with (one of the two sheets).
         unk = ndimage.binary_dilation((Wo == 0) & ~FREE & ~OTH)
         vg = np.clip(np.round(((verts - center) / scale + 1.0) / step), 0, G - 1).astype(int)
         bad_v = unk[vg[:, 0], vg[:, 1], vg[:, 2]]
@@ -1043,94 +1080,99 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
         used = np.unique(faces)
         remap = np.full(len(verts), -1, np.int64); remap[used] = np.arange(len(used))
         verts, faces = verts[used], remap[faces]
-        print(f"[열린경계] prior 없음 → 미관측 경계의 가짜 면 {n_drop}개 제거 "
-              f"(면 {n_drop + len(faces)} → {len(faces)}). 메쉬가 열린 상태가 된다")
+        print(f"[open-boundary] no prior -> dropped {n_drop} fake faces at the unobserved "
+              f"boundary ({n_drop + len(faces)} -> {len(faces)}). The mesh is left open.")
 
-    # ══ [sanity] 출력이 관측과 모순되는지 ══════════════════════════════════
-    # 배치 실측: obj0 는 seen accuracy 3.85mm → 1165mm(1.2m!) 로 멀쩡한 재구성이
-    # 통째로 망가졌다. 품질 저하가 아니라 형상이 엉뚱한 곳에 놓인 것이므로 GT 없이
-    # 잡을 수 있다. 조용히 쓰레기를 내보내느니 실패하는 편이 낫다.
+    # [sanity] Does the output contradict the observation?
+    # Measured in a batch: obj0 went from 3.85mm to 1165mm (1.2m!) seen accuracy -- a sound
+    # reconstruction destroyed. That is not a quality drop but a shape placed in the wrong
+    # location, which is detectable without GT. Failing is better than shipping garbage.
     #
-    # ⚠ 판정에 'FREE 복셀에 정점이 있다'를 쓰면 안 된다 — marching cubes 정점은
-    #   복셀 '사이'에 놓이므로 물체와 빈 공간의 '정상적인 경계면' 정점이 반올림으로
-    #   FREE 쪽에 들어간다. 합성 검증: 완벽한 구를 carve 안에 두어도 50% 가 나온다.
-    #   실제로 이 기준 때문에 obj28 이 오탐으로 죽었다(반올림 25.8% vs 깊이 5.7%,
-    #   게다가 게이트가 prior 를 막아 prior 기여는 0% 였다).
-    #   → 반드시 '빈 공간 안으로 margin 이상 들어간' 정점만 센다.
+    # Do NOT test "a vertex lies in a FREE voxel": marching-cubes vertices sit BETWEEN
+    #   voxels, so vertices on the legitimate object/empty boundary round into FREE. A
+    #   synthetic check scores 50% for a perfect sphere inside a carve. This criterion
+    #   actually killed a healthy obj28 as a false positive (25.8% by rounding vs 5.7% by
+    #   depth, and the gate had blocked the prior so its contribution was 0%).
+    #   Count only vertices that penetrate the free space by more than a margin.
     if not args.no_sanity:
         vi_ = np.clip(((verts - center) / scale + 1.0) / step, 0, G - 1).astype(int)
         sx, sy, sz = vi_[:, 0], vi_[:, 1], vi_[:, 2]
         k = max(1, int(np.ceil(args.sanity_free_depth / vox_g)))
-        FREE_deep = ndimage.binary_erosion(FREE, iterations=k)   # 경계에서 k복셀 안쪽
+        FREE_deep = ndimage.binary_erosion(FREE, iterations=k)   # k voxels inside the boundary
         vdeep = FREE_deep[sx, sy, sz]
         s_free = float(vdeep.mean())
         obsv = Wo[sx, sy, sz] > 0
         s_disp = float(np.median(np.abs(Fobs[sx, sy, sz][obsv]))) if obsv.any() else 0.0
         nd = max(int(vdeep.sum()), 1)
-        va = alpha[sx, sy, sz] > 0.5          # 관측이 지배하는 복셀
-        vgen = (SG[sx, sy, sz] < 0) & ~va     # prior 가 만든 표면
+        va = alpha[sx, sy, sz] > 0.5          # observation-dominated voxels
+        vgen = (SG[sx, sy, sz] < 0) & ~va     # surface created by the prior
         vfr = FRc[sx, sy, sz]
-        print(f"[sanity] 출력 표면 {len(verts)}점 중 빈 공간 안쪽 "
-              f"{args.sanity_free_depth*1000:.0f}mm(={k}복셀) 이상 침범 {s_free*100:.1f}% "
-              f"(임계 {args.sanity_free_max*100:.0f}%) / 관측영역 표면 이탈 중앙값 "
-              f"{s_disp*1000:.1f}mm (임계 {args.sanity_disp_max*1000:.0f}mm, "
-              f"관측 표면 위 정점 {int(obsv.sum())}개)")
-        print(f"[free-분해] 침범분의 구성: 관측지배 {float((vdeep & va).sum())/nd*100:.0f}% / "
+        print(f"[sanity] of {len(verts)} output vertices, {s_free*100:.1f}% penetrate free "
+              f"space by more than {args.sanity_free_depth*1000:.0f}mm (={k} voxels) "
+              f"(threshold {args.sanity_free_max*100:.0f}%) / median displacement from the "
+              f"observed surface {s_disp*1000:.1f}mm "
+              f"(threshold {args.sanity_disp_max*1000:.0f}mm, "
+              f"{int(obsv.sum())} vertices on observed surface)")
+        print(f"[free-split] violation is {float((vdeep & va).sum())/nd*100:.0f}% "
+              f"observation-dominated / "
               f"prior {float((vdeep & vgen).sum())/nd*100:.0f}%  |  "
-              f"1뷰 이상이 '비었다'고 했지만 FREE 아님 "
+              f"voted empty by >=1 view but not FREE: "
               f"{float(((vfr > 0) & ~FREE[sx, sy, sz]).sum())/max(len(verts),1)*100:.1f}% "
-              f"← 크면 우리 carve 가 평가보다 관대하다"
-              f"(평가 min_views=1, 우리 {args.free_min_views}뷰 합의)")
+              f"-- if large, our carve is more lenient than the evaluator "
+              f"(eval min_views=1, ours {args.free_min_views}-view consensus)")
         bad = []
         if s_free > args.sanity_free_max:
-            bad.append(f"표면의 {s_free*100:.0f}% 가 관측된 빈 공간을 "
-                       f"{args.sanity_free_depth*1000:.0f}mm 이상 침범")
+            bad.append(f"{s_free*100:.0f}% of the surface penetrates observed free space "
+                       f"by more than {args.sanity_free_depth*1000:.0f}mm")
         if s_disp > args.sanity_disp_max:
-            bad.append(f"관측 표면에서 {s_disp*1000:.0f}mm 이탈")
+            bad.append(f"{s_disp*1000:.0f}mm displaced from the observed surface")
         if bad:
             print("\n" + "!" * 70)
-            print("[sanity] 융합 결과가 관측과 모순됩니다 — 중단합니다.")
+            print("[sanity] the fused result contradicts the observation -- aborting.")
             for b_ in bad:
                 print(f"  · {b_}")
             if prior_applied:
-                print("  확인 순서: ① npz 의 center/scale/R_align 이 이 객체 것인지")
-                print("            ② pkl 의 T_model_world 와 bounds "
-                      "(dump_shaper_points.py 로 world bbox 확인)")
-                print("            ③ SAM3 인스턴스가 GT 객체 여럿에 걸쳐 있지 않은지")
+                print("  check, in order: 1) npz center/scale/R_align belong to this object")
+                print("                   2) pkl T_model_world and bounds "
+                      "(dump_shaper_points.py prints the world bbox)")
+                print("                   3) the SAM3 instance does not span several "
+                      "GT objects")
             else:
-                print("  ※ 게이트가 prior 를 막았으므로 이 출력에 생성 기하는 없습니다.")
-                print("    원인은 prior 가 아니라 관측 쪽입니다 — 마스크 오류, 포즈,")
-                print("    또는 GT depth 정합을 확인하세요.")
-            print("  이 검사를 끄려면 --no_sanity")
+                print("  NOTE the gate blocked the prior, so this output contains no "
+                      "generated geometry.")
+                print("    The cause is on the observation side: check the mask, the poses, "
+                      "or GT-depth alignment.")
+            print("  disable this check with --no_sanity")
             print("!" * 70, flush=True)
             sys.exit(2)
 
-    # [debug] 생성 표면 샘플의 분류 시각화 — 다리가 왜 잘리는지 눈으로 판별:
-    # 초록=unknown(생성 유지), 파랑=관측 지배, 노랑=타객체, 빨강=free-carve
+    # [debug] Colour the generated surface samples by class, to see why a leg was cut:
+    # green = unknown (kept), blue = observation-dominated, yellow = other object,
+    # red = free-carve
     if getattr(args, "debug_class_ply", ""):
-        # --prior_field 경로에는 메쉬가 없으므로 필드의 영교차 복셀에서 직접 점을 만든다
+        # the --prior_field path has no mesh, so sample points at the field's zero crossing
         if debug_pts is None:
-            # 필드의 zero-level 을 marching cubes 로 직접 뽑는다.
-            # (|SG|<임계 방식은 필드 스케일에 민감해, 값이 작은 필드에서 그리드 전체가
-            #  선택되어 통짜 큐브가 나오는 문제가 있었다)
+            # Extract the zero level with marching cubes. A |SG| < threshold test is
+            # sensitive to field scale and selected the whole grid on small-valued fields,
+            # producing a solid cube.
             if SG.min() < 0 < SG.max():
                 dv, _, _, _ = marching_cubes(SG, level=0.0, spacing=(step,) * 3)
                 debug_pts = (dv - 1.0) * scale + center
                 if len(debug_pts) > 300000:
                     debug_pts = debug_pts[np.random.choice(len(debug_pts), 300000,
                                                            replace=False)]
-                print(f"[debug] prior zero-level 에서 점군 {len(debug_pts)}개 "
-                      f"(SG 범위 [{SG.min():.4f}, {SG.max():.4f}])")
+                print(f"[debug] {len(debug_pts)} points on the prior zero-level "
+                      f"(SG range [{SG.min():.4f}, {SG.max():.4f}])")
             else:
-                print(f"  ⚠ [debug] prior 필드에 영교차가 없음 "
-                      f"(SG 범위 [{SG.min():.4f}, {SG.max():.4f}]) — "
-                      f"필드 생성 실패 또는 게이트로 비활성화됨. 점군 생략")
+                print(f"  [debug] the prior field has no zero crossing "
+                      f"(SG range [{SG.min():.4f}, {SG.max():.4f}]) -- generation failed "
+                      f"or the gate disabled it. Skipping the point cloud.")
                 debug_pts = np.zeros((0, 3))
     if getattr(args, "debug_class_ply", "") and len(debug_pts):
         idx = np.clip(np.round(((debug_pts - center) / scale + 1) / step), 0, G - 1).astype(int)
         i, j, k = idx[:, 0], idx[:, 1], idx[:, 2]
         cls = np.zeros(len(debug_pts), int)
-        cls[~HULL[i, j, k]] = 4                      # hull 밖(마스크 원뿔 위반)
+        cls[~HULL[i, j, k]] = 4                      # outside the hull (mask-cone violation)
         cls[FREE[i, j, k]] = 3
         cls[OTH[i, j, k] & ~FREE[i, j, k]] = 2
         cls[alpha[i, j, k] > 0.5] = 1
@@ -1142,10 +1184,10 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
         dp = os.path.expanduser(args.debug_class_ply)
         os.makedirs(os.path.dirname(dp) or ".", exist_ok=True)
         o3d.io.write_point_cloud(dp, pc)
-        print(f"[debug] 분류 점군: {dp}  keep {(cls == 0).mean()*100:.0f}%  "
+        print(f"[debug] class cloud: {dp}  keep {(cls == 0).mean()*100:.0f}%  "
               f"obs {(cls == 1).mean()*100:.0f}%  oth {(cls == 2).mean()*100:.0f}%  "
-              f"free {(cls == 3).mean()*100:.0f}%  hull밖 {(cls == 4).mean()*100:.0f}%  "
-              f"(초록=유지, 파랑=관측, 노랑=타객체, 빨강=carve, 보라=hull밖)")
+              f"free {(cls == 3).mean()*100:.0f}%  out-of-hull {(cls == 4).mean()*100:.0f}%  "
+              f"(green=keep, blue=observed, yellow=other, red=carve, purple=out-of-hull)")
     return verts, faces
 
 
@@ -1154,365 +1196,419 @@ def main():
     model = ModelParams(parser, sentinel=True)
     pipeline = PipelineParams(parser)
     parser.add_argument("--iteration", default=-1, type=int)
-    # render.py TSDF 옵션 매핑
-    parser.add_argument("--depth_trunc", default=6.0, type=float, help="최대 depth (back-project cutoff)")
-    parser.add_argument("--voxel_size", default=0.005, type=float, help="marching cubes 복셀 크기(그리드 산출)")
-    parser.add_argument("--sdf_trunc", default=0.04, type=float, help="(참고, SDF 경로 미사용)")
-    parser.add_argument("--num_cluster", default=10000, type=int, help="post-process 유지 클러스터 수(클램프됨)")
-    # SDF 관련
-    parser.add_argument("--alpha_thr", default=0.5, type=float, help="이하 alpha 픽셀 제거(배경/floater)")
+    # mapping of the render.py TSDF options
+    parser.add_argument("--depth_trunc", default=6.0, type=float, help="max depth (back-projection cutoff)")
+    parser.add_argument("--voxel_size", default=0.005, type=float, help="marching-cubes voxel size (sets the grid)")
+    parser.add_argument("--sdf_trunc", default=0.04, type=float, help="reference only; unused on the SDF path")
+    parser.add_argument("--num_cluster", default=10000, type=int, help="clusters to keep in post-processing (clamped)")
+    # SDF options
+    parser.add_argument("--alpha_thr", default=0.5, type=float, help="drop pixels with alpha below this (background / floaters)")
     parser.add_argument("--pts_per_view", default=40000, type=int)
-    parser.add_argument("--n_pts", default=1500000, type=int, help="학습용 표면점 상한(subsample)")
+    parser.add_argument("--n_pts", default=1500000, type=int, help="cap on surface points used for fitting (subsampled)")
     parser.add_argument("--pts_seed", default=0, type=int,
-                        help="점군 서브샘플링 시드. 이게 없으면 같은 명령도 매번 다른 "
-                             "center/scale 을 만들어 결과가 흔들린다(실측: gate 34.6%↔38.4%). "
-                             "설정 비교는 반드시 같은 시드로")
+                        help="seed for point-cloud subsampling. Without it the same command "
+                             "produces a different center/scale each run and results drift "
+                             "(measured: gate 34.6%% vs 38.4%%). Always compare settings at "
+                             "the same seed.")
     parser.add_argument("--sdf_iters", default=10000, type=int)
     parser.add_argument("--batch", default=16384, type=int)
     parser.add_argument("--lr", default=1e-4, type=float)
-    parser.add_argument("--pe_L", default=0, type=int, help="positional encoding 레벨(0=off, 권장)")
+    parser.add_argument("--pe_L", default=0, type=int, help="positional-encoding level (0 = off, recommended)")
     parser.add_argument("--w_normal", default=1.0, type=float)
     parser.add_argument("--w_sign", default=1.0, type=float)
     parser.add_argument("--w_eik", default=0.5, type=float)
     parser.add_argument("--w_free", default=1.0, type=float,
-                        help="표면 근처 free-space carving 가중치(0=off)")
+                        help="weight for near-surface free-space carving (0 = off)")
     parser.add_argument("--free_range", default=0.5, type=float,
-                        help="관측점에서 카메라 쪽으로 carve하는 최대 거리(정규화 좌표)")
+                        help="max carve distance from an observed point toward its camera "
+                             "(normalised coords)")
     parser.add_argument("--w_empty", default=1.0, type=float,
-                        help="empty-ray carving 가중치(0=off). alpha≈0 광선의 bbox 통과 구간 SDF≥0 — 진짜 구멍 보존/부풀림 제거")
+                        help="weight for empty-ray carving (0 = off). Forces SDF >= 0 along "
+                             "the bbox chord of alpha~0 rays: keeps real holes, removes "
+                             "inflation")
     parser.add_argument("--empty_per_view", default=4096, type=int)
     parser.add_argument("--empty_alpha", default=0.1, type=float,
-                        help="이 alpha 미만 픽셀을 빈 광선으로 간주. junk가 alpha를 깔면 0.3~0.5로 완화")
+                        help="treat pixels below this alpha as empty rays. Relax to 0.3-0.5 "
+                             "when junk gaussians raise alpha everywhere")
     parser.add_argument("--tile", default=0, type=int,
-                        help="타일 marching 블록 크기(예: 128). 0=단일 볼륨. whole-scene 고해상도에 필수")
+                        help="tiled marching block size (e.g. 128). 0 = one volume. Required "
+                             "for high-resolution whole-scene runs")
     parser.add_argument("--extra_points", default="", type=str,
-                        help="생성 뷰 점군 ply(법선 포함) — unseen 표면 증거 주입 (make_gen_points.py)")
+                        help="generated-view point cloud ply with normals; injects unseen "
+                             "surface evidence (make_gen_points.py)")
     parser.add_argument("--prior_repeat", default=1.0, type=float,
-                        help="<1 이면 prior 점을 그 비율로 서브샘플(신뢰도 하향)")
+                        help="< 1 subsamples the prior points by this ratio (lower trust)")
     parser.add_argument("--prior_weight", default=1.0, type=float,
-                        help="extra_points(prior) 표면 손실 가중치(<1: seen 이 지배하는 soft prior)")
+                        help="surface-loss weight for extra_points (prior). < 1 makes it a "
+                             "soft prior dominated by observation")
     parser.add_argument("--prior_field", default="", type=str,
-                        help="[권장] ShapeR 부호 SDF 그리드 npz(shaper_field.py 출력). "
-                             "메쉬를 거치지 않아 sign-fix/shell_delta/정합이 모두 불필요")
+                        help="recommended: ShapeR signed-SDF grid npz (shaper_field.py). "
+                             "It skips the mesh, so sign-fix, shell_delta and alignment are "
+                             "all unnecessary")
     parser.add_argument("--prior_field_rescale", default=1, type=int,
-                        help="prior 필드의 포화값을 --prior_trunc 에 맞춰 정규화(1=on). "
-                             "carve 경계 급점프로 생기는 가짜 표면 방지. 영교차는 불변")
+                        help="rescale the prior field's saturation value to --prior_trunc "
+                             "(1 = on). Prevents fake surfaces from a step at the carve "
+                             "boundary; the zero crossing is unchanged")
     parser.add_argument("--prior_sigma_w", default=0.0, type=float,
-                        help="앙상블 σ 가중 강도(0=off). 클수록 시드가 갈리는 곳의 생성을 "
-                             "적극 억제 — precision↑ recall↓")
+                        help="ensemble sigma weighting (0 = off). Larger values suppress "
+                             "generation where seeds disagree: precision up, recall down")
     parser.add_argument("--prior_sigma_ref", default=0.0, type=float,
-                        help="σ 기준값(m). 0=영교차 근방 σ 중앙값으로 자동")
+                        help="sigma reference (m). 0 = median sigma near the zero crossing")
     parser.add_argument("--prior_mesh", default="", type=str,
-                        help="[Step2] 정합된 watertight 생성 메쉬(fuse_generated_mesh --save_aligned "
-                             "출력 *_gen_aligned.ply). 표면점+볼륨 SDF distillation — extra_points 상위호환")
+                        help="aligned watertight generated mesh (*_gen_aligned.ply from "
+                             "fuse_generated_mesh --save_aligned). Surface + volume SDF "
+                             "distillation; supersedes extra_points")
     parser.add_argument("--w_prior_sdf", default=0.5, type=float,
-                        help="볼륨 SDF distillation 손실 가중치(0=off)")
+                        help="loss weight for volume SDF distillation (0 = off)")
     parser.add_argument("--prior_surf_n", default=150000, type=int,
-                        help="prior mesh 표면 샘플 수")
+                        help="surface samples on the prior mesh")
     parser.add_argument("--prior_band", default=0.08, type=float,
-                        help="볼륨 셸 샘플 half-width (world m). 다리 최소 두께의 2~3배 권장")
+                        help="half-width of the volume shell samples (world m). Use 2-3x the "
+                             "thinnest leg")
     parser.add_argument("--prior_trunc", default=0.05, type=float,
                         help="target SDF truncation (world m)")
     parser.add_argument("--prior_unseen_dist", default=0.03, type=float,
-                        help="[Step1] 관측점에서 이 거리(m) 이내의 prior 샘플 제거 — 관측이 항상 승리")
+                        help="drop prior samples within this distance (m) of an observed "
+                             "point: observation always wins")
     parser.add_argument("--prior_gate", default=0.02, type=float,
-                        help="[Step4] carve/empty 샘플이 prior mesh 표면 s<=gate(m) 이내면 제외")
+                        help="drop carve/empty samples within this distance (m) of the prior "
+                             "mesh surface")
     parser.add_argument("--prior_uniform_n", default=200000, type=int,
-                        help="uniform far-field 볼륨 샘플 수 — 셸 밖 unseen 공간 부풀림 차단")
+                        help="uniform far-field volume samples; stops inflation in unseen "
+                             "space outside the shell")
     parser.add_argument("--prior_carve_views", default=150, type=int,
-                        help="prior 할루시네이션 carve 에 쓸 균등 간격 뷰 수(0=off)")
+                        help="evenly spaced views buffered for carving prior hallucinations "
+                             "(0 = off). grid_fuse also builds the observed TSDF from them")
     parser.add_argument("--prior_carve_margin", default=0.015, type=float,
-                        help="carve depth 여유(m) — 관측 표면보다 이만큼 앞이면 freespace 위반")
+                        help="carve depth margin (m): this far in front of an observed "
+                             "surface counts as a free-space violation")
     parser.add_argument("--grid_fuse", action="store_true",
-                        help="MLP 대신 결정적 grid TSDF 융합(관측>carve>생성 우선순위). "
-                             "--prior_mesh 필수, --prior_carve_views 120+ 권장. 부풀림·스펀지 원천 차단")
+                        help="deterministic grid TSDF fusion instead of the MLP, with "
+                             "priority observation > carve > generated. Requires "
+                             "--prior_mesh; use --prior_carve_views 120+. Removes inflation "
+                             "and sponge artefacts by construction")
     parser.add_argument("--passthrough_mesh", default="", type=str,
-                        help="게이트가 prior 를 차단했을 때 이 메쉬를 그대로 출력한다"
-                             "(보통 관측 재구성 fuse_post.ply). 완성할 미관측 영역이 "
-                             "없는 객체에서 재융합은 손해만 남긴다 — 실측 obj16 seen F@1 "
-                             "0.914→0.647, obj10 free 5.4%→27.1%. 빈 문자열이면 재융합")
+                        help="mesh returned verbatim when a gate blocks the prior, normally "
+                             "the observed reconstruction fuse_post.ply. Re-fusing an object "
+                             "with nothing to complete only costs quality: measured obj16 "
+                             "seen F@1 0.914 -> 0.647, obj10 free 5.4%% -> 27.1%%. Empty "
+                             "string re-fuses")
     parser.add_argument("--no_alpha_full_wo_prior", action="store_true",
-                        help="prior 가 차단된 객체에서도 alpha 블렌드를 유지(구버전 동작). "
-                             "블렌드 대상이 trunc 뿐이라 표면이 최대 trunc 만큼 안쪽으로 "
-                             "침식된다. A/B 용으로만 사용")
+                        help="keep the alpha blend even when the prior is blocked (legacy). "
+                             "The only blend partner is trunc, so the surface erodes inward "
+                             "by up to trunc. A/B use only")
     parser.add_argument("--fuse_dtype", default="float64", type=str,
                         choices=["float32", "float64"],
-                        help="GPU 융합 정밀도. CPU 경로가 float64 이므로 대조하려면 float64. "
-                             "float32 는 1e-7 차이가 나는데 게이트(alpha<0.25)와 "
-                             "keep_connected 가 임계 위 통계라 증폭된다(실측 gate 34.6% vs "
-                             "38.8%). A100 은 FP64 가 FP32 의 1/2 속도뿐이라 기본 float64")
+                        help="GPU fusion precision. The CPU path is float64, so use float64 "
+                             "to compare. float32 differs by 1e-7, which the gate "
+                             "(alpha<0.25) and keep_connected amplify because both are "
+                             "threshold statistics (measured gate 34.6%% vs 38.8%%). FP64 is "
+                             "only 2x slower than FP32 on A100, hence the default")
     parser.add_argument("--fuse_device", default="auto", type=str,
-                        help="grid 융합 실행 장치: auto|cuda|cpu. GPU 경로는 CPU 와 같은 "
-                             "수식이며 50~100배 빠르다(실측 28분 → 수십 초). 전체 그리드는 "
-                             "CPU 에 두고 슬랩만 올려 GPU 는 ~1.5GB 만 쓴다. "
-                             "결과 대조가 필요하면 cpu 로 강제")
+                        help="device for grid fusion: auto|cuda|cpu. The GPU path uses the "
+                             "same formulas and is 50-100x faster (28 min -> tens of "
+                             "seconds). The full grid stays on CPU and only slabs are "
+                             "uploaded, so the GPU holds ~1.5GB. Force cpu to cross-check")
     parser.add_argument("--grid_wcap", default=8.0, type=float,
-                        help="관측 신뢰도 포화 뷰 수 — 이 이상 관측된 복셀은 관측 TSDF 100%. "
-                             "낮추면 관측 권한이 커지고, 올리면 '몇 뷰만 관측된 경계 밴드'가 "
-                             "prior 로 넘어간다")
-    # [wcap 근거] 5객체(6/1/22/2/16) 스윕에서 5 → 8 이 seen acc -0.49mm,
-    #   free 위반 -0.97%p 로 크게 이겼다(노이즈의 22배/11배). 3객체(6/22/2)로
-    #   8/16/32 를 더 보니 8 에서 평탄해진다:
+                        help="view count at which observation confidence saturates: above it "
+                             "a voxel is 100%% observed TSDF. Lower gives observation more "
+                             "authority; higher hands the thin boundary band seen by only a "
+                             "few views over to the prior")
+    # [wcap evidence] Over 5 objects (6/1/22/2/16), 5 -> 8 won clearly: seen acc -0.49mm and
+    #   free violation -0.97%p (22x and 11x the noise floor). Extending to 8/16/32 on 3
+    #   objects (6/22/2) shows it flattens at 8:
     #                      8      16      32
-    #     seen acc      4.250   4.190   4.128   ← 배가당 0.06mm, 미미
-    #     uns comp      23.35   25.10   25.96   ← 나빠짐
-    #     free 위반      10.40   10.66   10.73   ← 나빠짐
-    #   뷰가 200장이라 잘 관측된 복셀의 Wo 는 수십~수백이고, wcap 을 올리면 얇은
-    #   경계 밴드만 prior 로 넘어간다. 관측가중은 그 밴드를 '삭제'해서 손해였고
-    #   (seen F@1 0.959→0.923), wcap 은 '위임'해서 이득이다.
-    #   ⚠ obj6 단독으로는 5~8 이 평탄역으로 보였다 — 단일 객체 튜닝의 전형적 함정.
-    # ── 관측 신뢰도 가중 (기본 off) ─────────────────────────────────────────
-    # obj6 의 경계 번짐을 고치려고 넣었고 그 객체에서는 효과가 있었으나(free 위반
-    # 4.93→1.65%), 5객체(6/1/22/2/16) 스윕에서 순손실로 확인돼 기본값을 껐다.
+    #     seen acc      4.250   4.190   4.128   <- 0.06mm per doubling, negligible
+    #     uns comp      23.35   25.10   25.96   <- worse
+    #     free viol     10.40   10.66   10.73   <- worse
+    #   With 200 views a well-observed voxel has Wo in the tens to hundreds, so raising wcap
+    #   only hands the thin boundary band to the prior. Observation weighting DELETED that
+    #   band and lost (seen F@1 0.959 -> 0.923); wcap DELEGATES it and wins.
+    #   obj6 alone made 5-8 look like a plateau -- the classic single-object tuning trap.
+    # -- observation-confidence weighting (off by default) --------------------
+    # Added to fix edge bleed on obj6, where it worked (free violation 4.93 -> 1.65%), but a
+    # 5-object sweep (6/1/22/2/16) showed a net loss, so the default is off.
     #
-    #   prior ON, 5객체 중앙값        baseline   full  noerode   none(=off)
+    #   prior ON, median over 5 objects   baseline   full  noerode   none(=off)
     #     seen F@1cm                    0.924   0.923    0.933   0.959
     #     unseen F@2cm                  0.214   0.344    0.351   0.371
     #     unseen completion(mm)         125.5   23.29    23.44   23.18
-    #     free 위반(%)                    3.81    4.42     4.49    5.80
+    #     free violation (%)                  3.81    4.42     4.49    5.80
     #
-    # prior 를 꺼도(= 버린 관측을 메울 것이 없어도) 같은 결론이었다:
+    # The same held with the prior off (nothing to fill the discarded observations):
     #     seen F@1cm  full 0.857 / nocos 0.866 / noerode 0.895 / none 0.960
-    #   성분 기여는 침식 +0.038, cos 게이트 +0.009, 전부 해제 +0.103 으로 합보다
-    #   커서, |cos| 가중 자체가 가장 크다(Wo 가 절반이 되어 alpha 가 낮아진다).
+    #   Per-component: erosion +0.038, cos gate +0.009, all off +0.103 -- more than the
+    #   sum, so |cos| weighting itself dominates (it halves Wo and thus lowers alpha).
     #
-    # 유일하게 켜서 이득인 축은 free 위반이다. 그것만 필요하면 --obs_erode 0
-    # --obs_cos_min 0.2 (noerode) 가 절충점: seen acc 4.381mm 로 가장 좋고
-    # free 위반 4.49% 로 none 의 5.80% 보다 낮다.
+    # The one axis it improves is free violation. If that is all you need, --obs_erode 0
+    # --obs_cos_min 0.2 (noerode) is the compromise: best seen acc at 4.381mm and free
+    # violation 4.49% against 5.80% for none.
     parser.add_argument("--obs_erode", default=0, type=int,
-                        help="[seen] TSDF 적분에서 객체 마스크를 N픽셀 침식 — 뷰마다 흔들리는 "
-                             "마스크 경계 픽셀(전경/배경 혼합)을 배제. 2~3 권장")
+                        help="erode the object mask by N pixels for TSDF integration, "
+                             "excluding border pixels that flicker between fg and bg. 2-3")
     parser.add_argument("--obs_cos_min", default=0.0, type=float,
-                        help="[seen] |cos(시선,법선)| 이 이 값 미만인 grazing 픽셀을 TSDF 에서 "
-                             "배제. depth 불연속 픽셀도 cos≈0 이라 함께 걸러진다. 0.15~0.3 권장")
+                        help="exclude grazing pixels with |cos(view, normal)| below this. "
+                             "Depth-discontinuity pixels have cos ~ 0 and are caught too. "
+                             "0.15-0.3")
     parser.add_argument("--obs_cos_weight", dest="obs_cos_weight", action="store_true",
                         default=False,
-                        help="[seen] |cos| 로 가중 — 정면 관측이 실루엣 관측을 이긴다. "
-                             "⚠ 기본 off: 5객체 스윕에서 seen F@1cm 을 가장 크게 깎은 성분")
+                        help="weight by |cos| so head-on views beat grazing ones. Off by "
+                             "default: it cost the most seen F@1cm in the 5-object sweep")
     parser.add_argument("--no_obs_cos_weight", dest="obs_cos_weight", action="store_false",
-                        help="cos 가중 해제(기본값)")
-    # ── free-space 하드 제약 재적용 ────────────────────────────────────────
-    # ⚠ 기본 off — 검증 전. A/B 로 free 위반과 seen/unseen 을 함께 볼 것.
+                        help="disable cos weighting (default)")
+    # -- re-apply the hard free-space constraint ------------------------------
     parser.add_argument("--free_hard", dest="free_hard", action="store_true",
                         default=True,
-                        help="carve(FREE) 제약을 블렌드 뒤에 다시 적용 (기본 on). "
-                             "블렌드에서 base 는 (1-alpha) 몫뿐이라 관측이 강한 곳에서는 "
-                             "carve 가 무시된다. 4객체 실측: free 위반 +2.23%p → +0.33%p, "
-                             "obj10 은 21.1%→5.8% 이면서 unseen F@2 0.593→0.679 로 동시 개선")
+                        help="re-apply the carve (FREE) constraint after the blend (on by "
+                             "default). In the blend base only gets a (1-alpha) share, so "
+                             "the carve is ignored wherever observation is strong. Measured "
+                             "on 4 objects: free violation +2.23%%p -> +0.33%%p, and obj10 "
+                             "went 21.1%% -> 5.8%% while unseen F@2 rose 0.593 -> 0.679")
     parser.add_argument("--no_free_hard", dest="free_hard", action="store_false",
-                        help="carve 재적용 해제 — 관측이 항상 이긴다(구버전 동작)")
+                        help="do not re-apply the carve; observation always wins (legacy)")
     parser.add_argument("--free_hard_oth", action="store_true",
-                        help="free_hard 를 타객체(OTH) 복셀에도 적용. OTH 는 마스크 투표라 "
-                             "인접 객체 경계에서 흔들려 진짜 표면을 지울 수 있다"
-                             "(실측 obj2: seen F@1 +0.042 → -0.062). 기본은 FREE 만")
+                        help="apply free_hard to other-object (OTH) voxels too. OTH is a mask "
+                             "vote, so it wavers at a neighbour boundary and can delete real "
+                             "surface (measured obj2: seen F@1 +0.042 -> -0.062). FREE only "
+                             "by default")
     parser.add_argument("--free_hard_alpha", default=0.95, type=float,
-                        help="alpha 가 이 값 미만인 복셀에만 carve 를 재적용. "
-                             "0.95 = 완전 포화(Wo ≥ grid_wcap)한 복셀만 제외 = 기본")
-    # [free_hard_alpha 근거] 4객체 스윕. 관측가중이 꺼져 있으면 Wo 는 정수 뷰 수이고
-    #   alpha=Wo/wcap 이므로 임계는 '몇 뷰까지 carve 를 강제할 것인가'와 같다.
-    #     임계   대상        seen acc  seen F@1  uns F@2  free%
-    #     0.50   Wo ≤ 3뷰      3.836    0.947    0.527   6.350
-    #     0.80   Wo ≤ 6뷰      3.855    0.947    0.529   5.915
-    #     0.95   Wo ≤ 7뷰      3.908    0.947    0.530   5.275   ← 채택
-    #     1.01   Wo ≤ 8뷰(전부) 4.655    0.923    0.532   4.505   ← 절벽
-    #   0.5~0.95 는 seen 손상 0 인 채 free 만 단조 감소한다. 1.01 에서만 무너지는데
-    #   전부 obj2 한 객체다(0.924→0.864). 즉 8뷰 이상이 '표면 있음'이라 말하면
-    #   그 관측이 옳다. alpha 는 {0, 1/8, ..., 1} 이산값이라 0.95~0.99 는 동일하다.
+                        help="re-apply the carve only where alpha is below this. 0.95 = skip "
+                             "only fully saturated voxels (Wo >= grid_wcap), the default")
+    # [free_hard_alpha evidence] 4-object sweep. With observation weighting off, Wo is an
+    #   integer view count and alpha = Wo/wcap, so the threshold means "up to how many views
+    #   may the carve override".
+    #     thr    applies to       seen acc  seen F@1  uns F@2  free%
+    #     0.50   Wo <= 3 views      3.836    0.947    0.527   6.350
+    #     0.80   Wo <= 6 views      3.855    0.947    0.529   5.915
+    #     0.95   Wo <= 7 views      3.908    0.947    0.530   5.275   <- chosen
+    #     1.01   Wo <= 8 (all)      4.655    0.923    0.532   4.505   <- cliff
+    #   From 0.5 to 0.95 free falls monotonically at zero cost to seen. Only 1.01 collapses,
+    #   and entirely on one object (obj2, 0.924 -> 0.864): when 8+ views say "surface here",
+    #   they are right. alpha is discrete in {0, 1/8, ..., 1}, so 0.95 and 0.99 are the same.
     #
-    #   규칙: carve 가 관측을 이긴다. 단 관측이 완전 포화(Wo ≥ wcap)한 곳은 예외.
-    #   ⚠ grid_wcap 을 바꾸면 이 임계의 의미도 바뀐다(둘은 묶여 있다).
-    # ── prior 오배치 sanity 검사 (배치 안전장치) ────────────────────────────
+    #   Rule: the carve beats observation, except where observation is fully saturated
+    #   (Wo >= wcap). Changing grid_wcap changes what this threshold means -- they are tied.
+    # -- sanity checks for a misplaced prior (batch safety net) ----------------
     parser.add_argument("--sanity_free_max", default=0.25, type=float,
-                        help="출력 표면 중 빈 공간을 sanity_free_depth 이상 '침범한' 비율 상한. "
-                             "넘으면 중단. 실측(깊이 기준): obj22 0.2%, obj28 5.7% — 정상은 "
-                             "한 자릿수다. 반올림 기준(구버전)으로 재면 정상도 25%가 넘어 "
-                             "obj28 이 오탐으로 죽었다")
+                        help="max fraction of the output surface allowed to penetrate free "
+                             "space by more than sanity_free_depth; abort above it. Measured "
+                             "by depth: obj22 0.2%%, obj28 5.7%% -- healthy is single digits. "
+                             "The old rounding test read over 25%% even when healthy and "
+                             "killed obj28 as a false positive")
     parser.add_argument("--sanity_disp_max", default=0.05, type=float,
-                        help="관측 영역에서 출력 표면이 관측 TSDF 표면으로부터 이탈한 "
-                             "거리(m) 중앙값 상한. 실측: 정상 4~8mm, obj20 116mm")
+                        help="max median displacement (m) of the output surface from the "
+                             "observed TSDF surface, inside observed regions. Measured: "
+                             "healthy 4-8mm, obj20 116mm")
     parser.add_argument("--sanity_free_depth", default=0.015, type=float,
-                        help="free 위반 귀속에서 '빈 공간 안으로 이만큼 들어간' 표면만 센다(m). "
-                             "eval_seen_unseen.py 의 --margin 과 같은 값이어야 비교가 성립")
+                        help="only count surface penetrating free space by at least this (m). "
+                             "Must match --margin in eval_seen_unseen.py to be comparable")
     parser.add_argument("--no_sanity", action="store_true",
-                        help="sanity 검사 해제 — 오배치된 prior 가 그대로 출력된다")
+                        help="disable the sanity checks; a misplaced prior is then shipped as is")
     parser.add_argument("--obs_max_reject", default=0.35, type=float,
-                        help="[seen] 관측 픽셀 배제율 상한. 넘으면 --obs_erode 를 자동으로 "
-                             "1씩 낮춘다(작고 얇은 객체 보호). 배치 안전장치")
+                        help="max fraction of observed pixels that may be rejected; above it "
+                             "--obs_erode drops by 1 (protects small, thin objects)")
     parser.add_argument("--grid_smooth", default=0.7, type=float,
-                        help="융합 grid 가우시안 스무딩 sigma(voxel). 0=off")
+                        help="gaussian smoothing sigma (voxels) on the fused grid. 0 = off")
     parser.add_argument("--gt_depth_dir", default="", type=str,
-                        help="GT depth 폴더(nice-slam results 등). 지정 시 carve 를 마스크가 아닌 "
-                             "'실제 씬 depth' 기준으로 수행 — 다리 절단·경계 거침 해결")
+                        help="GT depth folder (e.g. nice-slam results). With it the carve runs "
+                             "against real scene depth instead of the mask, which stops legs "
+                             "being cut and edges being ragged")
     parser.add_argument("--gt_depth_scale", default=6553.5, type=float,
-                        help="GT depth PNG 스케일(픽셀값/스케일=미터). Replica nice-slam=6553.5")
-    parser.add_argument("--prior_carve_ds", default=2, type=int,
-                        help="뷰 버퍼 다운스케일(작을수록 경계 정밀, 메모리↑)")
+                        help="GT depth PNG scale (pixel value / scale = metres). Replica nice-slam = 6553.5")
+    parser.add_argument("--prior_carve_ds", default=1, type=int,
+                        help="view-buffer downscale. Keep at 1: grid_fuse builds the "
+                             "OBSERVED TSDF from these buffers, not just the prior carve. "
+                             "At ds=2 the fused surface sits ~8.8mm from the observed mesh "
+                             "everywhere (only 8%% matches within 2mm) and seen F@1 falls "
+                             "0.824 -> 0.680; at ds=1 it is 5.6mm and -0.015. No other knob "
+                             "moves this: prior on/off, free_hard, grid_wcap, depth_ratio, "
+                             "prior_trunc and voxel_size all measured flat, including voxel "
+                             "and trunc set to render.py's own values. View COUNT does not "
+                             "matter (150 vs 554 views: identical); resolution does.")
     parser.add_argument("--free_min_views", default=2, type=int,
-                        help="free 판정 최소 합의 뷰 수 — 1이면 OR(공격적), 3+ 권장. "
-                             "얇은 구조가 depth 경계 노이즈로 갉히는 것 방지")
+                        help="views that must agree before a voxel counts as free. 1 is an OR "
+                             "(aggressive); 3+ keeps depth-edge noise from eating thin parts")
     parser.add_argument("--gt_edge_thr", default=0.0, type=float,
-                        help="GT depth 불연속 경계 임계(m/px) — 초과 픽셀은 free 투표 무효. "
-                             "0=off(기본). 켜면 carve 범위가 좁아져 free 위반이 늘어난다"
-                             "(obj22 7.5%→10.8%). nearest 리사이즈 depth 등 실제로 경계가 "
-                             "번지는 데이터에서만 0.1 부터 시도할 것")
+                        help="GT-depth discontinuity threshold (m/px); pixels above it cast no "
+                             "free vote. 0 = off. Enabling it narrows the carve and raises "
+                             "free violations (obj22 7.5%% -> 10.8%%). Try 0.1 only on data "
+                             "where edges genuinely bleed, e.g. nearest-resized depth")
     parser.add_argument("--debug_class_ply", default="", type=str,
-                        help="생성 표면 샘플 분류 점군 저장 경로 — 잘림 원인 시각 진단용")
+                        help="path to save the class-coloured surface cloud, for diagnosing why parts are cut")
     parser.add_argument("--carve_align", action="store_true",
-                        help="[정합 보정] 생성이 free 공간을 피해 unknown 영역으로 들어가도록 "
-                             "9-DoF 재최적화(관측 앵커 유지) — 생성-실측 형상 차이 흡수")
+                        help="9-DoF re-optimisation so the generated shape avoids free space "
+                             "and settles into unknown space, keeping observed anchors. "
+                             "Absorbs shape mismatch between generation and observation")
     parser.add_argument("--carve_align_w", default=1.0, type=float,
-                        help="carve-align 관측 앵커 가중치(클수록 상판 정렬 엄격)")
+                        help="weight of the observed anchor in carve-align; higher aligns the top plate more strictly")
     parser.add_argument("--probe_box", default="", type=str,
-                        help='진단용 world 박스 "x0,y0,z0,x1,y1,z1" — 내부 복셀 분류 통계 출력')
+                        help='diagnostic world box "x0,y0,z0,x1,y1,z1"; prints voxel-class stats inside it')
     parser.add_argument("--grid_sign_fix", action="store_true",
-                        help="생성 SDF 부호를 flood-fill 로 강제 복원(watertight=False 면 자동)")
+                        help="force-restore the generated SDF sign by flood fill (automatic when watertight is False)")
     parser.add_argument("--shell_delta", default=0.02, type=float,
-                        help="오프셋 셸 최대 반두께 δ_max(m) — 깊은 미관측 영역(다리)에 적용")
+                        help="max offset-shell half-thickness d_max (m), used deep in unobserved space (legs)")
     parser.add_argument("--shell_delta_min", default=0.006, type=float,
-                        help="오프셋 셸 최소 반두께 δ_min(m) — 관측 표면 인접부(테두리)에 적용")
+                        help="min offset-shell half-thickness d_min (m), used next to the observed surface (rims)")
     parser.add_argument("--shell_ramp", default=0.10, type=float,
-                        help="δ_min→δ_max 전이 거리(m, 관측 표면으로부터)")
+                        help="transition distance from d_min to d_max (m, measured from the observed surface)")
     parser.add_argument("--alpha_smooth", default=1.0, type=float,
-                        help="[seam] 관측 신뢰도 alpha 가우시안 sigma(voxel) — 관측/생성 "
-                             "전이대를 만들어 접합부 계단 제거. 0=off")
+                        help="gaussian sigma (voxels) applied to alpha, creating an "
+                             "observed/generated transition band that removes the seam step. "
+                             "0 = off")
     parser.add_argument("--unseen_open", default=0.0, type=float,
-                        help="[스파이크] 미관측 영역 모폴로지 opening 반경(m). 두께 2r 이하 "
-                             "돌기를 제거한다. ⚠ 얇은 구조(테이블 다리 등)도 같이 지우므로 "
-                             "기본 off. 켤 때는 반드시 다리 생존을 확인할 것")
+                        help="morphological opening radius (m) in unobserved regions; removes "
+                             "protrusions up to 2r thick. Off by default because it also "
+                             "deletes thin structure such as table legs -- check they survive")
     parser.add_argument("--no_color_match", action="store_true",
-                        help="생성 색을 관측 색 통계에 맞추는 보정 비활성")
+                        help="disable matching the generated colour to observed colour statistics")
     parser.add_argument("--color_blend_ramp", default=0.05, type=float,
-                        help="접합부 색 블렌드 거리(m) — 관측면에서 이 거리까지 관측색으로 "
-                             "가중 혼합. 0=off")
+                        help="seam colour blend distance (m): blend toward the observed colour "
+                             "up to this distance from the observed surface. 0 = off")
     parser.add_argument("--hull_min_frac", default=0.0, type=float,
-                        help="[visual hull] 시야에 든 뷰 중 객체 마스크 안으로 투영된 비율이 "
-                             "이 값 이상인 복셀에만 prior 허용. 0=off. 생성 기하가 바닥·인접 "
-                             "객체로 새는 것을 차단")
+                        help="allow the prior only in voxels where at least this fraction of "
+                             "in-frustum views project inside the object mask. 0 = off. "
+                             "Stops generated geometry leaking into the floor or a neighbour")
     parser.add_argument("--hull_min_views", default=5, type=int,
-                        help="hull 판정에 필요한 최소 시야 뷰 수(증거 부족 복셀 배제)")
+                        help="minimum in-frustum views before the hull test applies (drops voxels with too little evidence)")
     parser.add_argument("--view_stride", default=1, type=int,
-                        help="[속도] 학습 뷰를 이 간격으로만 사용(back-project/carve 비용 ∝ 뷰 수). "
-                             "관측 점군은 어차피 서브샘플되므로 2~4 는 손실이 작다")
-    # [게이트] 21객체 배치로 검증한 값. 한 번 폐기(0)했다가 복구했다.
+                        help="use every Nth training view (back-projection and carve cost scale "
+                             "with view count). The point cloud is subsampled anyway, so 2-4 "
+                             "costs little")
+    # [gate] Validated on a 21-object batch. It was once disabled (0) and then restored.
     #
-    #   폐기했던 이유: 통계가 흔들린다. unknown=(alpha<0.25)&~FREE&~OTH 를 |SG|<1.5vox
-    #   의 얇은 껍질에서 집계하므로 'Wo가 2 근처'인 경계 복셀 소속이 결과를 좌우한다.
-    #   같은 명령 3회에서 38.4 / 38.8 / 40.0%.
+    #   Why it was disabled: the statistic is noisy. unknown = (alpha<0.25)&~FREE&~OTH is
+    #   aggregated over the thin shell |SG| < 1.5 vox, so boundary voxels with Wo near 2
+    #   decide the outcome. Three runs of the same command gave 38.4 / 38.8 / 40.0%.
     #
-    #   복구한 이유: 폐기하고 배치를 돌리니 게이트가 막던 객체가 정확히 무너졌다.
-    #     obj16(액자)  unseen F@2 0.358→0.073,  seen F@1 0.914→0.646
-    #     obj8 (꽃병)  unseen F@2 0.070→0.025,  free 7.6→33.6%
+    #   Why it was restored: with it off, exactly the objects it used to block collapsed.
+    #     obj16 (picture frame)  unseen F@2 0.358 -> 0.073,  seen F@1 0.914 -> 0.646
+    #     obj8  (vase)           unseen F@2 0.070 -> 0.025,  free 7.6 -> 33.6%
     #     obj10        unseen F@2 0.584→0.564,  free 5.4→21.9%
-    #   판단은 옳았고 통계만 흔들렸던 것이다.
+    #   The decision was right; only the statistic was noisy.
     #
-    #   임계 선택 (gate_stat_check.py, 21객체):
-    #     임계   맞게적용  헛되이  맞게차단  놓침   순이득ΔunsF2
+    #   Threshold choice (gate_stat_check.py, 21 objects):
+    #     thr    applied-ok  wasted  blocked-ok  missed  net gain d(unsF2)
     #     0.05      15      2      2       0      +2.229
-    #     0.10      15      1      3       0      +2.269   ← 채택
-    #     0.20      15      1      3       0      +2.269   (결과는 같음)
+    #     0.10      15      1      3       0      +2.269   <- chosen
+    #     0.20      15      1      3       0      +2.269   (same decisions)
     #     0.25      13      1      3       2      +1.734
-    #   0.10 과 0.20 이 동일한 판정을 내므로 여유가 큰 쪽을 고른다. 개선 객체 중
-    #   ufrac 이 가장 낮은 obj14(22.2%) 기준 여유가 0.20 이면 2.2%p(흔들림 ±1.6%p 에
-    #   위험), 0.10 이면 12.2%p 로 안전하다. 통계를 바꿀 게 아니라 임계에 여유를 둔다.
+    #   Both decide identically, so take the one with more margin. Against obj14 (22.2%),
+    #   the lowest ufrac among objects that improve, 0.20 leaves 2.2%p -- inside the +-1.6%p
+    #   run-to-run drift -- while 0.10 leaves 12.2%p. Give the threshold margin rather than
+    #   trying to stabilise the statistic.
     #
-    #   대안으로 '생성 내부(미관측) 부피%' 를 시험했으나 더 나빴다(14/2/2/1, +2.111)
-    #   — obj14 의 개선을 놓친다.
-    #   남은 오류: obj24(ufrac 42.0%, ΔunsF2 -0.026) 는 어떤 임계로도 못 막는다.
+    #   The alternative, "unobserved fraction of the generated INTERIOR volume", was worse
+    #   (14/2/2/1, +2.111): it misses obj14's improvement.
+    #   Remaining error: obj24 (ufrac 42.0%, d unsF2 -0.026) is not separable by any
+    #   threshold.
+    parser.add_argument("--min_obs_frac", default=0.05, type=float,
+                        help="minimum fraction of observed voxels for the prior to apply. "
+                             "Below it the prior is unconstrained and invents the object: "
+                             "obj31 at 1.0%% and obj28 at 2.1%% blew up to 69.9 / 77.6mm seen "
+                             "accuracy, while obj22 at 7.7%% improved. 0 disables the gate; "
+                             "a blocked object falls through to --passthrough_mesh.")
     parser.add_argument("--min_unknown_frac", default=0.10, type=float,
-                        help="[적용 게이트] 생성 내부 부피 중 unknown 비율이 이 값 미만이면 "
-                             "prior 를 쓰지 않는다(이미 충분히 관측된 객체). 0=항상 적용")
+                        help="skip the prior when the unknown fraction of the generated surface "
+                             "is below this (the object is already well observed). "
+                             "0 = always apply")
     parser.add_argument("--keep_connected", dest="keep_connected", action="store_true",
                         default=True,
-                        help="최종 음수 볼륨 중 관측 복셀과 연결된 성분만 유지 — "
-                             "통짜 생성 prior 의 타 객체 잔해 제거 (기본 on)")
+                        help="keep only the negative components connected to observed voxels, "
+                             "removing another object's debris from a single-blob prior "
+                             "(on by default)")
     parser.add_argument("--no_keep_connected", dest="keep_connected", action="store_false",
-                        help="연결성분 필터 해제(분리된 부품이 있는 객체)")
+                        help="disable the connected-component filter (for objects with detached parts)")
     parser.add_argument("--carve_depth_dir", default="", type=str,
-                        help="dump_scene_depth.py 출력 폴더. 전체 씬 200뷰 depth로 free-space carving (empty-ray보다 우선)")
-    parser.add_argument("--offsurf_delta", default=0.01, type=float, help="정규화 좌표 기준 off-surface 오프셋")
-    parser.add_argument("--grid", default=0, type=int, help="marching cubes 해상도(0=voxel_size로 산출)")
+                        help="dump_scene_depth.py output folder. Carves free space from whole-scene depth; takes precedence over empty-ray")
+    parser.add_argument("--offsurf_delta", default=0.01, type=float, help="off-surface offset in normalised coordinates")
+    parser.add_argument("--grid", default=0, type=int, help="marching-cubes resolution (0 = derived from voxel_size)")
     parser.add_argument("--max_grid", default=512, type=int)
     parser.add_argument("--mask_dist", default=0.0, type=float,
-                        help="메쉬 정점이 관측 점군에서 이 거리(world) 초과면 제거(0=off) — 박스 제거 vs 구멍채움 균형. "
-                             "unseen 완성(측면/뒷면 보간)을 보존하려면 ROI crop과 함께 0 또는 크게")
+                        help="drop mesh vertices farther than this (world) from the observed "
+                             "cloud; 0 = off. Trades box removal against hole filling. To keep "
+                             "unseen completion (sides and back), use 0 or a large value "
+                             "together with an ROI crop")
     parser.add_argument("--roi_mesh", default="", type=str,
-                        help="관측 anchor mesh(예: TSDF fuse_post.ply). 이 mesh에서 roi_dist 밖 점은 SDF 입력에서 제외")
+                        help="observed anchor mesh (e.g. the TSDF fuse_post.ply). Points beyond roi_dist from it are dropped from the SDF input")
     parser.add_argument("--roi_dist", default=0.15, type=float)
     parser.add_argument("--mask_dir", default="auto", type=str,
-                        help="뷰별 객체 마스크 폴더. 'auto'=<source_path>/masks (있으면 사용), ''=사용 안 함")
+                        help="per-view object mask folder. 'auto' = <source_path>/masks when present, '' = none")
     parser.add_argument("--require_mask", dest="require_mask", action="store_true",
                         default=True,
-                        help="마스크 없는 학습 뷰는 통째로 skip (객체별 추출에 필수, 기본 on)")
+                        help="skip training views that have no mask (required for per-object extraction, on by default)")
     parser.add_argument("--no_require_mask", dest="require_mask", action="store_false",
-                        help="마스크 없는 뷰도 사용(씬 전체 추출)")
+                        help="also use views without a mask (whole-scene extraction)")
     parser.add_argument("--extra_poses", default="", type=str,
-                        help="추가 novel 포즈 npz(render_hole_novel soft_out poses.npz). "
-                             "See3D 정제된 unseen 밴드를 추출에 포함")
+                        help="extra novel poses npz (render_hole_novel soft_out poses.npz), to "
+                             "include See3D-refined unseen bands in the extraction")
     parser.add_argument("--extra_mask_npy", default="", type=str,
-                        help="per-Gaussian 객체 라벨 npy — extra 포즈에서 label-buffer 렌더로 "
-                             "객체 마스크 생성(base/바닥 유입 차단). 미지정 시 extra 뷰는 마스크 없음")
+                        help="per-gaussian object label npy. Used to render a label buffer at "
+                             "extra poses and build object masks there (blocks floor bleed). "
+                             "Without it the extra views are unmasked")
     parser.add_argument("--extra_mask_thr", default=0.3, type=float)
     parser.add_argument("--out", default="", type=str)
     args = get_combined_args(parser)
 
-    # ══ 재현성 ════════════════════════════════════════════════════════════
-    # 관측 점군 P 를 시드 없이 서브샘플링하면 그 percentile 로 정해지는 center/scale 이
-    # 매 실행 달라지고, 복셀 그리드 전체가 조금씩 다른 자리에 놓인다.
-    # 실측(obj6, 동일 설정 2회): [gate] 34.6% vs 38.4%, 정점 405개 차이, Chamfer 0.09mm.
-    # 게이트 임계(0.20) 근처 객체는 이 흔들림만으로 prior 적용 여부가 뒤집힌다
-    # (obj28 은 18.1% 로 임계 바로 아래였다).
-    # ⚠ 설정 A/B 를 할 때 이 시드가 다르면 설정 차이와 샘플링 차이가 섞인다.
+    # -- reproducibility -------------------------------------------------------
+    # Subsampling the observed cloud P without a seed changes the percentile-derived
+    # center/scale every run, so the whole voxel grid lands in a slightly different place.
+    # Measured (obj6, same settings twice): [gate] 34.6% vs 38.4%, 405 vertices apart,
+    # Chamfer 0.09mm. Objects near the gate threshold flip on that drift alone (obj28 sat at
+    # 18.1%, just below). In an A/B, an unequal seed mixes the setting difference with the
+    # sampling difference.
     np.random.seed(args.pts_seed)
 
-    # ══ 확정 설정 자동 적용 ═══════════════════════════════════════════════
-    # obj6 튜닝으로 확정된 값들은 전부 argparse 기본값에 들어가 있다. 여기서는
-    # 명령줄로 표현하기 번거로운 나머지 셋만 처리하고, 실제 적용값을 전부 찍는다.
-    #   (기본값이 조용히 결과를 바꿔 며칠을 날린 적이 있다 — unseen_open 0.015.
-    #    그래서 '기본값을 감추는 대신 매 실행마다 전부 출력'하는 쪽을 택한다.)
+    # -- settled settings ------------------------------------------------------
+    # Everything settled by tuning lives in the argparse defaults. Only the few that are
+    # awkward to express on the command line are handled here, and every value actually in
+    # force is printed. (A silent default once changed results and cost days -- unseen_open
+    # 0.015 -- so nothing is hidden: the full table is printed every run.)
     _given = {a.split("=")[0] for a in sys.argv[1:] if a.startswith("--")}
 
     if "--data_device" not in _given:
-        args.data_device = "cpu"              # GPU 메모리 절약, 결과 불변
+        args.data_device = "cpu"              # saves GPU memory, does not change results
     if args.prior_field and not args.grid_fuse and "--no_grid_fuse" not in _given:
-        args.grid_fuse = True                 # prior_field 를 준 시점에 의도는 명확하다
+        args.grid_fuse = True                 # passing prior_field already states the intent
     if not args.gt_depth_dir and "--no_gt_depth" not in _given:
         _d = os.environ.get("REFINEGS_GT_DEPTH", DEFAULT_GT_DEPTH_DIR)
         if os.path.isdir(_d):
             args.gt_depth_dir = _d
 
-    print("┌─ [config] 이번 실행에 적용된 값 " + "─" * 30)
+    print("+- [config] values in force this run " + "-" * 30)
     for _k, _v, _note in [
-        ("prior_field",     args.prior_field,      "생성 prior 필드 npz"),
-        ("prior_sigma_w",   args.prior_sigma_w,    "σ 가중(0=off, 앙상블 npz 에서만 의미)"),
-        ("grid_fuse",       args.grid_fuse,        "결정적 grid 융합"),
-        ("obs_erode",       args.obs_erode,        "마스크 침식 px [seen 품질]"),
-        ("obs_cos_min",     args.obs_cos_min,      "grazing 배제 임계 [seen 품질]"),
-        ("obs_cos_weight",  args.obs_cos_weight,   "cos 가중 [seen 품질]"),
-        ("grid_wcap",       args.grid_wcap,        "관측 신뢰도 포화 뷰 수"),
-        ("unseen_open",     args.unseen_open,      "⚠ >0 이면 얇은 구조가 지워진다"),
-        ("free_min_views",  args.free_min_views,   "carve 합의 뷰 수"),
-        ("min_unknown_frac", args.min_unknown_frac, "prior 적용 게이트"),
-        ("hull_min_frac",   args.hull_min_frac,    "visual hull 게이트(0=off)"),
-        ("keep_connected",  args.keep_connected,   "연결성분 필터"),
-        ("free_hard",       args.free_hard,        "블렌드 뒤 carve 재적용"),
-        ("free_hard_alpha", args.free_hard_alpha,  "완전 포화 관측은 제외(0.95)"),
-        ("voxel_size",      args.voxel_size,       "복셀 크기(m)"),
-        ("gt_depth_dir",    args.gt_depth_dir,     "GT depth(carve 기준)"),
-        ("pts_seed",        args.pts_seed,         "점군 샘플링 시드(재현성)"),
-        ("fuse_device",     args.fuse_device,      "융합 실행 장치"),
+        ("prior_field",     args.prior_field,      "generated prior field npz"),
+        ("prior_sigma_w",   args.prior_sigma_w,    "sigma weighting (0=off, ensemble npz only)"),
+        ("grid_fuse",       args.grid_fuse,        "deterministic grid fusion"),
+        ("obs_erode",       args.obs_erode,        "mask erosion px [seen quality]"),
+        ("obs_cos_min",     args.obs_cos_min,      "grazing rejection threshold [seen quality]"),
+        ("obs_cos_weight",  args.obs_cos_weight,   "cos weighting [seen quality]"),
+        ("grid_wcap",       args.grid_wcap,        "views at which observation saturates"),
+        ("unseen_open",     args.unseen_open,      "WARN >0 deletes thin structure"),
+        ("free_min_views",  args.free_min_views,   "carve consensus views"),
+        ("min_unknown_frac", args.min_unknown_frac, "prior gate: unobserved surface"),
+        ("min_obs_frac",    args.min_obs_frac,     "prior gate: observed voxels"),
+        ("hull_min_frac",   args.hull_min_frac,    "visual hull gate (0=off)"),
+        ("keep_connected",  args.keep_connected,   "connected-component filter"),
+        ("free_hard",       args.free_hard,        "re-apply carve after the blend"),
+        ("free_hard_alpha", args.free_hard_alpha,  "skip fully saturated observation (0.95)"),
+        ("voxel_size",      args.voxel_size,       "voxel size (m)"),
+        ("prior_carve_ds",  args.prior_carve_ds,   "view-buffer downscale (keep 1)"),
+        ("gt_depth_dir",    args.gt_depth_dir,     "GT depth (carve reference)"),
+        ("pts_seed",        args.pts_seed,         "point sampling seed (reproducibility)"),
+        ("fuse_device",     args.fuse_device,      "fusion device"),
     ]:
-        _src = "지정" if f"--{_k}" in _given or f"--no_{_k}" in _given else "기본"
+        _src = "set" if f"--{_k}" in _given or f"--no_{_k}" in _given else "default"
         print(f"│ {_k:<17} = {str(_v):<28} [{_src}] {_note}")
     print("└" + "─" * 62)
     if args.unseen_open > 0:
-        print("⚠ [config] unseen_open > 0 — 미관측 영역의 얇은 구조(테이블 다리 등)가 "
-              "모폴로지 opening 으로 삭제된다. 의도한 것이 맞는지 확인할 것")
+        print("[config] WARN unseen_open > 0: morphological opening will delete thin "
+              "structure in unobserved regions (table legs). Confirm this is intended.")
 
     _T0 = time.time(); _tk = _T0
 
     def _lap(msg):
         now = time.time()
-        print(f"[time] {msg}: {now - _lap.prev:.1f}s (누적 {now - _T0:.1f}s)", flush=True)
+        print(f"[time] {msg}: {now - _lap.prev:.1f}s (total {now - _T0:.1f}s)", flush=True)
         _lap.prev = now
     _lap.prev = _tk
 
@@ -1520,12 +1616,12 @@ def main():
     pipe = pipeline.extract(args)
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians, load_iteration=args.iteration, shuffle=False)
-    _lap(f"Scene 로드 (학습뷰 {len(scene.getTrainCameras())}장)")
-    gaussians.active_sh_degree = 0  # diffuse만(테xture) — render.py mesh 경로와 동일
+    _lap(f"scene load ({len(scene.getTrainCameras())} training views)")
+    gaussians.active_sh_degree = 0  # diffuse only, same as the render.py mesh path
     bg = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg, dtype=torch.float32, device="cuda")
 
-    # 1) oriented point cloud (객체 마스크 밖 픽셀 제외 — TSDF 경로와 동일)
+    # 1) oriented point cloud (pixels outside the object mask dropped, as in the TSDF path)
     mask_dir = None
     if args.mask_dir == "auto":
         cand = os.path.join(dataset.source_path, "masks")
@@ -1553,37 +1649,39 @@ def main():
         extra_masks = render_extra_masks(extra_cams, gaussians, pipe, background,
                                          torch.from_numpy(lab_np).cuda(), thr=args.extra_mask_thr)
         cov = np.mean([m.float().mean().item() for m in extra_masks.values()])
-        print(f"extra 객체 마스크 생성: {len(extra_masks)}뷰 (평균 커버 {cov*100:.1f}%)")
+        print(f"[extra] built masks for {len(extra_masks)} views (mean cover {cov*100:.1f}%)")
 
-    print("뷰별 depth back-project + 법선 정렬 ...")
+    print("back-projecting depth and aligning normals ...")
     P, N, C, O, EO, ED, VB = collect_oriented_points(scene, gaussians, pipe, background, args,
                                                      mask_dir=mask_dir,
                                                      require_mask=args.require_mask,
                                                      extra_cams=extra_cams,
                                                      extra_masks=extra_masks)
-    _lap("뷰별 depth back-project")
-    print(f"표면점 {len(P)} (관측 back-projected)")
+    _lap("depth back-projection")
+    print(f"[points] {len(P)} observed surface points")
     if len(P) < 1000:
-        raise SystemExit(f"[중단] 유효 표면점 {len(P)}개 — 마스크 값 규약 또는 alpha_thr 확인 필요. "
-                         f"(마스크 없이 테스트: --mask_dir '' , alpha 완화: --alpha_thr 0.5)")
+        raise SystemExit(f"[abort] only {len(P)} valid surface points -- check the mask value "
+                         f"convention or alpha_thr (test without masks: --mask_dir '', "
+                         f"relax alpha: --alpha_thr 0.5)")
 
-    # 1b) ROI crop — 신뢰 가능한 관측 mesh(TSDF fuse_post 등) 근방 점만 유지.
-    #     instance 모델의 배경/마스크 경계 junk(검은 노이즈)를 SDF 피팅 전에 제거.
+    # 1b) ROI crop: keep only points near a trusted observed mesh (the TSDF fuse_post),
+    #     removing background and mask-border junk before the SDF fit.
     if args.roi_mesh:
         from scipy.spatial import cKDTree as _KD
         rm = o3d.io.read_triangle_mesh(args.roi_mesh)
         rv = np.asarray(rm.vertices)
-        assert len(rv) > 0, f"ROI mesh 비어있음: {args.roi_mesh}"
+        assert len(rv) > 0, f"ROI mesh is empty: {args.roi_mesh}"
         d, _ = _KD(rv).query(P, workers=-1)
         keep = d < args.roi_dist
-        print(f"ROI crop: {int(keep.sum())}/{len(P)} 유지 (dist<{args.roi_dist}, mesh={args.roi_mesh})")
+        print(f"[roi] kept {int(keep.sum())}/{len(P)} (dist<{args.roi_dist}, mesh={args.roi_mesh})")
         P, N, C, O = P[keep], N[keep], C[keep], O[keep]
 
     if len(P) > args.n_pts:
         idx = np.random.choice(len(P), args.n_pts, replace=False)
         P, N, C, O = P[idx], N[idx], C[idx], O[idx]
 
-    # robust 정규화 [-1,1] — floater가 scale을 부풀리지 않도록 percentile bbox 밖 점 제거
+    # robust normalisation to [-1,1]: drop points outside the percentile bbox so floaters
+    # cannot inflate scale
     lo = np.percentile(P, 0.5, axis=0); hi = np.percentile(P, 99.5, axis=0)
     pad = 0.05 * (hi - lo)
     keep = np.all((P >= lo - pad) & (P <= hi + pad), axis=1)
@@ -1591,56 +1689,59 @@ def main():
     P, N, C, O = P[keep], N[keep], C[keep], O[keep]
     center = (lo + hi) / 2
     scale = np.abs(P - center).max() * 1.1
-    print(f"robust bbox: outlier {n_drop}점 제거, scale={scale:.3f} world (bbox {np.round(hi-lo,3)})")
-    # [FIX] Pn/On 은 prior 주입 '후'에 계산 (기존엔 여기서 계산해 stale Pn 이 train 에 들어가
-    # prior 점이 표면 손실에 전혀 반영되지 않던 치명 버그 — 다리 무감독→팽창의 직접 원인)
-    EOn = (EO - center) / scale if len(EO) else EO   # 방향(ED)은 정규화 불변
+    print(f"[bbox] dropped {n_drop} outliers, scale={scale:.3f} world (bbox {np.round(hi-lo,3)})")
+    # Pn/On are computed AFTER the prior is injected. Computing them here fed a stale Pn to
+    # train(), so prior points never reached the surface loss -- legs went unsupervised and
+    # inflated.
+    EOn = (EO - center) / scale if len(EO) else EO   # directions (ED) are invariant to normalisation
     if len(EOn):
         t0 = -(EOn * ED).sum(-1)
         dmin = np.linalg.norm(EOn + ED * t0[:, None], axis=-1)
-        print(f"empty ray 진단: t0(전방거리) 중앙값 {np.median(t0):.2f} (양수여야 정상), "
-              f"dmin(중심 최근접) min/중앙값 {dmin.min():.2f}/{np.median(dmin):.2f} (단위=정규화, bbox≈1)")
-        keep_e = (t0 > 0) & (dmin < 1.2)             # 객체 bbox 근처를 실제로 지나는 광선만
+        print(f"[empty-ray] median t0 (forward distance) {np.median(t0):.2f} (should be "
+              f"positive), dmin (closest approach to centre) min/median "
+              f"{dmin.min():.2f}/{np.median(dmin):.2f} (normalised units, bbox ~ 1)")
+        keep_e = (t0 > 0) & (dmin < 1.2)             # keep only rays that actually pass near the object bbox
         EOn, ED = EOn[keep_e], ED[keep_e]
-        print(f"empty ray 필터: {int(keep_e.sum())}/{len(keep_e)} 유지 (bbox 관통 광선)")
+        print(f"[empty-ray] kept {int(keep_e.sum())}/{len(keep_e)} rays crossing the bbox")
 
     n_obs = len(P)
-    OBS = np.ones(n_obs, bool)          # True=관측점. prior 점은 False → l_free 제외
+    OBS = np.ones(n_obs, bool)          # True = observed point; prior points are False and excluded from l_free
 
-    # 1b-2) [prior·점군 경로] 생성 뷰 점군 주입 (make_gen_points.py / fuse --export_points).
-    #       [FIX Step4-B] OBS=False 로 표시 — 가짜 원점(O=center) free-carve 버그 제거.
+    # 1b-2) prior, point-cloud path: inject the generated-view cloud (make_gen_points.py /
+    #       fuse --export_points). Marked OBS=False so their fake origin (O = center) cannot
+    #       free-carve the interior.
     if args.extra_points:
         pp = o3d.io.read_point_cloud(os.path.expanduser(args.extra_points))
         Pe = np.asarray(pp.points)
         Ne = np.asarray(pp.normals) if pp.has_normals() else None
         Ce = np.asarray(pp.colors) if pp.has_colors() else np.tile([0.6, 0.6, 0.6], (len(Pe), 1))
-        assert Ne is not None and len(Ne) == len(Pe), "extra_points 에 법선 필요 (make_gen_points.py 사용)"
+        assert Ne is not None and len(Ne) == len(Pe), "extra_points needs normals (use make_gen_points.py)"
         if 0 < args.prior_repeat < 1.0:
             sel = np.random.choice(len(Pe), max(int(len(Pe) * args.prior_repeat), 1), replace=False)
             Pe, Ne, Ce = Pe[sel], Ne[sel], Ce[sel]
         P = np.concatenate([P, Pe]); N = np.concatenate([N, Ne])
         C = np.concatenate([C, Ce]); O = np.concatenate([O, np.tile(center, (len(Pe), 1))])
         OBS = np.concatenate([OBS, np.zeros(len(Pe), bool)])
-        print(f"prior 점군 주입: {len(Pe)}점 (총 {len(P)})")
+        print(f"[prior] injected {len(Pe)} points ({len(P)} total)")
         n_extra = len(Pe)
     else:
         n_extra = 0
 
-    # 1b-3) [prior·메쉬 경로, Step2] 정합된 watertight 생성 메쉬
-    #       (fuse_generated_mesh --save_aligned 출력 *_gen_aligned.ply).
-    #       표면 샘플(face normal, unseen 게이트) + 볼륨 셸 샘플의 target SDF 회귀.
+    # 1b-3) prior, mesh path: an aligned watertight generated mesh (*_gen_aligned.ply from
+    #       fuse_generated_mesh --save_aligned). Regresses a target SDF from surface samples
+    #       (face normals, unseen-gated) plus volume shell samples.
     PV = PS = None
     rs_prior = None
     _sd = None
     prior_dbg = None
 
-    # 1b-3') [prior·필드 경로] ShapeR 디코더의 '부호 있는' SDF 그리드를 직접 주입.
-    #   메쉬를 거치지 않으므로:
-    #     - sign-fix 불필요 (필드가 이미 signed)
-    #     - shell_delta 불필요 (제로 두께 시트 문제 자체가 없음. ShapeR 의 UDF 메쉬는
-    #       |f|=iso 로 뽑혀 표면 양쪽에 껍질이 생기는데, 여기선 그 단계를 건너뜀)
-    #     - 정합 불필요 (ShapeR 은 metric + world 변환)
-    #   → grid_fuse 의 SG 를 이 필드에서 삼선형 보간으로 채운다.
+    # 1b-3') prior, field path: inject the ShapeR decoder's SIGNED SDF grid directly.
+    #   Skipping the mesh removes three problems:
+    #     - no sign-fix needed (the field is already signed)
+    #     - no shell_delta needed (there is no zero-thickness sheet: a ShapeR UDF mesh is
+    #       extracted at |f| = iso and gains a shell on both sides; that step is skipped)
+    #     - no alignment needed (ShapeR is metric and outputs a world transform)
+    #   grid_fuse then fills SG from this field by trilinear interpolation.
     if args.prior_field:
         z = np.load(os.path.expanduser(args.prior_field))
         Ffield = z["field"].astype(np.float32)
@@ -1648,43 +1749,46 @@ def main():
         Gf = Ffield.shape[0]
         print(f"[prior-field] {os.path.basename(args.prior_field)}  G={Gf}  "
               f"voxel={float(z['vox_world'])*1000:.2f}mm  "
-              f"내부 {(Ffield < 0).mean()*100:.2f}%  "
-              f"범위 [{Ffield.min():.4f}, {Ffield.max():.4f}]m")
+              f"inside {(Ffield < 0).mean()*100:.2f}%  "
+              f"range [{Ffield.min():.4f}, {Ffield.max():.4f}]m")
 
-        # [truncation 정규화] 디코더 출력은 객체마다 다른 값에서 포화한다(obj1 ±27mm,
-        # obj20 ±6mm). 그런데 융합은 carve 복셀을 +prior_trunc(50mm)로 채우므로,
-        # 포화값이 작을수록 carve 경계에서 필드가 급점프하고 스무딩이 그 구간에
-        # **인위적 영교차**(가짜 표면)를 만든다. 영교차 위치는 스케일링에 불변이므로
-        # 포화값을 prior_trunc 에 맞춰 두 필드를 commensurate 하게 만든다.
+        # [truncation rescale] The decoder saturates at a different value per object (obj1
+        # +-27mm, obj20 +-6mm), while fusion fills carved voxels with +prior_trunc (50mm).
+        # The smaller the saturation, the sharper the jump at the carve boundary, and
+        # smoothing then creates an ARTIFICIAL zero crossing (a fake surface) there. The
+        # zero crossing is invariant to scaling, so rescale the saturation to prior_trunc
+        # and make the two fields commensurate.
         if args.prior_field_rescale:
             sat = float(np.percentile(np.abs(Ffield), 99.5))
             if sat > 1e-9 and abs(sat - args.prior_trunc) / args.prior_trunc > 0.2:
                 Ffield = (Ffield * (args.prior_trunc / sat)).astype(np.float32)
-                print(f"  → truncation 정규화: 포화 {sat*1000:.1f}mm → "
+                print(f"  -> truncation rescale: saturation {sat*1000:.1f}mm -> "
                       f"{args.prior_trunc*1000:.0f}mm (×{args.prior_trunc/sat:.2f})")
-        args.prior_watertight = True          # sign-fix 비활성(이미 signed)
+        args.prior_watertight = True          # disable sign-fix; the field is already signed
 
-        # [앙상블 σ 가중] 50% 이상 미관측이면 정답이 하나가 아니다. 여러 시드가 동의하는
-        # 곳만 prior 를 믿고, 갈리는 곳(σ 큼)은 '표면 없음(+trunc)' 쪽으로 후퇴시켜
-        # 관측 표면에서의 자연스러운 연장(eikonal·평활화)에 맡긴다.
+        # [ensemble sigma weighting] Past ~50% unobserved there is no single right answer.
+        # Trust the prior only where seeds agree; where they diverge (large sigma), fall back
+        # toward "no surface" (+trunc) and let the natural extension of the observed surface
+        # (eikonal, smoothing) take over.
         Fsig = None
         if "field_std" in z.files and args.prior_sigma_w > 0:
             Fsig = z["field_std"].astype(np.float32)
             near = np.abs(Ffield) < 3 * float(z["vox_world"])
-            # 필드가 metric 이므로 σ0 는 '허용 가능한 표면 위치 불확실성'의 절대 기준.
-            # 기본 = prior_trunc → σ≪σ0 이면 w≈1(그대로 신뢰), σ≈σ0 이면 w=0.5.
-            # ※ σ0 를 σ 중앙값으로 잡으면 정의상 복셀 절반이 억제되므로 쓰지 않는다.
+            # The field is metric, so sigma0 is an absolute bound on acceptable surface
+            # position uncertainty. Default = prior_trunc: sigma << sigma0 gives w ~ 1 (full
+            # trust), sigma ~ sigma0 gives w = 0.5. Do NOT set sigma0 to the median sigma --
+            # that suppresses half the voxels by definition.
             s0 = max(args.prior_sigma_ref if args.prior_sigma_ref > 0
                      else args.prior_trunc, 1e-6)
             Wsig = 1.0 / (1.0 + args.prior_sigma_w * (Fsig / s0) ** 2)
             sm = float(np.median(Fsig[near])) if near.any() else float("nan")
-            print(f"[prior-field] σ 가중 활성: σ0={s0*1000:.1f}mm  "
-                  f"표면근방 σ 중앙값 {sm*1000:.2f}mm  "
-                  f"w 중앙값 {float(np.median(Wsig[near])) if near.any() else float('nan'):.3f}  "
-                  f"(w<0.5 복셀 {(Wsig < 0.5).mean()*100:.1f}%)")
+            print(f"[prior-field] sigma weighting on: sigma0={s0*1000:.1f}mm  "
+                  f"median sigma near surface {sm*1000:.2f}mm  "
+                  f"median w {float(np.median(Wsig[near])) if near.any() else float('nan'):.3f}  "
+                  f"(w<0.5 in {(Wsig < 0.5).mean()*100:.1f}% of voxels)")
 
         def _sd(q):
-            """world 점 → 근사 metric SDF(음수=내부). 그리드 밖은 +trunc."""
+            """World point -> approximate metric SDF (negative inside); +trunc outside the grid."""
             n = ((np.asarray(q, np.float64) - f_center) @ f_R.T) * f_scale
             idx = (n + 1.0) * (Gf - 1) / 2.0
             out = np.full(len(idx), args.prior_trunc, np.float64)
@@ -1695,7 +1799,7 @@ def main():
             i0 = np.floor(p).astype(np.int64); w = p - i0
             i1 = i0 + 1
 
-            def _interp(vol):                 # 삼선형 보간
+            def _interp(vol):                 # trilinear interpolation
                 v = np.zeros(len(p), np.float64)
                 for dx in (0, 1):
                     for dy in (0, 1):
@@ -1709,7 +1813,7 @@ def main():
                 return v
 
             v = _interp(Ffield)
-            if Fsig is not None:              # 합의도 가중: 불확실하면 '표면 없음'으로 후퇴
+            if Fsig is not None:              # consensus weighting: fall back to "no surface" where uncertain
                 wg = _interp(Wsig)
                 v = wg * v + (1 - wg) * args.prior_trunc
             out[ok] = v
@@ -1719,10 +1823,10 @@ def main():
         from scipy.spatial import cKDTree as _KDp
         pm_path = os.path.expanduser(args.prior_mesh)
         gm = o3d.io.read_triangle_mesh(pm_path)
-        assert len(gm.vertices), f"prior mesh 로드 실패: {args.prior_mesh}"
-        # glb 등 UV 텍스처 입력이면 vertex color 로 bake (없으면 샘플 점이 흰색이 됨).
-        # ※ "more than 1 material" Open3D 경고는 RaycastingScene 변환 시 재질을 버린다는
-        #   의미일 뿐 — SDF(geometry) 계산에는 무해.
+        assert len(gm.vertices), f"failed to load prior mesh: {args.prior_mesh}"
+        # Bake UV textures (glb) into vertex colours, otherwise the samples come out white.
+        # Open3D's "more than 1 material" warning only means materials are dropped when
+        # converting to a RaycastingScene; it does not affect the SDF geometry.
         if not (gm.has_vertex_colors() and len(gm.vertex_colors) == len(gm.vertices)):
             try:
                 import trimesh
@@ -1733,32 +1837,34 @@ def main():
                         o3d.utility.Vector3dVector(np.asarray(tm.vertices, np.float64)),
                         o3d.utility.Vector3iVector(np.asarray(tm.faces, np.int32)))
                     gm.vertex_colors = o3d.utility.Vector3dVector(np.clip(vc, 0, 1))
-                    print(f"[prior] 텍스처→정점색 bake ({len(vc)} verts)")
+                    print(f"[prior] baked texture into vertex colours ({len(vc)} verts)")
             except Exception as e:
-                print(f"[prior] 색 bake 실패({e}) — 회색 유지")
+                print(f"[prior] colour bake failed ({e}) -- keeping grey")
         wt = gm.is_watertight()
         args.prior_watertight = bool(wt)
         print(f"[prior] mesh verts {len(gm.vertices)} watertight={wt}"
-              + ("" if wt else "  ⚠ signed distance 부호 불안정 — grid_fuse 에서 sign-fix 자동 적용"))
+              + ("" if wt else "  WARN unstable signed-distance sign -- grid_fuse applies sign-fix"))
         rs_prior = o3d.t.geometry.RaycastingScene()
         rs_prior.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(gm))
 
-        def _sd(q):     # world 좌표 signed distance (양수=밖)
+        def _sd(q):     # signed distance in world coords (positive outside)
             return rs_prior.compute_signed_distance(
                 o3c.Tensor(q.astype(np.float32))).numpy().astype(np.float64)
 
         obs_tree_w = _KDp(P[:n_obs])
         band, trunc = args.prior_band, args.prior_trunc
-        # 표면 샘플 — face normal 사용(생성 mesh vertex normal 오염 회피) + 부호 검증
+        # surface samples: use face normals (generated-mesh vertex normals are unreliable)
+        # and verify the sign
         sp = gm.sample_points_uniformly(args.prior_surf_n, use_triangle_normal=True)
         Ps_w = np.asarray(sp.points); Ns_w = np.asarray(sp.normals).copy()
-        prior_dbg = Ps_w.copy()                      # [debug] 분류 시각화용(게이트 전 원본)
-        flip = _sd(Ps_w + 0.5 * band * Ns_w) < 0     # p+εn 이 내부면 법선 뒤집힘
+        prior_dbg = Ps_w.copy()                      # [debug] pre-gate copy, for the class visualisation
+        flip = _sd(Ps_w + 0.5 * band * Ns_w) < 0     # if p + eps*n is inside, the normal is flipped
         Ns_w[flip] = -Ns_w[flip]
-        print(f"[prior] 표면 법선 부호 flip {int(flip.sum())}/{len(Ns_w)}")
-        # [할루시네이션 carve] 렌더 depth+mask 뷰 버퍼(VB)로 prior 샘플 검증.
-        #   freespace 위반: 마스크 안인데 관측 표면보다 '앞'에 뜸 (상판 위 덩어리 등)
-        #   silhouette 위반: 마스크 밖 픽셀에 비가림 상태로 투영 (꼬리 등)
+        print(f"[prior] flipped {int(flip.sum())}/{len(Ns_w)} surface normals")
+        # [hallucination carve] Validate prior samples against the depth+mask view buffers.
+        #   freespace violation:  inside the mask but IN FRONT of the observed surface
+        #                         (a blob floating above a table top)
+        #   silhouette violation: projects unoccluded onto a pixel outside the mask (a tail)
         def _carve_viol(Xw, margin=args.prior_carve_margin):
             viol = np.zeros(len(Xw), bool)
             for b in VB:
@@ -1771,73 +1877,76 @@ def main():
                 ui = np.clip(u, 0, b["W"] - 1).astype(int)
                 vi = np.clip(v, 0, b["H"] - 1).astype(int)
                 di = b["depth"][vi, ui]; mi = b["mask"][vi, ui]
-                front = (di > 0) & (z < di - margin)             # 관측 표면보다 앞
-                sil = (~mi) & ((di <= 0) | front)                # 실루엣 밖 & 비가림
+                front = (di > 0) & (z < di - margin)             # in front of the observed surface
+                sil = (~mi) & ((di <= 0) | front)                # outside the silhouette and unoccluded
                 viol |= infr & ((mi & front) | sil)
             return viol
 
-        # [Step1] unseen 게이트: 관측점 τ 이내 표면 샘플 제거 — 관측이 항상 승리(이중 표면 방지)
+        # unseen gate: drop surface samples within tau of an observed point. Observation
+        # always wins, which prevents double surfaces.
         du, _ = obs_tree_w.query(Ps_w, workers=-1)
         ku = du > args.prior_unseen_dist
         Cs = (np.asarray(sp.colors)[ku] if len(sp.colors) == len(ku)
               else np.tile([0.6, 0.6, 0.6], (int(ku.sum()), 1)))
         Ps_w, Ns_w = Ps_w[ku], Ns_w[ku]
-        # 표면 샘플 carve — 관측과 모순되는 생성 표면(할루시네이션) 제거
+        # carve surface samples that contradict the observation (hallucinations)
         vv = _carve_viol(Ps_w)
         Ps_w, Ns_w, Cs = Ps_w[~vv], Ns_w[~vv], Cs[~vv]
-        print(f"[prior] unseen 표면 샘플 {len(Ps_w)}/{len(ku)} "
-              f"(τ={args.prior_unseen_dist}m, carve 제거 {int(vv.sum())})")
+        print(f"[prior] unseen surface samples {len(Ps_w)}/{len(ku)} "
+              f"(tau={args.prior_unseen_dist}m, carved {int(vv.sum())})")
         P = np.concatenate([P, Ps_w]); N = np.concatenate([N, Ns_w])
         C = np.concatenate([C, Cs]);  O = np.concatenate([O, np.tile(center, (len(Ps_w), 1))])
         OBS = np.concatenate([OBS, np.zeros(len(Ps_w), bool)])
         n_extra += len(Ps_w)
-        # [Step2] 볼륨 샘플 = 셸(표면 ±band) + uniform far-field.
-        #   셸: 얇은 구조 '양쪽' 근접 빈 공간을 양수로 감독.
-        #   uniform: 셸 밖 unseen ROI 전체를 truncated SDF 로 감독 —
-        #            셸 사이 무감독 공간에서 생기던 잔여 부풀림 차단.
+        # Volume samples = shell (surface +- band) plus a uniform far field.
+        #   shell:   supervises the empty space on BOTH sides of a thin structure as positive
+        #   uniform: supervises the rest of the unseen ROI with a truncated SDF, removing the
+        #            residual inflation that grew in the unsupervised gaps between shells
         rng = np.random.default_rng(0)
         Xs = [Ps_w + rng.standard_normal(Ps_w.shape) * band * f for f in (0.25, 1.0)]
         Xu = rng.uniform(-1, 1, (args.prior_uniform_n, 3)) * scale + center
         X = np.concatenate(Xs + [Xu])
         sd_x = _sd(X)
         tgt = np.clip(sd_x, -trunc, trunc)
-        # carve 위반 볼륨 샘플: 제거 대신 target=+trunc 강제(관측된 빈 공간 = 확실한 '밖')
+        # carve-violating volume samples: force target=+trunc instead of dropping them
+        # (observed empty space is definitively outside)
         vx = _carve_viol(X)
         tgt[vx] = trunc
         dxo, _ = obs_tree_w.query(X, workers=-1)
-        kx = dxo > args.prior_unseen_dist            # 관측 근방 샘플 제외(관측 항이 담당)
+        kx = dxo > args.prior_unseen_dist            # exclude samples near observations; the observation term owns those
         Xn_ = (X[kx] - center) / scale
-        kin = np.all(np.abs(Xn_) < 1.0, axis=1)      # 정규화 큐브 내부만
+        kin = np.all(np.abs(Xn_) < 1.0, axis=1)      # keep only what is inside the normalised cube
         PV = Xn_[kin].astype(np.float64)
         PS = (tgt[kx][kin] / scale).astype(np.float64)
-        print(f"[prior] 볼륨 distill 샘플 {len(PV)} (셸 {len(X)-len(Xu)} + uniform {len(Xu)}, "
+        print(f"[prior] volume distill samples {len(PV)} (shell {len(X)-len(Xu)} + uniform {len(Xu)}, "
               f"carve override {int(vx.sum())}, band={band}m trunc={trunc}m)")
 
-    # 정규화 좌표 — prior 주입 '후' 계산 ([FIX] stale Pn 버그 수정의 핵심)
+    # normalised coords, computed AFTER the prior injection (the stale-Pn fix)
     Pn = (P - center) / scale
     On = (O - center) / scale
 
     Wp = np.ones(len(P), np.float32)
     if n_extra and args.prior_weight != 1.0:
         Wp[len(P) - n_extra:] = args.prior_weight
-        print(f"prior 가중치 {args.prior_weight}: seen {len(P)-n_extra} : prior {n_extra}")
+        print(f"[prior] weight {args.prior_weight}: seen {len(P)-n_extra} : prior {n_extra}")
 
-    # 1c) 전체 씬 depth 기반 carve 샘플 (있으면 empty-ray보다 우선)
+    # 1c) carve samples from whole-scene depth; takes precedence over empty-ray
     CV = None
     if args.carve_depth_dir:
         CV = load_carve_points(args.carve_depth_dir, center, scale)
-        print(f"carve 샘플 {len(CV)}개 (전체 씬 depth, bbox 내부)")
+        print(f"[carve] {len(CV)} samples (whole-scene depth, inside the bbox)")
 
-    # 1d) [FIX Step4-D] carve/empty 샘플이 prior mesh 근방(s<=prior_gate)이면 제외 —
-    #     'SDF>=0 강제'와 'l_prior 음수 회귀'가 같은 voxel에서 싸우는 것을 차단.
+    # 1d) drop carve/empty samples near the prior mesh (s <= prior_gate), so "force SDF>=0"
+    #     and "regress l_prior negative" stop fighting over the same voxel.
     if _sd is not None:
         gate = args.prior_gate
         if CV is not None and len(CV):
             keep_cv = _sd(CV * scale + center) > gate
-            print(f"[prior] carve 게이트: {int(keep_cv.sum())}/{len(CV)} 유지 (s<={gate}m 제거)")
+            print(f"[prior] carve gate: kept {int(keep_cv.sum())}/{len(CV)} (dropped s<={gate}m)")
             CV = CV[keep_cv]
         if len(EOn):
-            # empty ray 를 chord 상 '고정 샘플'로 변환 → prior 근방 제외 → CV 병합, chord 경로 비활성
+            # turn empty rays into fixed samples on the chord, drop those near the prior,
+            # merge into CV and disable the chord path
             K = 4
             t0 = -(EOn * ED).sum(-1, keepdims=True)
             cp = EOn + ED * t0
@@ -1848,20 +1957,20 @@ def main():
             Xe = Xe[_sd(Xe * scale + center) > gate]
             CV = Xe if (CV is None or not len(CV)) else np.concatenate([CV, Xe])
             EOn = np.zeros((0, 3)); ED = np.zeros((0, 3))
-            print(f"[prior] empty-ray → 고정 샘플 {len(Xe)} (게이트 적용, chord 경로 비활성)")
+            print(f"[prior] empty-ray -> {len(Xe)} fixed samples (gated, chord path off)")
 
-    # 2) SDF 생성 — grid_fuse(결정적 융합, MLP 없음) 또는 IGR MLP 학습
+    # 2) build the SDF: grid_fuse (deterministic, no MLP) or an IGR MLP fit
     net = None
     if args.grid_fuse:
-        assert _sd is not None, "--grid_fuse 는 --prior_field 또는 --prior_mesh 필요"
-        assert VB, "--grid_fuse 는 뷰 버퍼 필요 (--prior_carve_views > 0, mask_dir 필수)"
+        assert _sd is not None, "--grid_fuse needs --prior_field or --prior_mesh"
+        assert VB, "--grid_fuse needs view buffers (--prior_carve_views > 0 and a mask_dir)"
         verts, faces = grid_fuse_tsdf(VB, _sd, center, scale, args, debug_pts=prior_dbg)
-        _lap("grid_fuse (TSDF 적분 + carve + marching cubes)")
+        _lap("grid_fuse (TSDF integration + carve + marching cubes)")
     else:
-        print("IGR SDF 학습 ...")
+        print("fitting the IGR SDF ...")
         net = train_sdf(Pn, N, On, EOn, ED, args, CV=CV, W=Wp, OBS=OBS, PV=PV, PS=PS)
 
-    # 3) 그리드 평가 + marching cubes — 타일 분할로 고해상도(whole-scene) 지원
+    # 3) grid evaluation + marching cubes; tiling supports high-resolution whole-scene runs
     G = args.grid if args.grid > 0 else int(round(2 * scale / args.voxel_size))
     G = int(min(G, args.max_grid))
     from skimage.measure import marching_cubes
@@ -1871,9 +1980,9 @@ def main():
     step = 2.0 / (G - 1)
 
     if net is None:
-        pass                                    # grid_fuse 경로: verts/faces 이미 생성됨
+        pass                                    # grid_fuse path: verts/faces already built
     elif args.tile <= 0 or G <= args.tile:
-        print(f"SDF 그리드 평가 (G={G}, voxel≈{2*scale/(G-1):.4f} world) + marching cubes ...")
+        print(f"grid evaluation (G={G}, voxel~{2*scale/(G-1):.4f} world) + marching cubes ...")
         vol = np.empty((G, G, G), np.float32)
         with torch.no_grad():
             gx, gy = np.meshgrid(lin, lin, indexing="ij")
@@ -1884,11 +1993,11 @@ def main():
         verts, faces, _, _ = marching_cubes(vol, level=0.0, spacing=(step,) * 3)
         verts = (verts - 1.0) * scale + center
     else:
-        # ── 타일 marching: G를 tile 크기 블록으로 쪼개 각각 marching 후 병합 ──
-        #    블록 경계는 1복셀 오버랩으로 이어붙여 이음새 없음. 메모리 O(tile^3).
+        # Tiled marching: split G into blocks, march each, then merge. Blocks overlap by one
+        # voxel so there is no seam. Memory is O(tile^3).
         T = int(args.tile)
         nb = int(np.ceil((G - 1) / (T - 1)))
-        print(f"SDF 타일 marching (G={G}, voxel≈{2*scale/(G-1):.4f} world, "
+        print(f"tiled marching (G={G}, voxel~{2*scale/(G-1):.4f} world, "
               f"tile={T}, blocks={nb}^3={nb**3}) ...")
         vs_all, fs_all, voff = [], [], 0
         with torch.no_grad():
@@ -1907,15 +2016,15 @@ def main():
                             pts = np.stack([gx, gy, np.full_like(gx, zv)], -1).reshape(-1, 3)
                             sub[:, :, kk] = net(torch.tensor(pts, dtype=torch.float32, device="cuda")
                                                 ).cpu().numpy().reshape(len(xs), len(ys))
-                        if sub.min() > 0 or sub.max() < 0:      # zero-crossing 없는 블록 skip
+                        if sub.min() > 0 or sub.max() < 0:      # skip blocks with no zero crossing
                             continue
                         v, f, _, _ = marching_cubes(sub, level=0.0, spacing=(step,) * 3)
-                        v = v + np.array([xs[0], ys[0], zs[0]]) + 1.0   # 블록 원점 → [-1,1] 좌표
+                        v = v + np.array([xs[0], ys[0], zs[0]]) + 1.0   # block origin -> [-1,1] coords
                         vs_all.append((v - 1.0) * scale + center)
                         fs_all.append(f + voff)
                         voff += len(v)
-                print(f"  블록 {bi+1}/{nb} 행 완료 (누적 verts {voff})")
-        assert vs_all, "zero-crossing 블록 없음 — 학습/스케일 확인"
+                print(f"  block row {bi+1}/{nb} done ({voff} verts so far)")
+        assert vs_all, "no block contains a zero crossing -- check the fit and the scale"
         verts = np.concatenate(vs_all); faces = np.concatenate(fs_all)
 
     mesh = o3d.geometry.TriangleMesh()
@@ -1930,10 +2039,10 @@ def main():
         mesh.remove_vertices_by_mask(far)
         mesh.remove_unreferenced_vertices()
         mesh.remove_degenerate_triangles()
-        print(f"거리 트리밍(d>{args.mask_dist}): {int(far.sum())}/{len(verts)} 정점 제거")
+        print(f"[trim] d>{args.mask_dist}: removed {int(far.sum())}/{len(verts)} vertices")
 
-    # 색: [1] 생성 색을 관측 색 통계에 정합(톤 차이 제거)
-    #     [2] 접합부에서 관측색↔생성색 거리 가중 블렌드(하드 컷 제거)
+    # Colour: 1) match generated colour statistics to observed ones (removes the tone gap)
+    #         2) distance-weighted blend across the seam (removes the hard cut)
     verts2 = np.asarray(mesh.vertices)
     Cw = np.clip(C, 0, 1).copy()
     n_obs = int(OBS.sum()); n_pri = int((~OBS).sum())
@@ -1941,42 +2050,42 @@ def main():
         mo, so = Cw[OBS].mean(0), Cw[OBS].std(0) + 1e-6
         mp, sp = Cw[~OBS].mean(0), Cw[~OBS].std(0) + 1e-6
         Cw[~OBS] = np.clip((Cw[~OBS] - mp) / sp * so + mo, 0, 1)
-        print(f"[색] 생성 색 통계 정합: mean {np.round(mp,3)} → {np.round(mo,3)}")
+        print(f"[colour] matched statistics: mean {np.round(mp,3)} -> {np.round(mo,3)}")
     if args.color_blend_ramp > 0 and n_obs > 100 and n_pri > 0:
         t_obs = cKDTree(P[OBS]); Cobs = Cw[OBS]
         d_o, i_o = t_obs.query(verts2, workers=-1)
         _, i_a = tree.query(verts2, workers=-1)
         w = np.clip(1.0 - d_o / args.color_blend_ramp, 0, 1)[:, None]
         col = w * Cobs[i_o] + (1 - w) * Cw[i_a]
-        print(f"[색] 접합부 블렌드 ramp {args.color_blend_ramp*1000:.0f}mm "
-              f"(전이 정점 {int(((w > 0) & (w < 1)).sum())}/{len(verts2)})")
+        print(f"[colour] seam blend ramp {args.color_blend_ramp*1000:.0f}mm "
+              f"({int(((w > 0) & (w < 1)).sum())}/{len(verts2)} vertices in transition)")
     else:
         _, ni = tree.query(verts2, workers=-1)
         col = Cw[ni]
     mesh.vertex_colors = o3d.utility.Vector3dVector(np.clip(col, 0, 1))
     mesh.compute_vertex_normals()
 
-    # 5) safe_post_process_mesh(num_cluster) — TSDF 경로와 동일 로직(클램프 추가)
+    # 5) safe_post_process_mesh(num_cluster): same logic as the TSDF path, plus the clamp
 
     out = os.path.expanduser(args.out)
     if not out:
         train_dir = os.path.join(args.model_path, "train", f"ours_{scene.loaded_iter}")
         os.makedirs(train_dir, exist_ok=True)
         out = os.path.join(train_dir, "sdf_fuse.ply")
-    # [FIX] Open3D 는 확장자로 포맷 판별 → 확장자 없음/미지원이면 "unknown file extension"
-    # 경고만 내고 조용히 실패. 자동 교정 + 저장 성공 여부 검증(실패 시 즉시 중단).
+    # Open3D picks the format from the extension: a missing or unsupported one only warns
+    # ("unknown file extension") and fails silently. Fix it up and verify the write.
     if os.path.splitext(out)[1].lower() not in (".ply", ".obj", ".stl", ".off", ".gltf", ".glb"):
-        print(f"[경고] 출력 확장자 없음/미지원 ('{out}') → '.ply' 부착")
+        print(f"[warn] missing or unsupported output extension ('{out}') -> appending '.ply'")
         out = out + ".ply"
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
     ok = o3d.io.write_triangle_mesh(out, mesh)
-    assert ok, f"[중단] 메쉬 저장 실패: {os.path.abspath(out)}"
+    assert ok, f"[abort] failed to write mesh: {os.path.abspath(out)}"
     print(f"mesh saved at {os.path.abspath(out)}  verts {len(verts)} faces {len(faces)}")
 
     mesh_post = safe_post_process_mesh(mesh, cluster_to_keep=args.num_cluster)
     out_post = os.path.splitext(out)[0] + "_post.ply"
     ok = o3d.io.write_triangle_mesh(out_post, mesh_post)
-    assert ok, f"[중단] post 메쉬 저장 실패: {os.path.abspath(out_post)}"
+    assert ok, f"[abort] failed to write post-processed mesh: {os.path.abspath(out_post)}"
     print(f"mesh post processed saved at {os.path.abspath(out_post)}")
 
 
