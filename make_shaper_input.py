@@ -213,6 +213,12 @@ def main():
                     help="[관측 필터] depth 폴더. 지정 시 '관측이 확인된 점'만 조건으로 준다 — "
                          "recon 의 미관측 영역 쓰레기가 생성물을 오염시키는 것을 막는다")
     ap.add_argument("--depth_scale", type=float, default=6553.5)
+    ap.add_argument("--n_pool", type=int, default=200000,
+                    help="points sampled from the mesh BEFORE the observation filter. Fixed "
+                         "so --n_points does not move the object frame")
+    ap.add_argument("--frame_pct", type=float, default=0.5,
+                    help="percentile used for the object bbox (0 = raw min/max). The frame "
+                         "sets ShapeR's normalisation, so one floater costs real resolution")
     ap.add_argument("--seen_margin", type=float, default=0.02,
                     help="관측 판정 허용오차(m): |z - depth| < margin")
     ap.add_argument("--seen_min_views", type=int, default=2,
@@ -236,34 +242,30 @@ def main():
         _seeded = True
     except Exception:
         pass
+    # Sample a FIXED, larger pool, filter it, then subsample to --n_points.
+    #   Sampling n_points straight off the mesh spends the budget on junk that the
+    #   observation filter then deletes, leaving far fewer points on the real surface.
+    #   The pool size is fixed so that changing --n_points does not move the object frame,
+    #   which would break ensemble averaging across runs.
+    n_pool = max(args.n_pool, args.n_points)
     try:
-        pc = m.sample_points_uniformly(args.n_points, seed=args.seed)
+        pc = m.sample_points_uniformly(n_pool, seed=args.seed)
         _seeded = True
     except TypeError:
-        pc = m.sample_points_uniformly(args.n_points)
+        pc = m.sample_points_uniformly(n_pool)
     P_w = np.asarray(pc.points, np.float64)
-    print(f"[points] {len(P_w)}점 (world, seed={args.seed}"
-          + ("" if _seeded else ", ⚠ 시드 미지원 Open3D — 실행마다 달라짐") + ")")
+    print(f"[points] pool {len(P_w)} (world, seed={args.seed}"
+          + ("" if _seeded else ", WARN this Open3D ignores the seed; runs will differ")
+          + ")")
 
-    # ---- 2) 오브젝트 프레임: 중력 정렬 + AABB 중심 ----
-    # centroid 대신 AABB 중심 — 절반 미관측 시 centroid 는 관측 쪽으로 크게 치우침.
-    # ※ AABB 는 '샘플 점'이 아니라 '메쉬 정점'에서 계산한다 — 그래야 --n_points 를 바꿔도
-    #   오브젝트 프레임(center/bounds/scale)이 동일해져 앙상블 평균이 유효하다.
-    V_w = np.asarray(m.vertices, np.float64)
-    lo, hi = V_w.min(0), V_w.max(0)
-    center = (lo + hi) / 2
+    # ---- 2) object frame: gravity aligned, AABB centre ----
     R_align = np.eye(3)
-    if args.world_up != "z":                          # ShapeR 은 z-up 오브젝트 프레임 가정
+    if args.world_up != "z":                          # ShapeR assumes a z-up object frame
         ax = {"x": 0, "y": 1}[args.world_up]
         perm = [0, 1, 2]; perm[ax], perm[2] = perm[2], perm[ax]
         R_align = np.eye(3)[perm]
-    bounds = np.abs((R_align @ (V_w - center).T).T).max(0) * args.bounds_margin
-    scale = 0.9 / bounds.max()
-    T_model_world = np.eye(4)                          # world → model
-    T_model_world[:3, :3] = R_align
-    T_model_world[:3, 3] = -R_align @ center
 
-    # ---- 3) 카메라 / 뷰 ----
+    # ---- 3) cameras / views ----
     cams = {c["stem"]: c for c in read_colmap(args.colmap)}
     if args.stems and os.path.exists(os.path.expanduser(args.stems)):
         stems = [l.strip() for l in open(os.path.expanduser(args.stems)) if l.strip()]
@@ -272,17 +274,47 @@ def main():
     stems = [s for s in stems if s in cams and find_image(args.images, s)]
     assert stems, "사용 가능한 뷰 없음 — --images / --stems 확인"
 
-    # ---- 2b) 관측 필터 (프레임은 메쉬 정점 기준이라 필터와 무관하게 고정) ----
+    # ---- 3b) observation filter, THEN the frame ----
+    # The frame used to be computed from the raw mesh vertices, before this filter. A
+    # single floater a metre away then doubled `bounds`, halved `scale`, and the object
+    # shrank inside ShapeR's normalised cube -- so the generation lost resolution exactly
+    # on the objects whose reconstruction was worst. Measured raw/robust bbox ratios on the
+    # scene slices: obj14 2.73, obj28 1.69, obj21 1.62, obj12 1.52, i.e. scale was 1.5-2.7x
+    # too small there. Derive the frame from the points that survive the filter instead,
+    # and use a percentile bbox so one stray point cannot set it.
     F_m = np.zeros((0, 3), np.float32)
     if args.depth_dir:
         P_w = filter_observed(P_w, stems, cams, args)
-        if args.free_points > 0:
-            F_m = sample_free_points(stems, cams, center, R_align, bounds, args,
-                                     n_target=args.free_points)
+
+    q = args.frame_pct
+    lo, hi = np.percentile(P_w, q, axis=0), np.percentile(P_w, 100 - q, axis=0)
+    center = (lo + hi) / 2
+    keep = np.all((P_w >= lo) & (P_w <= hi), axis=1)
+    ref = P_w[keep] if keep.sum() >= 200 else P_w
+    bounds = np.abs((R_align @ (ref - center).T).T).max(0) * args.bounds_margin
+    scale = 0.9 / bounds.max()
+    T_model_world = np.eye(4)                          # world -> model
+    T_model_world[:3, :3] = R_align
+    T_model_world[:3, 3] = -R_align @ center
+
+    V_w = np.asarray(m.vertices, np.float64)
+    raw_b = np.abs((R_align @ (V_w - center).T).T).max(0) * args.bounds_margin
+    if args.depth_dir and args.free_points > 0:
+        F_m = sample_free_points(stems, cams, center, R_align, bounds, args,
+                                 n_target=args.free_points)
+    if len(P_w) > args.n_points:                       # budget now lands on real surface
+        rng = np.random.default_rng(args.seed)
+        P_w = P_w[rng.choice(len(P_w), args.n_points, replace=False)]
+    print(f"[points] conditioning on {len(P_w)} observed points "
+          f"(target {args.n_points})")
+
     P_m = (R_align @ (P_w - center).T).T
     clipped = int((np.abs(P_m * scale) > 1.0).any(1).sum())
     print(f"[frame] center={np.round(center,3)}  half-extent={np.round(bounds,3)}m  "
-          f"scale={scale:.3f}  (정규화 후 클리핑될 점 {clipped})")
+          f"scale={scale:.3f}  (points clipped after normalisation: {clipped})")
+    print(f"[frame] raw-mesh half-extent {np.round(raw_b,3)}m  "
+          f"raw/robust {raw_b.max()/bounds.max():.2f}x"
+          + ("   <- junk was setting the frame" if raw_b.max() / bounds.max() > 1.3 else ""))
     if len(stems) > args.n_views:                      # 균등 간격 서브샘플
         idx = np.unique(np.linspace(0, len(stems) - 1, args.n_views).round().astype(int))
         stems = [stems[i] for i in idx]
