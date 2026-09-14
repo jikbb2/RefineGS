@@ -306,9 +306,17 @@ def collect_oriented_points(scene, gaussians, pipe, background, args, mask_dir=N
     P_all, N_all, C_all, O_all = [], [], [], []
     EO_all, ED_all = [], []
     VB = []  # view buffers (depth+mask). NOTE: grid_fuse builds the OBSERVED TSDF from these too
-    n_tr = sum(1 for _, u in views if u)
     n_carve_views = getattr(args, "prior_carve_views", 0)
-    keep_every = max(1, n_tr // max(n_carve_views, 1)) if n_carve_views > 0 else 0
+    # Keep every masked view, then subsample uniformly at the end.
+    #   A fixed stride computed up front is wrong whenever only some training views carry a
+    #   mask: the stride divides by ALL training views while only masked ones advance the
+    #   counter, so the buffer count drops by the mask coverage ratio. Measured on a scene
+    #   model with per-object masks: obj6 554/2000 masked -> 42 buffers instead of 184, and
+    #   obj31 110/2000 -> 8, which then tripped the observation gate at 0.3% observed
+    #   voxels. The list is halved whenever it exceeds 4x the target, so memory stays
+    #   bounded regardless of how many views are masked.
+    keep_all = n_carve_views > 0
+    vb_cap = 4 * max(n_carve_views, 1)
     ti = 0
     n_masked_views = 0
     n_skipped = 0
@@ -343,25 +351,26 @@ def collect_oriented_points(scene, gaussians, pipe, background, args, mask_dir=N
                 n_skipped += 1
                 continue          # skip training views without a mask (keeps whole-scene points out)
 
-        # store depth+mask buffers for evenly spaced views
-        if use_mask and keep_every and m_obj is not None:
+        # store depth+mask buffers; subsampled to prior_carve_views after the loop
+        if use_mask and keep_all and m_obj is not None:
             ti += 1
-            if ti % keep_every == 0:
-                ds = max(1, int(getattr(args, "prior_carve_ds", 1)))
-                dbuf = torch.where(alpha > args.alpha_thr, depth,
-                                   torch.zeros_like(depth))[::ds, ::ds].cpu().numpy()
-                mbuf = m_obj[::ds, ::ds].cpu().numpy()
-                w2c = extrinsic.cpu().numpy()
-                b = {"R": w2c[:3, :3], "t": w2c[:3, 3],
-                     "fx": fx / ds, "fy": fy / ds, "cx": cx / ds, "cy": cy / ds,
-                     "W": dbuf.shape[1], "H": dbuf.shape[0],
-                     "depth": dbuf, "mask": mbuf}
-                if getattr(args, "gt_depth_dir", ""):
-                    dg = load_gt_depth(args.gt_depth_dir, cam.image_name, H, W,
-                                       args.gt_depth_scale)
-                    if dg is not None:
-                        b["dgt"] = dg[::ds, ::ds]
-                VB.append(b)
+            ds = max(1, int(getattr(args, "prior_carve_ds", 1)))
+            dbuf = torch.where(alpha > args.alpha_thr, depth,
+                               torch.zeros_like(depth))[::ds, ::ds].cpu().numpy()
+            mbuf = m_obj[::ds, ::ds].cpu().numpy()
+            w2c = extrinsic.cpu().numpy()
+            b = {"R": w2c[:3, :3], "t": w2c[:3, 3],
+                 "fx": fx / ds, "fy": fy / ds, "cx": cx / ds, "cy": cy / ds,
+                 "W": dbuf.shape[1], "H": dbuf.shape[0],
+                 "depth": dbuf, "mask": mbuf}
+            if getattr(args, "gt_depth_dir", ""):
+                dg = load_gt_depth(args.gt_depth_dir, cam.image_name, H, W,
+                                   args.gt_depth_scale)
+                if dg is not None:
+                    b["dgt"] = dg[::ds, ::ds]
+            VB.append(b)
+            if len(VB) > vb_cap:                # halve, coverage stays uniform
+                VB = VB[::2]
         if not use_mask and extra_masks is not None and cam.image_name in extra_masks:
             valid &= extra_masks[cam.image_name]   # extra poses: label-buffer object mask
         pts_w = pts_w[valid]
@@ -406,7 +415,11 @@ def collect_oriented_points(scene, gaussians, pipe, background, args, mask_dir=N
     O = torch.cat(O_all).numpy().astype(np.float64)
     EO = torch.cat(EO_all).numpy().astype(np.float64) if EO_all else np.zeros((0, 3))
     ED = torch.cat(ED_all).numpy().astype(np.float64) if ED_all else np.zeros((0, 3))
-    print(f"[rays] {len(EO)} empty rays, {len(VB)} view buffers")
+    if keep_all and len(VB) > n_carve_views:
+        sel = np.linspace(0, len(VB) - 1, n_carve_views).round().astype(int)
+        VB = [VB[i] for i in np.unique(sel)]
+    print(f"[rays] {len(EO)} empty rays, {len(VB)} view buffers "
+          f"(from {ti} masked views, target {n_carve_views})")
     return P, N, C, O, EO, ED, VB
 
 
