@@ -46,7 +46,7 @@ echo "=== grid_wcap A/B  obj${GID}  wcaps=${WCAPS} ==="
 
 for W in ${WCAPS}; do
   NAME="wcap${W}"
-  echo "  [${NAME}]  (tail -f ${LOGDIR}/ab_${NAME}.log)"
+  echo "  [${NAME}]"
   python sdf_distill_depth.py -m "${MDIR}" --iteration ${ITER} \
     --prior_field "${NPZ}" --gt_depth_dir "${GTD}" \
     --grid_wcap "${W}" \

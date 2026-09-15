@@ -44,7 +44,7 @@ for MDIR in "${OBJ}"/*/; do
     --sdf_trunc ${SDF_TRUNC} --num_cluster ${NUM_CLUSTER} \
     > "${MDIR}/mesh.log" 2>&1 \
     && ok=$((ok+1)) \
-    || { echo "    fail (tail ${MDIR}/mesh.log)"; tail -5 "${MDIR}/mesh.log"; ng=$((ng+1)); }
+    || { echo "    FAILED"; tail -5 "${MDIR}/mesh.log" | sed 's/^/      /'; ng=$((ng+1)); }
 done
 
 echo ""

@@ -49,7 +49,7 @@ run_arm () {                       # $1=이름  $2=npz stem  $3=prior_sigma_w
   local NAME=$1 STEM=$2 SIGW=$3
   local NPZ=${PRIOR}/${STEM}.npz
   [ -f "${NPZ}" ] || { echo "  [skip ${NAME}] ${NPZ} 없음"; return 1; }
-  echo "  [${NAME}] npz=${STEM} sigma_w=${SIGW}  (tail -f ${LOGDIR}/ab_${NAME}.log)"
+  echo "  [${NAME}] npz=${STEM} sigma_w=${SIGW}"
 
   python sdf_distill_depth.py -m "${MDIR}" --iteration ${ITER} \
     --prior_field "${NPZ}" --prior_sigma_w "${SIGW}" \
