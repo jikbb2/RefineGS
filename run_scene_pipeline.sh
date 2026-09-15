@@ -30,6 +30,8 @@ LABEL_DIR=${LABEL_DIR:-${DATA}/labels_scene}
 CSV=${CSV:-$HOME/prior/_scene_reg.csv}
 FROM=${FROM:-vote}                 # vote | extract | mesh | pkl | field | fuse
 CLEAN=${CLEAN:-0}
+GT_MESH=${GT_MESH:-$HOME/room_0/habitat/mesh_semantic.ply}
+GT_INFO=${GT_INFO:-$HOME/room_0/habitat/info_semantic.json}
 SHAPER_DIR=${SHAPER_DIR:-$HOME/ShapeR}
 PKL_SUBDIR=${PKL_SUBDIR:-$(basename "${OBJ}")}   # keeps pkls apart from other pipelines
 # Extraction filters, off by default. Turn them on only as a separate experiment, so the
@@ -59,7 +61,7 @@ cd "${ROOT}" || exit 1
 if [ "${CLEAN}" = "1" ]; then
   echo ""; echo "=== clean: removing outputs from '${FROM}' onward ==="
   stage_at vote    && { echo "  ${SCENE_MODEL}/vote"; rm -rf "${SCENE_MODEL}/vote"; }
-  stage_at extract && { echo "  ${OBJ}";              rm -rf "${OBJ}"; }
+  stage_at extract && { echo "  ${OBJ}  (incl. names.tsv)"; rm -rf "${OBJ}"; }
   # 'mesh' only re-meshes; extract already removed the dirs when it ran
   if stage_at mesh && [ -d "${OBJ}" ]; then
     echo "  ${OBJ}/*/train/ours_${ITER}/fuse*.ply"
@@ -93,6 +95,15 @@ if stage_at extract && [ ! -f "${OBJ}/objects.json" ]; then
     --out "${OBJ}" --iter "${ITER}" ${EXTRACT_EXTRA} || exit 1
 fi
 
+# Name the objects against the GT semantic mesh. Runs on the sliced gaussians, so it fits
+# between extract and mesh. Gives readable logs and, more usefully, real ShapeR captions:
+# without it every object is generated from "a 3D object in a room".
+if stage_at extract && [ ! -f "${OBJ}/names.tsv" ] && [ -f "${GT_MESH}" ]; then
+  echo ""; echo "=== name: match each object to a GT class ==="
+  python name_objects.py --gt_mesh "${GT_MESH}" --gt_info "${GT_INFO}" \
+    --root "${OBJ}" --iter "${ITER}" || true
+fi
+
 if stage_at mesh; then
   echo ""; echo "=== mesh: TSDF per object (the A side) ==="
   OBJ="${OBJ}" DATA="${DATA}/masks" IT="${ITER}" bash mesh_voted_objects.sh
@@ -102,7 +113,8 @@ for ph in pkl field fuse; do
   stage_at "${ph}" || continue
   echo ""; echo "=== ${ph} ==="
   PRIOR="${PRIOR}" ITER="${ITER}" OUT="${OBJ}" CSV="${CSV}" PHASE="${ph}" \
-    PKL_SUBDIR="${PKL_SUBDIR}" bash run_field_fusion_batch.sh || exit 1
+    PKL_SUBDIR="${PKL_SUBDIR}" CAPTIONS="${OBJ}/names.tsv" \
+    bash run_field_fusion_batch.sh || exit 1
 done
 
 echo ""

@@ -98,6 +98,8 @@ echo "  n_points=${NPTS} seed=${SEED} grid=${GRID} cfg=${CFG} ensemble=${ENSEMBL
 [ -n "${FUSE_EXTRA}" ] && echo "  FUSE_EXTRA=${FUSE_EXTRA}"
 [ -f "${CAPTIONS}" ] || echo "  no caption file (${CAPTIONS}); using the default text"
 
+name_of() { [ -f "${CAPTIONS}" ] && awk -F'\t' -v g="$1" '$1==g{print $2; exit}' "${CAPTIONS}"; }
+
 caption_of() {
   local g=$1 c
   if [ -f "${CAPTIONS}" ]; then
@@ -109,6 +111,25 @@ caption_of() {
 
 note_fail() { echo "$1,$2,$3" >> "${FAILCSV}"; }
 echo "gid,stage,detail" > "${FAILCSV}"        # reset, so old failures cannot confuse
+
+# Long stages write to a log file, so the terminal shows nothing for minutes and it is
+# impossible to tell a slow run from a hung one. Run in the background and keep one line
+# updated with the elapsed time and the log's last line.
+PROGRESS_EVERY=${PROGRESS_EVERY:-5}
+run_progress() {                              # run_progress LOG LABEL -- cmd...
+  local log=$1 label=$2; shift 2
+  "$@" > "${log}" 2>&1 &
+  local pid=$! t0=$SECONDS cur
+  while kill -0 "${pid}" 2>/dev/null; do
+    sleep "${PROGRESS_EVERY}"
+    cur=$(tail -1 "${log}" 2>/dev/null | tr -d '\r' | tr -cd '\11\12\40-\176' | cut -c1-64)
+    printf "\r    %-18s %4ds  %-64s" "${label}" "$((SECONDS - t0))" "${cur}"
+  done
+  wait "${pid}"; local rc=$?
+  printf "\r    %-18s %4ds  %-64s\n" "${label}" "$((SECONDS - t0))" \
+         "$([ ${rc} -eq 0 ] && echo ok || echo FAILED)"
+  return ${rc}
+}
 
 show_tail() {                                 # failures otherwise hide in the log file
   local f=$1 n=${2:-15}
@@ -170,15 +191,17 @@ if [ "${PHASE}" = "field" ] || [ "${PHASE}" = "all" ]; then
          $([ "${ENSEMBLE}" -gt 1 ] && echo --ensemble ${ENSEMBLE} --combine ${COMBINE}) \
          $([ "${GUIDE_FREE_W}" != "0" ] && echo --guide_free_w ${GUIDE_FREE_W}) \
          --out '${NPZ}'"
+    LBL="[${gid}] field$([ "${ENSEMBLE}" -gt 1 ] && echo " x${ENSEMBLE}")"
     if [ "${SHAPER_DIRECT}" = "1" ]; then
-      bash -c "${CMD}" > "${LOGDIR}/field_${gid}.log" 2>&1
+      run_progress "${LOGDIR}/field_${gid}.log" "${LBL}" bash -c "${CMD}"
     else
       CONDA_BASE=$(conda info --base 2>/dev/null)
       if [ -n "${CONDA_BASE}" ] && [ -f "${CONDA_BASE}/etc/profile.d/conda.sh" ]; then
-        bash -c "source '${CONDA_BASE}/etc/profile.d/conda.sh' && conda activate '${SHAPER_ENV}' && ${CMD}" \
-          > "${LOGDIR}/field_${gid}.log" 2>&1
+        run_progress "${LOGDIR}/field_${gid}.log" "${LBL}" bash -c \
+          "source '${CONDA_BASE}/etc/profile.d/conda.sh' && conda activate '${SHAPER_ENV}' && ${CMD}"
       else
-        conda run -n "${SHAPER_ENV}" bash -c "${CMD}" > "${LOGDIR}/field_${gid}.log" 2>&1
+        run_progress "${LOGDIR}/field_${gid}.log" "${LBL}" \
+          conda run -n "${SHAPER_ENV}" bash -c "${CMD}"
       fi
     fi
     [ -f "${NPZ}" ] || { echo "  [${gid}] field FAILED"; note_fail "${gid}" field "shaper_field";
@@ -197,13 +220,12 @@ if [ "${PHASE}" = "fuse" ] || [ "${PHASE}" = "all" ]; then
     STEMS=${STEMS_DIR}/${gid}.txt
     [ -f "${NPZ}" ] || { echo "  [${gid}] no field"; note_fail "${gid}" fuse "no field";
                          ng=$((ng+1)); continue; }
-    echo "  [${gid}] fusing   (tail -f ${LOGDIR}/fuse_${gid}.log)"
-    python sdf_distill_depth.py -m "${MDIR}" --iteration ${ITER} \
+    run_progress "${LOGDIR}/fuse_${gid}.log" "[${gid}] $(name_of "${gid}")" \
+      python sdf_distill_depth.py -m "${MDIR}" --iteration ${ITER} \
       --prior_field "${NPZ}" --gt_depth_dir "${GTD}" \
       --passthrough_mesh "${OUTD}/fuse_post.ply" \
       --out "${OUTD}/fused_field.ply" ${FUSE_EXTRA} \
-      > "${LOGDIR}/fuse_${gid}.log" 2>&1 \
-      || { echo "    fusion FAILED"; note_fail "${gid}" fuse "sdf_distill";
+      || { note_fail "${gid}" fuse "sdf_distill";
            show_tail "${LOGDIR}/fuse_${gid}.log" 20; ng=$((ng+1)); continue; }
     python eval_seen_unseen.py --gt_mesh "${GT_MESH}" \
       --recon "${OUTD}/fuse_post.ply" --recon2 "${OUTD}/fused_field_post.ply" \

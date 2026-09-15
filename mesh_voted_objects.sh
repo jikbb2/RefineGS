@@ -23,6 +23,9 @@ SDF_TRUNC=${SDF_TRUNC:-0.02}
 NUM_CLUSTER=${NUM_CLUSTER:-1}
 
 cd "${ROOT}" || exit 1
+# names.tsv (name_objects.py) makes the log readable: "[6] table" instead of "[6]"
+NAMES=${NAMES:-${OBJ}/names.tsv}
+name_of() { [ -f "${NAMES}" ] && awk -F'\t' -v g="$1" '$1==g{print $2; exit}' "${NAMES}"; }
 ok=0; ng=0; skip=0
 for MDIR in "${OBJ}"/*/; do
   gid=$(basename "${MDIR}")
@@ -35,7 +38,7 @@ for MDIR in "${OBJ}"/*/; do
   D="${DATA}/${gid}"
   [ -d "${D}/masks" ] || { echo "  [skip ${gid}] no ${D}/masks"; skip=$((skip+1)); continue; }
 
-  echo "  [${gid}] mesh"
+  echo "  [${gid}] $(name_of "${gid}")"
   python render.py -m "${MDIR}" -s "${D}" --iteration ${IT} --skip_test \
     --depth_ratio 1 --depth_trunc ${DEPTH_TRUNC} --voxel_size ${VOXEL} \
     --sdf_trunc ${SDF_TRUNC} --num_cluster ${NUM_CLUSTER} \
@@ -46,4 +49,4 @@ done
 
 echo ""
 echo "meshed ${ok}, failed ${ng}, skipped ${skip}"
-echo "next:  ITER=${IT} OUT=${OBJ} bash run_field_fusion_batch.sh"
+

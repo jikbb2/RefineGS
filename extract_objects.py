@@ -212,8 +212,7 @@ def main():
         print("\nskipped: " + ", ".join(f"{c}({n})" for c, n, _ in skipped))
     json.dump({"dirs": {name: c for c, name, _, _ in kept}, "iter": args.iter},
               open(os.path.join(od, "objects.json"), "w"), indent=1)
-    print(f"\nnext: build fuse_post.ply for each dir, then run the fusion batch "
-          f"with OUT={od}")
+
 
 
 if __name__ == "__main__":

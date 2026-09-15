@@ -1,27 +1,25 @@
 #!/usr/bin/env python3
-"""RefineGS 객체 → ShapeR 입력 pkl 변환기.
+"""RefineGS object -> ShapeR input pkl.
 
-ShapeR(Meta FAIR, arXiv 2601.11514)은 posed multi-view + **metric sparse point cloud**를
-조건으로 SDF를 생성한다. 우리가 겪은 세 문제를 동시에 겨냥한다:
-  - shape 오차: 포인트 클라우드가 1급 조건 → 생성 형상이 관측 기하에 앵커됨
-  - 필드 추출 해킹: SDF 디코더 출력 → sign-fix / shell_delta / flood-fill 전부 불필요
-  - 접합부 끊김: 관측점 근처를 지나도록 조건화 → seam 감소
+ShapeR (Meta FAIR, arXiv 2601.11514) conditions on posed multi-view images plus a METRIC
+sparse point cloud, which anchors the generated shape to the observed geometry, outputs an
+SDF directly (no sign-fix / shell_delta / flood-fill), and keeps the seam attached.
 
-스키마는 ShapeR `dataset/shaper_dataset.py` + `dataset/image_processor.py` 를 읽고 매핑.
-필수 키(SLAM 경로, strategy="cluster"):
-  points_model            (N,3) torch  오브젝트 프레임 metric 포인트
-  bounds                  (3,)  torch  half-extent → scale = 0.9/max(bounds)
-  inv_dist_std, dist_std  (N,)  torch  포인트별 불확실성(작을수록 신뢰)
-  image_data              list[bytes]  인코딩된 이미지(PIL 로 열림, "L" 변환)
-  Ts_camera_model         list[(4,4) torch]  model→camera
-  camera_params           list[(3,3)]  ※ 핀홀 K. 원본은 Fisheye624 파라미터라
-                                        infer_shape_pinhole.py 의 패치가 필요
-  object_point_projections list[(M,2) torch]  객체 포인트의 uv (crop 기준)
-  visible_points_model    list[(M,3)]  뷰별 가시 포인트(뷰 선택 점수)
-  T_model_world           (4,4) torch  world→model (--do_transform_to_world 용)
+Schema from ShapeR `dataset/shaper_dataset.py` and `dataset/image_processor.py`.
+Required keys (SLAM path, strategy="cluster"):
+  points_model            (N,3) torch  metric points in the object frame
+  bounds                  (3,)  torch  half-extent -> scale = 0.9/max(bounds)
+  inv_dist_std, dist_std  (N,)  torch  per-point uncertainty (smaller = trusted more)
+  image_data              list[bytes]  encoded images (opened by PIL, converted to "L")
+  Ts_camera_model         list[(4,4) torch]  model->camera
+  camera_params           list[(3,3)]  pinhole K. Upstream expects Fisheye624, so
+                                        infer_shape_pinhole.py patches this
+  object_point_projections list[(M,2) torch]  uv of the object points, in crop coords
+  visible_points_model    list[(M,3)]  visible points per view (drives view selection)
+  T_model_world           (4,4) torch  world -> model (for --do_transform_to_world)
   caption / category      str
-선택:
-  mesh_vertices, mesh_faces  GT (평가용)
+Optional:
+  mesh_vertices, mesh_faces  GT, for evaluation only
 
   python make_shaper_input.py --gid 1 \
     --recon output/replica_room0_v2/refinegs_full/1/train/ours_7000/fuse_post.ply \
@@ -44,7 +42,7 @@ from PIL import Image
 
 try:
     from warp_gt_to_pose import read_colmap, cam_center
-except Exception:                                     # repo 밖에서 실행 시
+except Exception:                                     # running outside the repo
     read_colmap = None
 
     def cam_center(R, t):
@@ -63,12 +61,12 @@ def load_mask(masks_root, gid, stem):
     if a.max() <= 1:
         return a > 0
     if (a == 188).any():
-        return a == 188                               # amodal 규약: 188=visible
+        return a == 188                               # amodal convention: 188 = visible
     return a > 127
 
 
 def load_depth_map(depth_dir, stem, scale):
-    """stem → depth(meters). 이름 규약: frameNNNN→depthNNNN / 동일이름 / _depth."""
+    """stem -> depth in metres. Naming: frameNNNN->depthNNNN, same name, or _depth."""
     for c in (stem.replace("frame", "depth"), stem, stem + "_depth"):
         for ext in (".png", ".npy"):
             p = os.path.join(os.path.expanduser(depth_dir), c + ext)
@@ -80,15 +78,8 @@ def load_depth_map(depth_dir, stem, scale):
     return None
 
 
-def filter_observed(P_w, stems, cams, args):
-    """관측이 확인된 점만 남긴다.
-
-    ShapeR 는 포인트를 geometric anchor 로 '충실히' 따른다. 그런데 recon(fuse_post.ply)
-    은 미관측 영역에 부정확한 덩어리·floater 를 갖고 있어, 그대로 주면 생성물이 그
-    퍼진 형태를 재현한다(obj6: 다리가 성긴 그물로 생성됨).
-    → 각 점이 '어느 뷰에서 실제로 관측된 표면'인지(|z-depth|<margin, 마스크 안) 검사해
-      확인된 점만 조건으로 준다. 미관측 영역은 점 없음 = 모델이 자유롭게 추론.
-    """
+def _count_seen(P_w, stems, cams, args, margin):
+    """Per point: in how many views is it the first surface inside the object mask."""
     n_seen = np.zeros(len(P_w), np.int32)
     n_dep = n_msk = 0
     for s in stems:
@@ -96,8 +87,8 @@ def filter_observed(P_w, stems, cams, args):
         if D is None:
             continue
         n_dep += 1
-        # 마스크도 함께 봐야 한다 — depth 일치만 보면 바닥·인접 객체 표면 위의 점도
-        # '관측됨'으로 통과해 버린다(그 점들이 생성물을 오염시킨다)
+        # The mask is needed too: a depth match alone also passes points lying on the
+        # floor or on a neighbouring object, and those corrupt the generation.
         M = load_mask(args.masks_root, args.gid, s) if args.masks_root else None
         if M is not None:
             n_msk += 1
@@ -114,29 +105,56 @@ def filter_observed(P_w, stems, cams, args):
             continue
         ui = np.clip(u, 0, Wd - 1).astype(int); vi = np.clip(v, 0, Hd - 1).astype(int)
         d = D[vi, ui]
-        hit = ok & (d > 0.01) & (np.abs(z - d) < args.seen_margin)
-        if M is not None:                                  # 객체 마스크 안이어야 함
+        hit = ok & (d > 0.01) & (np.abs(z - d) < margin)
+        if M is not None:                                  # must be inside the mask
             if M.shape != (Hd, Wd):
                 M = np.array(Image.fromarray(M.astype(np.uint8))
                              .resize((Wd, Hd), Image.NEAREST)) > 0
             hit &= M[vi, ui]
         n_seen += hit.astype(np.int32)
-    keep = n_seen >= args.seen_min_views
-    print(f"[filter] 관측 확인 점 {int(keep.sum())}/{len(P_w)} "
-          f"({keep.mean()*100:.1f}%)  depth 뷰 {n_dep}, 마스크 {n_msk}뷰, "
-          f"기준 |z-d|<{args.seen_margin*1000:.0f}mm ∧ 마스크 안 이 {args.seen_min_views}뷰 이상")
-    if keep.sum() < 200:
-        print("  ⚠ 남은 점이 너무 적음 — depth 경로/스케일 확인. 필터 미적용")
+    return n_seen, n_dep, n_msk
+
+
+def filter_observed(P_w, stems, cams, args):
+    """Keep points that are the first surface inside the mask in >= seen_min_views views.
+
+    ShapeR anchors to these points, so recon junk is reproduced in the generation. The old
+    version fell back to the UNFILTERED cloud below 200 survivors, which silently disabled
+    the filter on the worst objects (34-object batch: 7 kept 0 points, 2 kept under 5%).
+    Relax the margin instead, and refuse an object rather than poison it.
+    """
+    tried = []
+    for mv in (args.seen_min_views, 1):
+        for mul in (1.0, 2.0, 4.0):
+            margin = args.seen_margin * mul
+            n_seen, n_dep, n_msk = _count_seen(P_w, stems, cams, args, margin)
+            keep = n_seen >= mv
+            tried.append((margin, mv, int(keep.sum())))
+            if keep.sum() >= args.min_kept:
+                print(f"[filter] gid {args.gid}: {int(keep.sum())}/{len(P_w)} verified "
+                      f"({keep.mean()*100:.1f}%)  depth {n_dep} / mask {n_msk} views"
+                      + ("" if len(tried) == 1 else
+                         f"  RELAXED |z-d|<{margin*1000:.0f}mm min_views={mv}"))
+                return P_w[keep]
+    print(f"[filter] FAILED to verify any observation for gid {args.gid}")
+    for margin, mv, n in tried:
+        print(f"    |z-d|<{margin*1000:.0f}mm  min_views={mv}  ->  {n} points")
+    if args.allow_unfiltered:
+        print("  --allow_unfiltered: passing the RAW cloud (it contains the junk)")
         return P_w
-    return P_w[keep]
+    raise SystemExit(
+        f"[abort] gid {args.gid}: no reconstructed point lands on GT depth inside the mask.\n"
+        f"  The reconstruction and the GT are not in the same place, or the mask belongs to\n"
+        f"  a different object. Feeding this to ShapeR produces a prior built from junk.\n"
+        f"  Inspect the recon against the GT object, or drop this gid. "
+        f"Override with --allow_unfiltered.")
 
 
 def sample_free_points(stems, cams, center, R_align, bounds, args, n_target=6000):
-    """관측된 빈 공간 샘플(오브젝트 프레임).
+    """Observed free-space samples in the object frame.
 
-    카메라~관측 표면 사이 구간은 '비어 있음이 관측된' 곳이다. 이 점들을 pkl 에 실어
-    생성 과정의 free-space 구속으로 쓰면, 다리 밑 같은 관측 가능 영역의 할루시네이션이
-    원천 차단된다(융합 단계 carve 로 지우는 것보다 앞선 개입).
+    Space between a camera and the observed surface is known empty. Carrying it in the pkl
+    blocks hallucination under a table earlier than the fusion-stage carve could remove it.
     """
     rng = np.random.default_rng(0)
     per = max(64, n_target // max(1, len(stems)))
@@ -158,20 +176,20 @@ def sample_free_points(stems, cams, center, R_align, bounds, args, n_target=6000
         d = D[v_, u_]
         x = ((u_ / sx) - c["cx"]) / c["fx"]
         y = ((v_ / sy) - c["cy"]) / c["fy"]
-        dirs = np.stack([x, y, np.ones_like(x)], 1) @ c["R"]      # world 방향(z성분=1 규약)
+        dirs = np.stack([x, y, np.ones_like(x)], 1) @ c["R"]      # world dirs, z = 1
         tau = rng.uniform(0.25, 0.95, k) * np.maximum(d - 2 * args.seen_margin, 1e-3)
         P = C[None] + dirs * tau[:, None]
         Pm = (R_align @ (P - center).T).T
-        keep = (np.abs(Pm) <= bounds).all(1)                      # 오브젝트 bbox 안만
+        keep = (np.abs(Pm) <= bounds).all(1)                      # inside the object bbox
         if keep.any():
             out.append(Pm[keep])
     if not out:
-        print("[free] 샘플 0개 — depth 경로 확인")
+        print("[free] no samples -- check the depth path")
         return np.zeros((0, 3), np.float32)
     F = np.concatenate(out)
     if len(F) > n_target:
         F = F[rng.choice(len(F), n_target, replace=False)]
-    print(f"[free] 관측된 빈 공간 샘플 {len(F)}점 (오브젝트 bbox 내)")
+    print(f"[free] {len(F)} free-space samples in the object bbox")
     return F.astype(np.float32)
 
 
@@ -184,35 +202,42 @@ def find_image(images_dir, stem):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="RefineGS 객체 → ShapeR 입력 pkl")
+    ap = argparse.ArgumentParser(description="RefineGS object -> ShapeR input pkl")
     ap.add_argument("--gid", required=True)
-    ap.add_argument("--recon", required=True, help="관측 객체 메쉬(fuse_post.ply)")
+    ap.add_argument("--recon", required=True, help="observed object mesh (fuse_post.ply)")
     ap.add_argument("--colmap", required=True)
     ap.add_argument("--images", required=True)
     ap.add_argument("--masks_root", default="")
     ap.add_argument("--stems", default="")
     ap.add_argument("--out", required=True)
-    ap.add_argument("--caption", default="", help="비우면 'a 3D object'")
+    ap.add_argument("--caption", default="", help="empty falls back to 'a 3D object'")
     ap.add_argument("--n_points", type=int, default=20000,
-                    help="포인트 수. ※ 도메인 갭 A/B: 조밀(20000) vs SLAM 밀도(1500)")
+                    help="conditioning point count. Domain-gap A/B: dense 20000 vs SLAM-like 1500")
     ap.add_argument("--n_views", type=int, default=32,
-                    help="pkl 에 담을 후보 뷰 수(ShapeR 이 여기서 16개 선택)")
+                    help="candidate views stored in the pkl; ShapeR picks 16 of them")
     ap.add_argument("--world_up", default="z", choices=["x", "y", "z"])
     ap.add_argument("--bounds_margin", type=float, default=1.15,
-                    help="half-extent 여유. 1.0 이면 미관측 확장분이 |p|>1 로 잘릴 수 있음")
+                    help="half-extent margin. At 1.0 the unobserved extension can clip at |p|>1")
     ap.add_argument("--point_std", type=float, default=1e-3,
-                    help="포인트 불확실성(inv_dist_std/dist_std). 우리 depth 는 SLAM 반정밀"
-                         "보다 정확하므로 작게. 필터가 걸러내지 않도록")
+                    help="point uncertainty (inv_dist_std/dist_std). Our depth is better "
+                         "than the semi-dense SLAM this expects, so keep it small or the "
+                         "upstream filter discards the points")
     ap.add_argument("--img_max_side", type=int, default=640,
-                    help="이미지 다운스케일 긴 변(ShapeR 추론은 280px 라 큰 해상도 무의미)")
+                    help="downscale images to this long side; ShapeR infers at 280px")
     ap.add_argument("--seed", type=int, default=0,
-                    help="포인트 샘플링 시드. 고정해야 같은 명령이 같은 pkl 을 낸다 — "
-                         "설정 A/B 를 비교하려면 필수")
-    ap.add_argument("--gt_mesh", default="", help="선택: GT 메쉬(평가용)")
+                    help="point sampling seed. Fix it or the same command yields a "
+                         "different pkl, which invalidates any A/B comparison")
+    ap.add_argument("--gt_mesh", default="", help="optional GT mesh, evaluation only")
     ap.add_argument("--depth_dir", default="",
-                    help="[관측 필터] depth 폴더. 지정 시 '관측이 확인된 점'만 조건으로 준다 — "
-                         "recon 의 미관측 영역 쓰레기가 생성물을 오염시키는 것을 막는다")
+                    help="depth folder for the observation filter. With it, only verified "
+                         "points condition the generation, so junk in the unobserved part "
+                         "of the recon cannot corrupt it")
     ap.add_argument("--depth_scale", type=float, default=6553.5)
+    ap.add_argument("--min_kept", type=int, default=200,
+                    help="minimum verified points before the margin is relaxed")
+    ap.add_argument("--allow_unfiltered", action="store_true",
+                    help="pass the raw cloud when nothing verifies, instead of aborting. "
+                         "The old behaviour, and it poisoned the prior silently")
     ap.add_argument("--n_pool", type=int, default=200000,
                     help="points sampled from the mesh BEFORE the observation filter. Fixed "
                          "so --n_points does not move the object frame")
@@ -220,33 +245,30 @@ def main():
                     help="percentile used for the object bbox (0 = raw min/max). The frame "
                          "sets ShapeR's normalisation, so one floater costs real resolution")
     ap.add_argument("--seen_margin", type=float, default=0.02,
-                    help="관측 판정 허용오차(m): |z - depth| < margin")
+                    help="tolerance (m) for calling a point observed: |z - depth| < margin")
     ap.add_argument("--seen_min_views", type=int, default=2,
-                    help="관측 판정 최소 뷰 수")
+                    help="views that must confirm a point")
     ap.add_argument("--free_points", type=int, default=6000,
-                    help="pkl 에 실을 '관측된 빈 공간' 샘플 수(0=off). "
-                         "shaper_field.py --guide_free_w 로 생성 구속에 사용")
+                    help="observed free-space samples to carry in the pkl (0 = off); "
+                         "used by shaper_field.py --guide_free_w to constrain generation")
     args = ap.parse_args()
 
-    assert read_colmap is not None, "warp_gt_to_pose 임포트 실패 — RefineGS 루트에서 실행하세요"
+    assert read_colmap is not None, "cannot import warp_gt_to_pose -- run from the RefineGS root"
 
-    # ---- 1) 관측 포인트 (world, metric) ----
+    # ---- 1) observed points (world, metric) ----
     m = o3d.io.read_triangle_mesh(os.path.expanduser(args.recon))
-    assert len(m.vertices), f"recon 로드 실패: {args.recon}"
-    # ※ 재현성: 포인트 샘플링이 시드 없이 매번 달라지면, 같은 명령이어도 조건 포인트가
-    #   바뀌어 생성 결과가 달라진다(ShapeR 는 포인트를 anchor 로 충실히 따름).
-    #   실제로 파이프라인의 주된 변동 원인은 ShapeR 샘플링이 아니라 여기다.
+    assert len(m.vertices), f"failed to load recon: {args.recon}"
+    # Unseeded sampling changes the conditioning points, and ShapeR follows them closely.
+    # This, not ShapeR's own sampling, was the main source of run-to-run variation.
     _seeded = False
     try:
         o3d.utility.random.seed(args.seed)             # Open3D >= 0.16
         _seeded = True
     except Exception:
         pass
-    # Sample a FIXED, larger pool, filter it, then subsample to --n_points.
-    #   Sampling n_points straight off the mesh spends the budget on junk that the
-    #   observation filter then deletes, leaving far fewer points on the real surface.
-    #   The pool size is fixed so that changing --n_points does not move the object frame,
-    #   which would break ensemble averaging across runs.
+    # Sample a fixed larger pool, filter, then subsample to --n_points: sampling n_points
+    # directly spends the budget on junk the filter deletes. The pool is fixed so changing
+    # --n_points cannot move the object frame (which would break ensemble averaging).
     n_pool = max(args.n_pool, args.n_points)
     try:
         pc = m.sample_points_uniformly(n_pool, seed=args.seed)
@@ -254,9 +276,8 @@ def main():
     except TypeError:
         pc = m.sample_points_uniformly(n_pool)
     P_w = np.asarray(pc.points, np.float64)
-    print(f"[points] pool {len(P_w)} (world, seed={args.seed}"
-          + ("" if _seeded else ", WARN this Open3D ignores the seed; runs will differ")
-          + ")")
+    if not _seeded:
+        print("[points] WARN this Open3D ignores the sampling seed; runs will differ")
 
     # ---- 2) object frame: gravity aligned, AABB centre ----
     R_align = np.eye(3)
@@ -272,16 +293,13 @@ def main():
     else:
         stems = sorted(cams)
     stems = [s for s in stems if s in cams and find_image(args.images, s)]
-    assert stems, "사용 가능한 뷰 없음 — --images / --stems 확인"
+    assert stems, "no usable view -- check --images / --stems"
 
     # ---- 3b) observation filter, THEN the frame ----
-    # The frame used to be computed from the raw mesh vertices, before this filter. A
-    # single floater a metre away then doubled `bounds`, halved `scale`, and the object
-    # shrank inside ShapeR's normalised cube -- so the generation lost resolution exactly
-    # on the objects whose reconstruction was worst. Measured raw/robust bbox ratios on the
-    # scene slices: obj14 2.73, obj28 1.69, obj21 1.62, obj12 1.52, i.e. scale was 1.5-2.7x
-    # too small there. Derive the frame from the points that survive the filter instead,
-    # and use a percentile bbox so one stray point cannot set it.
+    # The frame was previously taken from raw mesh vertices: one floater doubled `bounds`,
+    # halved `scale`, and the object shrank inside ShapeR's cube, costing resolution on
+    # exactly the worst reconstructions (measured raw/robust 2.73, 1.69, 1.62, 1.52).
+    # Use the filtered points and a percentile bbox.
     F_m = np.zeros((0, 3), np.float32)
     if args.depth_dir:
         P_w = filter_observed(P_w, stems, cams, args)
@@ -305,17 +323,14 @@ def main():
     if len(P_w) > args.n_points:                       # budget now lands on real surface
         rng = np.random.default_rng(args.seed)
         P_w = P_w[rng.choice(len(P_w), args.n_points, replace=False)]
-    print(f"[points] conditioning on {len(P_w)} observed points "
-          f"(target {args.n_points})")
-
     P_m = (R_align @ (P_w - center).T).T
     clipped = int((np.abs(P_m * scale) > 1.0).any(1).sum())
-    print(f"[frame] center={np.round(center,3)}  half-extent={np.round(bounds,3)}m  "
-          f"scale={scale:.3f}  (points clipped after normalisation: {clipped})")
-    print(f"[frame] raw-mesh half-extent {np.round(raw_b,3)}m  "
-          f"raw/robust {raw_b.max()/bounds.max():.2f}x"
-          + ("   <- junk was setting the frame" if raw_b.max() / bounds.max() > 1.3 else ""))
-    if len(stems) > args.n_views:                      # 균등 간격 서브샘플
+    ratio = raw_b.max() / bounds.max()
+    print(f"[frame] gid {args.gid}: {len(P_w)} pts  "
+          f"half-extent={np.round(bounds, 3)}m  scale={scale:.3f}  clipped={clipped}  "
+          f"raw/robust={ratio:.2f}x"
+          + ("  <- junk was setting the frame" if ratio > 1.3 else ""))
+    if len(stems) > args.n_views:                      # uniform subsample
         idx = np.unique(np.linspace(0, len(stems) - 1, args.n_views).round().astype(int))
         stems = [stems[i] for i in idx]
 
@@ -333,11 +348,11 @@ def main():
         fx, fy = c["fx"] * sc, c["fy"] * sc
         cx, cy = c["cx"] * sc, c["cy"] * sc
 
-        # model → camera : T_cm = T_cw @ T_wm
+        # model -> camera : T_cm = T_cw @ T_wm
         T_cw = np.eye(4); T_cw[:3, :3] = c["R"]; T_cw[:3, 3] = c["t"]
         T_cm = T_cw @ np.linalg.inv(T_model_world)
 
-        # 객체 포인트 투영(핀홀) — crop 기준 + 뷰 선택 점수
+        # project the object points (pinhole): crop coords plus the view-selection score
         Xc = P_m @ T_cm[:3, :3].T + T_cm[:3, 3]
         z = Xc[:, 2]
         ok = z > 1e-6
@@ -345,7 +360,7 @@ def main():
         u[ok] = fx * Xc[ok, 0] / z[ok] + cx
         v[ok] = fy * Xc[ok, 1] / z[ok] + cy
         infr = ok & (u >= 0) & (u < W) & (v >= 0) & (v < H)
-        if args.masks_root:                            # 객체 마스크로 가시성 정제
+        if args.masks_root:                            # refine visibility with the mask
             mk = load_mask(args.masks_root, args.gid, s)
             if mk is not None:
                 n_mask += 1
@@ -354,11 +369,9 @@ def main():
                                   .resize((W, H), Image.NEAREST)) > 0
                 ui = np.clip(u, 0, W - 1).astype(int); vi = np.clip(v, 0, H - 1).astype(int)
                 infr &= mk[vi, ui]
-        # [가림 판정] infr 은 '이미지 안에 투영되는가'일 뿐 가림을 보지 않는다.
-        #   그대로 두면 항아리 뒷면 점도 '보인다'로 기록되어, 실측 obj10 에서 32뷰 전부
-        #   14252점 중 13133점(92%)이 가시로 잡혔다. ShapeR 에게 "이 물체는 거의 다
-        #   보인다"고 말하는 셈이라 완성할 이유를 주지 않는다.
-        #   depth 로 '그 뷰의 첫 표면'인 점만 남긴다 — 관측 필터와 같은 기준.
+        # Occlusion test: infr only means "projects inside the image". Without it, points
+        # on the far side counted as visible (obj10: 13133/14252 = 92% across all 32
+        # views), telling ShapeR there is nothing to complete. Keep first-surface only.
         vis = infr.copy()
         if args.depth_dir:
             d = load_depth_map(args.depth_dir, s, args.depth_scale)
@@ -368,7 +381,7 @@ def main():
                 ui = np.clip(u, 0, W - 1).astype(int); vi = np.clip(v, 0, H - 1).astype(int)
                 dv = d[vi, ui]
                 vis = infr & (dv > 0.01) & (np.abs(z - dv) < args.seen_margin)
-        if infr.sum() < 20:                            # 객체가 거의 안 보이는 뷰는 제외
+        if infr.sum() < 20:                            # drop views that barely see it
             continue
 
         buf = io.BytesIO(); img.save(buf, format="PNG")
@@ -378,17 +391,14 @@ def main():
         obj_uv.append(torch.tensor(np.stack([u[infr], v[infr]], 1), dtype=torch.float32))
         vis_pts.append(P_m[vis].astype(np.float32))
         n_infr.append(int(infr.sum())); n_vis.append(int(vis.sum()))
-    assert image_data, "유효 뷰 0개 — 마스크/포즈 확인"
+    assert image_data, "no valid view -- check the masks and poses"
     _mv, _mi = int(np.median(n_vis)), int(np.median(n_infr))
-    print(f"[views] {len(image_data)}뷰 (마스크 적용 {n_mask}), "
-          f"가시점 중앙값 {_mv} / 시야내 {_mi} "
-          f"({_mv/max(_mi,1)*100:.0f}% — 가림 판정 "
-          f"{'적용' if args.depth_dir else '없음(⚠ depth_dir 미지정)'})")
-    if _mv / max(_mi, 1) > 0.8:
-        print("  ⚠ 가시 비율이 80%를 넘습니다. 물체 전체가 모든 뷰에서 보인다는 뜻인데, "
-              "3D 물체에서는 비정상입니다 — ShapeR 가 '완성할 것이 없다'고 판단할 수 있습니다")
+    vis = _mv / max(_mi, 1)
+    print(f"[views] {len(image_data)} ({n_mask} masked)  visible {_mv}/{_mi} "
+          f"({vis*100:.0f}%)  occlusion {'on' if args.depth_dir else 'OFF'}"
+          + ("  <- too high; nothing left for ShapeR to complete" if vis > 0.8 else ""))
 
-    # ---- 4) pkl 조립 ----
+    # ---- 4) assemble the pkl ----
     N = len(P_m)
     sample = {
         "points_model": torch.tensor(P_m, dtype=torch.float32),
@@ -397,15 +407,15 @@ def main():
         "dist_std": torch.full((N,), args.point_std, dtype=torch.float32),
         "image_data": image_data,
         "Ts_camera_model": torch.stack(Ts_cm),
-        "camera_params": np.stack(cam_params),         # 3x3 K (핀홀 패치 필요)
+        "camera_params": np.stack(cam_params),         # 3x3 K (needs the pinhole patch)
         "object_point_projections": obj_uv,
         "visible_points_model": vis_pts,
         "T_model_world": torch.tensor(T_model_world, dtype=torch.float32),
         "caption": args.caption or "a 3D object",
         "is_ariagen2": False,
-        "pinhole": True,                               # ← 패치가 이 플래그로 rectify 우회
+        "pinhole": True,                               # the patch skips rectification on this
     }
-    if len(F_m):                                       # 생성 단계 free-space 구속용
+    if len(F_m):                                       # free-space constraint for generation
         sample["free_points_model"] = torch.tensor(F_m, dtype=torch.float32)
     if args.gt_mesh:
         gm = o3d.io.read_triangle_mesh(os.path.expanduser(args.gt_mesh))
@@ -413,15 +423,12 @@ def main():
             gv = (R_align @ (np.asarray(gm.vertices) - center).T).T
             sample["mesh_vertices"] = torch.tensor(gv, dtype=torch.float32)
             sample["mesh_faces"] = torch.tensor(np.asarray(gm.triangles), dtype=torch.int64)
-            print(f"[gt] 평가용 GT 포함 (verts {len(gv)})")
 
     out = os.path.expanduser(args.out)
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
     with open(out, "wb") as fh:
         pickle.dump(sample, fh)
-    print(f"→ {out}  ({os.path.getsize(out)/1e6:.1f} MB)")
-    print("  실행: python infer_shape_pinhole.py --input_pkl "
-          f"{os.path.basename(out)} --config balance --do_transform_to_world")
+    print(f"[pkl] {out}  ({os.path.getsize(out)/1e6:.1f} MB)")
 
 
 if __name__ == "__main__":
