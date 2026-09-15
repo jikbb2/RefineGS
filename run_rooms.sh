@@ -16,19 +16,21 @@ RUN=${RUN:-0}
 ITER=${ITER:-30000}
 RES=${RES:-2}                       # -r ; room0 was trained at 2, keep it matched
 
-# {room} -> room1,  {room_us} -> room_1   (Replica ships both spellings)
-DATA_T=${DATA_T:-${ROOT}/data/replica_{room}_v2}
-OUTD_T=${OUTD_T:-${ROOT}/output/replica_{room}_v2}
+# Placeholders are @room@ -> room1 and @room_us@ -> room_1 (Replica ships both spellings).
+# Braces cannot be used here: inside ${VAR:-default} the first unescaped } ends the
+# expansion, so "replica_{room}_v2" silently became "replica_{room_v2}".
+DATA_T=${DATA_T:-${ROOT}/data/replica_@room@_v2}
+OUTD_T=${OUTD_T:-${ROOT}/output/replica_@room@_v2}
 # Replica room0 keeps depth*.png next to frame*.jpg; a separate nice-slam export also
 # works. Both spellings are accepted below.
-GTD_T=${GTD_T:-${ROOT}/data/replica_{room}_v2/images}
+GTD_T=${GTD_T:-${ROOT}/data/replica_@room@_v2/images}
 POSE_DIRS=${POSE_DIRS:-"sparse/0 sparse_dense/0"}
-GTMESH_T=${GTMESH_T:-$HOME/{room_us}/habitat/mesh_semantic.ply}
-GTINFO_T=${GTINFO_T:-$HOME/{room_us}/habitat/info_semantic.json}
+GTMESH_T=${GTMESH_T:-$HOME/@room_us@/habitat/mesh_semantic.ply}
+GTINFO_T=${GTINFO_T:-$HOME/@room_us@/habitat/info_semantic.json}
 
 sub() {  # sub TEMPLATE ROOM
   local t=$1 r=$2 u="${2/room/room_}"
-  t=${t//\{room\}/$r}; t=${t//\{room_us\}/$u}; echo "$t"
+  t=${t//@room_us@/$u}; t=${t//@room@/$r}; echo "$t"
 }
 
 printf "%-8s %-7s %-7s %-7s %-7s %-7s %-7s  %s\n" \
