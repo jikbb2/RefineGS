@@ -46,21 +46,23 @@ def stats(model, args):
     step = max(1, len(cams) // args.n_views)
 
     err, nfin, npx = [], 0, 0
-    for c in cams[::step][:args.n_views]:
-        d = render(c, g, pp.extract(a), bg)["surf_depth"][0]
-        fin = torch.isfinite(d)
-        nfin += int((~fin).sum()); npx += d.numel()
-        dg = load_gt_depth(args.gt_depth_dir, c.image_name,
-                           d.shape[0], d.shape[1], args.gt_depth_scale)
-        if dg is None:
-            continue
-        dg = torch.as_tensor(np.asarray(dg), device=d.device, dtype=d.dtype)
-        if dg.shape != d.shape:
-            dg = torch.nn.functional.interpolate(
-                dg[None, None], size=d.shape, mode="nearest")[0, 0]
-        ok = fin & (dg > 0.01) & (d > 0.01)
-        if ok.any():
-            err.append((d[ok] - dg[ok]).abs().cpu().numpy())
+    pipe = pp.extract(a)
+    with torch.no_grad():                      # render() returns a tensor with a graph
+        for c in cams[::step][:args.n_views]:
+            d = render(c, g, pipe, bg)["surf_depth"][0]
+            fin = torch.isfinite(d)
+            nfin += int((~fin).sum()); npx += d.numel()
+            dg = load_gt_depth(args.gt_depth_dir, c.image_name,
+                               d.shape[0], d.shape[1], args.gt_depth_scale)
+            if dg is None:
+                continue
+            dg = torch.as_tensor(np.asarray(dg), device=d.device, dtype=d.dtype)
+            if dg.shape != d.shape:
+                dg = torch.nn.functional.interpolate(
+                    dg[None, None], size=d.shape, mode="nearest")[0, 0]
+            ok = fin & (dg > 0.01) & (d > 0.01)
+            if ok.any():
+                err.append((d[ok] - dg[ok]).abs().cpu().numpy())
     if not err:
         return None
     e = np.concatenate(err)
@@ -80,9 +82,11 @@ def main():
     ap.add_argument("--n_views", type=int, default=40)
     args = ap.parse_args()
 
-    print(f"{'model':<34}{'gauss':>10}{'med':>8}{'p90':>8}{'p99':>8}{'mean':>8}  nonfin%")
+    res = []
     for m in args.models:
-        s = stats(os.path.expanduser(m), args)
+        res.append((m, stats(os.path.expanduser(m), args)))
+    print(f"\n{'model':<34}{'gauss':>10}{'med':>8}{'p90':>8}{'p99':>8}{'mean':>8}  nonfin%")
+    for m, s in res:
         nm = os.path.basename(os.path.normpath(m))
         if s is None:
             print(f"{nm:<34}  no GT depth matched -- check --gt_depth_dir")
