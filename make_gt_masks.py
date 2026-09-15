@@ -99,6 +99,8 @@ def main():
                     help="mean pixels per cast view an object needs")
     ap.add_argument("--min_views", type=int, default=20,
                     help="views in which the object covers at least 20 px")
+    ap.add_argument("--min_mask_px", type=int, default=20,
+                    help="do not write a per-view mask below this many pixels")
     ap.add_argument("--drop_unnamed", action="store_true",
                     help="also drop GT objects whose class name is empty ('undefined'). "
                          "They are real geometry, so they are kept by default")
@@ -120,20 +122,22 @@ def main():
     cams = read_colmap(args.colmap)[::args.stride]
     print(f"[gt-mask] {len(T):,} tris, {len(np.unique(L))} object ids, {len(cams)} views")
 
-    # pass 1: how many pixels does each object actually occupy
-    px, nv = {}, {}
-    hits = []
-    for i, c in enumerate(cams):
+    def cast(c):
+        """object_id per pixel (-1 where the ray misses), plus hit distance."""
         K = o3d.core.Tensor([[c["fx"], 0, c["cx"]], [0, c["fy"], c["cy"]], [0, 0, 1]],
                             dtype=o3d.core.Dtype.Float64)
         E = np.eye(4); E[:3, :3] = c["R"]; E[:3, 3] = c["t"]
-        rays = sc.create_rays_pinhole(K, o3d.core.Tensor(E), int(c["W"]), int(c["H"]))
-        r = sc.cast_rays(rays)
+        r = sc.cast_rays(sc.create_rays_pinhole(K, o3d.core.Tensor(E),
+                                                int(c["W"]), int(c["H"])))
         pid = r["primitive_ids"].numpy()
-        t = r["t_hit"].numpy()
         ok = pid != o3d.t.geometry.RaycastingScene.INVALID_ID
-        oid = np.where(ok, L[np.where(ok, pid, 0)], -1)
-        hits.append((c, oid, t, ok))
+        return np.where(ok, L[np.where(ok, pid, 0)], -1), r["t_hit"].numpy(), ok
+
+    # Pass 1 counts pixels; pass 2 writes. The results are NOT cached between them: at
+    # stride 1 that is 2000 views x ~1.8MB = 3.7GB. Casting twice is cheaper than that.
+    px, nv = {}, {}
+    for i, c in enumerate(cams):
+        oid, _, ok = cast(c)
         u, n = np.unique(oid[ok], return_counts=True)
         for a, b in zip(u.tolist(), n.tolist()):
             px[a] = px.get(a, 0) + b
@@ -181,12 +185,17 @@ def main():
     for o in keep:
         os.makedirs(os.path.join(out, "masks", str(o), "masks"), exist_ok=True)
 
-    for i, (c, oid, t, ok) in enumerate(hits):
+    for i, c in enumerate(cams):
+        oid, t, ok = cast(c)
         lab = np.zeros(oid.shape, np.uint16)
         for o in keep:
             m = ok & (oid == o)
-            if m.any():
+            n = int(m.sum())
+            if n:
                 lab[m] = label_of[o]
+            # A mask with a handful of pixels is noise, and a missing file simply means
+            # "not visible here", which require_mask already handles.
+            if n >= args.min_mask_px:
                 Image.fromarray((m * 255).astype(np.uint8)).save(
                     os.path.join(out, "masks", str(o), "masks", c["stem"] + ".png"))
         Image.fromarray(lab).save(os.path.join(lab_d, c["stem"] + ".png"))
@@ -198,7 +207,7 @@ def main():
             Image.fromarray(np.clip(d, 0, 65535).astype(np.uint16)).save(
                 os.path.join(out, "images", nm + ".png"))
         if (i + 1) % 200 == 0:
-            print(f"  wrote {i + 1}/{len(hits)}")
+            print(f"  wrote {i + 1}/{len(cams)}")
 
     json.dump({"gids": keep, "label_of_gid": {str(o): label_of[o] for o in keep},
                "K": len(keep), "source": "gt_raycast", "ignore": IGNORE,
