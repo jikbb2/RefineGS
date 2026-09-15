@@ -23,6 +23,11 @@ OUT=${OUT:-${ROOT}/output/${SCENE}/refinegs_full}
 ITER=${ITER:-7000}
 PRIOR=${PRIOR:-$HOME/prior}
 SHAPER_DIR=${SHAPER_DIR:-$HOME/ShapeR}
+# pkl files live under ShapeR so shaper_field.py can take a relative --input_pkl. Set
+# PKL_SUBDIR per pipeline: without it, the per-object and scene runs write the same
+# obj<gid>.pkl, and the stale-prior guard then rebuilds one pipeline's field from the
+# other's input, silently.
+PKL_SUBDIR=${PKL_SUBDIR:-}
 SHAPER_ENV=${SHAPER_ENV:-shaper}
 SHAPER_DIRECT=${SHAPER_DIRECT:-0}
 COLMAP=${COLMAP:-${ROOT}/data/${SCENE}/sparse/0}
@@ -72,7 +77,9 @@ MATCH_MIN_SHARE=${MATCH_MIN_SHARE:-0.03}
 CSV=${CSV:-${OUT}/_field_batch.csv}
 FAILCSV=${FAILCSV:-${OUT}/_field_batch_failures.csv}
 LOGDIR=${LOGDIR:-${PRIOR}/logs}
-mkdir -p "${PRIOR}" "${LOGDIR}" "${SHAPER_DIR}/data"
+PKL_DIR=${SHAPER_DIR}/data${PKL_SUBDIR:+/${PKL_SUBDIR}}
+PKL_REL=data${PKL_SUBDIR:+/${PKL_SUBDIR}}
+mkdir -p "${PRIOR}" "${LOGDIR}" "${PKL_DIR}"
 cd "${ROOT}" || exit 1
 
 gids=()
@@ -86,7 +93,7 @@ for MDIR in ${OUT}/*/; do
 done
 [ ${#gids[@]} -gt 0 ] || { echo "no target object under ${OUT}"; exit 1; }
 echo "targets (${#gids[@]}): ${gids[*]}"
-echo "  out=${OUT} iter=${ITER} prior=${PRIOR}"
+echo "  out=${OUT} iter=${ITER} prior=${PRIOR} pkl=${PKL_DIR}"
 echo "  n_points=${NPTS} seed=${SEED} grid=${GRID} cfg=${CFG} ensemble=${ENSEMBLE}/${COMBINE}"
 [ -n "${FUSE_EXTRA}" ] && echo "  FUSE_EXTRA=${FUSE_EXTRA}"
 [ -f "${CAPTIONS}" ] || echo "  no caption file (${CAPTIONS}); using the default text"
@@ -122,9 +129,9 @@ if [ "${PHASE}" = "pkl" ] || [ "${PHASE}" = "all" ]; then
       --masks_root "${MASKS}" ${STEMS:+$([ -f "${STEMS}" ] && echo --stems "${STEMS}")} \
       --depth_dir "${GTD}" --seen_margin "${SEEN_MARGIN}" \
       --seen_min_views "${SEEN_MIN_VIEWS}" --free_points "${FREE_POINTS}" \
-      --caption "$(caption_of "${gid}")" --out "${SHAPER_DIR}/data/obj${gid}.pkl" \
+      --caption "$(caption_of "${gid}")" --out "${PKL_DIR}/obj${gid}.pkl" \
       > "${LOGDIR}/pkl_${gid}.log" 2>&1
-    if [ -f "${SHAPER_DIR}/data/obj${gid}.pkl" ]; then
+    if [ -f "${PKL_DIR}/obj${gid}.pkl" ]; then
       grep -hE "^\[filter\]|^\[frame\].*raw/robust|RELAXED" \
         "${LOGDIR}/pkl_${gid}.log" | sed 's/^/  /'
     else
@@ -138,7 +145,7 @@ fi
 if [ "${PHASE}" = "field" ] || [ "${PHASE}" = "all" ]; then
   echo "=== [2/3] ShapeR signed field (grid=${GRID}) ==="
   for gid in "${gids[@]}"; do
-    PKL=${SHAPER_DIR}/data/obj${gid}.pkl
+    PKL=${PKL_DIR}/obj${gid}.pkl
     NPZ=${PRIOR}/obj${gid}_field.npz
     [ -f "${PKL}" ] || { echo "  [${gid}] no pkl"; note_fail "${gid}" field "no pkl"; continue; }
     # Stale-prior guard. Skipping an existing npz silently reuses an old field, and the
@@ -158,7 +165,7 @@ if [ "${PHASE}" = "field" ] || [ "${PHASE}" = "all" ]; then
       fi
     fi
     CMD="cd '${SHAPER_DIR}' && LD_LIBRARY_PATH= python shaper_field.py \
-         --input_pkl data/obj${gid}.pkl --config balance --grid ${GRID} \
+         --input_pkl ${PKL_REL}/obj${gid}.pkl --config balance --grid ${GRID} \
          --cfg ${CFG} --min_comp_frac ${MIN_COMP_FRAC} \
          $([ "${ENSEMBLE}" -gt 1 ] && echo --ensemble ${ENSEMBLE} --combine ${COMBINE}) \
          $([ "${GUIDE_FREE_W}" != "0" ] && echo --guide_free_w ${GUIDE_FREE_W}) \

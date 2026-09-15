@@ -8,12 +8,14 @@
 #   field    ShapeR signed SDF grid
 #   fuse     grid fusion + seen/unseen evaluation         (the B side)
 #
-# Each stage is skipped when its output already exists, so a failed run can be resumed.
-# Use FROM= to force a restart at a stage.
+# A stage is skipped when its output already exists, so a failed run resumes where it
+# stopped. FROM= restarts at a stage; CLEAN=1 additionally deletes that stage's outputs and
+# everything after it, which is what you want when an INPUT changed rather than a crash.
 #
 #   bash run_scene_pipeline.sh
-#   FROM=mesh bash run_scene_pipeline.sh
-#   SCENE_MODEL=.../scene_reg PRIOR=~/prior_reg bash run_scene_pipeline.sh
+#   FROM=mesh bash run_scene_pipeline.sh              # resume, keep existing meshes
+#   CLEAN=1 FROM=vote bash run_scene_pipeline.sh      # redo everything from scratch
+#   EXTRACT_EXTRA="--min_margin 0.3" CLEAN=1 FROM=extract bash run_scene_pipeline.sh
 set -uo pipefail
 
 ROOT=${ROOT:-$HOME/RefineGS}
@@ -27,6 +29,9 @@ GTD=${GTD:-/home/elicer/nice-slam/Datasets/Replica/room0/results}
 LABEL_DIR=${LABEL_DIR:-${DATA}/labels_scene}
 CSV=${CSV:-$HOME/prior/_scene_reg.csv}
 FROM=${FROM:-vote}                 # vote | extract | mesh | pkl | field | fuse
+CLEAN=${CLEAN:-0}
+SHAPER_DIR=${SHAPER_DIR:-$HOME/ShapeR}
+PKL_SUBDIR=${PKL_SUBDIR:-$(basename "${OBJ}")}   # keeps pkls apart from other pipelines
 # Extraction filters, off by default. Turn them on only as a separate experiment, so the
 # change is attributable: --min_margin drops gaussians whose views disagreed (object
 # boundaries), --split_below keeps the largest blob of a merged label.
@@ -47,8 +52,26 @@ for p in "${PLY}" "${SCENE_MODEL}/cfg_args" "${DATA}/sparse/0" "${LABEL_DIR}/id_
 done
 [ "${fail}" -eq 0 ] || { echo "[abort] fix the paths above (override with env vars)"; exit 1; }
 echo "  scene=${SCENE_MODEL}"
-echo "  objects=${OBJ}   prior=${PRIOR}   from=${FROM}"
+echo "  objects=${OBJ}   prior=${PRIOR}"
+echo "  pkl=${SHAPER_DIR}/data/${PKL_SUBDIR}   from=${FROM}   clean=${CLEAN}"
 cd "${ROOT}" || exit 1
+
+if [ "${CLEAN}" = "1" ]; then
+  echo ""; echo "=== clean: removing outputs from '${FROM}' onward ==="
+  stage_at vote    && { echo "  ${SCENE_MODEL}/vote"; rm -rf "${SCENE_MODEL}/vote"; }
+  stage_at extract && { echo "  ${OBJ}";              rm -rf "${OBJ}"; }
+  # 'mesh' only re-meshes; extract already removed the dirs when it ran
+  if stage_at mesh && [ -d "${OBJ}" ]; then
+    echo "  ${OBJ}/*/train/ours_${ITER}/fuse*.ply"
+    rm -f "${OBJ}"/*/train/ours_"${ITER}"/fuse.ply "${OBJ}"/*/train/ours_"${ITER}"/fuse_post.ply
+  fi
+  stage_at pkl   && { echo "  ${SHAPER_DIR}/data/${PKL_SUBDIR}"; rm -rf "${SHAPER_DIR}/data/${PKL_SUBDIR}"; }
+  stage_at field && { echo "  ${PRIOR}/obj*_field*.npz";         rm -f "${PRIOR}"/obj*_field*.npz; }
+  if stage_at fuse && [ -d "${OBJ}" ]; then
+    echo "  ${OBJ}/*/train/ours_${ITER}/fused_field*.ply  and  ${CSV}"
+    rm -f "${OBJ}"/*/train/ours_"${ITER}"/fused_field*.ply "${CSV}"
+  fi
+fi
 
 if stage_at vote && { [ "${FROM}" = vote ] || [ ! -f "${SCENE_MODEL}/vote/labels.npy" ]; }; then
   echo ""; echo "=== vote: per-gaussian instance labels ==="
@@ -77,7 +100,7 @@ for ph in pkl field fuse; do
   stage_at "${ph}" || continue
   echo ""; echo "=== ${ph} ==="
   PRIOR="${PRIOR}" ITER="${ITER}" OUT="${OBJ}" CSV="${CSV}" PHASE="${ph}" \
-    bash run_field_fusion_batch.sh || exit 1
+    PKL_SUBDIR="${PKL_SUBDIR}" bash run_field_fusion_batch.sh || exit 1
 done
 
 echo ""
