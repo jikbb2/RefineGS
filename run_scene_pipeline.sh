@@ -73,7 +73,9 @@ if [ "${CLEAN}" = "1" ]; then
   fi
 fi
 
-if stage_at vote && { [ "${FROM}" = vote ] || [ ! -f "${SCENE_MODEL}/vote/labels.npy" ]; }; then
+# Skip when the output is already there. FROM only sets where to START; deleting outputs
+# is CLEAN's job, so the two do not have to be reasoned about together.
+if stage_at vote && [ ! -f "${SCENE_MODEL}/vote/labels.npy" ]; then
   echo ""; echo "=== vote: per-gaussian instance labels ==="
   python vote_labels.py --ply "${PLY}" --colmap "${DATA}/sparse/0" \
     --label_dir "${LABEL_DIR}" --gt_depth_dir "${GTD}" \
@@ -83,7 +85,7 @@ if stage_at vote && { [ "${FROM}" = vote ] || [ ! -f "${SCENE_MODEL}/vote/labels
     | tail -6
 fi
 
-if stage_at extract && { [ "${FROM}" = extract ] || [ ! -f "${OBJ}/objects.json" ]; }; then
+if stage_at extract && [ ! -f "${OBJ}/objects.json" ]; then
   echo ""; echo "=== extract: slice the scene into per-object models ==="
   python extract_objects.py --ply "${PLY}" --labels "${SCENE_MODEL}/vote/labels.npy" \
     --scene_dir "${SCENE_MODEL}" --id_map "${LABEL_DIR}/id_map.json" \
