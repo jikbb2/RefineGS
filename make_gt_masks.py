@@ -35,8 +35,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from warp_gt_to_pose import read_colmap                        # noqa: E402
 
 IGNORE = 65535
-DEFAULT_EXCLUDE = ("wall,floor,ceiling,door,window,blind,vent,light switch,"
-                   "thermostat,rug,stair,beam,panel,pillar")
+DEFAULT_EXCLUDE = ("wall,floor,ceiling,door,window,blind,vent,switch,thermostat,"
+                   "rug,stair,beam,panel,pillar,wall-plug,outlet")
 
 
 def tok(name):
@@ -93,8 +93,15 @@ def main():
     ap.add_argument("--colmap", required=True)
     ap.add_argument("--out", required=True, help="the room's data dir")
     ap.add_argument("--stride", type=int, default=1, help="use every Nth view")
-    ap.add_argument("--min_px", type=int, default=2000,
-                    help="total pixels an object needs across all views to be kept")
+    # A total-pixel threshold depends on how many views were cast, so --stride silently
+    # changes which objects survive. Both criteria below are per-view and stride-free.
+    ap.add_argument("--min_px_per_view", type=float, default=50.0,
+                    help="mean pixels per cast view an object needs")
+    ap.add_argument("--min_views", type=int, default=20,
+                    help="views in which the object covers at least 20 px")
+    ap.add_argument("--drop_unnamed", action="store_true",
+                    help="also drop GT objects whose class name is empty ('undefined'). "
+                         "They are real geometry, so they are kept by default")
     ap.add_argument("--exclude_classes", default=DEFAULT_EXCLUDE,
                     help="classes never treated as objects; 'none' keeps them")
     ap.add_argument("--write_depth", action="store_true",
@@ -114,7 +121,7 @@ def main():
     print(f"[gt-mask] {len(T):,} tris, {len(np.unique(L))} object ids, {len(cams)} views")
 
     # pass 1: how many pixels does each object actually occupy
-    px = {}
+    px, nv = {}, {}
     hits = []
     for i, c in enumerate(cams):
         K = o3d.core.Tensor([[c["fx"], 0, c["cx"]], [0, c["fy"], c["cy"]], [0, 0, 1]],
@@ -130,21 +137,39 @@ def main():
         u, n = np.unique(oid[ok], return_counts=True)
         for a, b in zip(u.tolist(), n.tolist()):
             px[a] = px.get(a, 0) + b
+            if b >= 20:
+                nv[a] = nv.get(a, 0) + 1
         if (i + 1) % 200 == 0:
             print(f"  cast {i + 1}/{len(cams)}")
 
-    keep = []
-    for o, n in sorted(px.items(), key=lambda x: -x[1]):
-        nm = names.get(int(o), "")
-        if n < args.min_px or (terms and nm and excluded(nm, terms)):
-            continue
-        keep.append(int(o))
-    keep.sort()
+    nc = max(len(cams), 1)
+    keep, dropped = [], []
+    for o in sorted(px):
+        o = int(o)
+        nm = names.get(o, "")
+        ppv, views = px[o] / nc, nv.get(o, 0)
+        why = ""
+        if terms and nm and excluded(nm, terms):
+            why = "class"
+        elif args.drop_unnamed and not nm:
+            why = "unnamed"
+        elif ppv < args.min_px_per_view:
+            why = "too small"
+        elif views < args.min_views:
+            why = f"only {views} views"
+        (dropped if why else keep).append((o, nm, ppv, views, why))
+    print(f"\n[gt-mask] keeping {len(keep)}, dropping {len(dropped)}"
+          f"   (>= {args.min_px_per_view:.0f} px/view and >= {args.min_views} views)")
+    print(f"{'oid':>5}  {'class':<16}{'px/view':>9}{'views':>7}")
+    for o, nm, ppv, views, _ in sorted(keep, key=lambda x: -x[2]):
+        print(f"{o:>5}  {nm or 'undefined':<16}{ppv:>9.0f}{views:>7}"
+              + ("   <- no class name" if not nm else ""))
+    if dropped:
+        print("\ndropped:")
+        for o, nm, ppv, views, why in sorted(dropped, key=lambda x: -x[2])[:20]:
+            print(f"{o:>5}  {nm or 'undefined':<16}{ppv:>9.0f}{views:>7}   {why}")
+    keep = sorted(o for o, *_ in keep)
     label_of = {o: i + 1 for i, o in enumerate(keep)}
-    print(f"[gt-mask] keeping {len(keep)} objects "
-          f"(>= {args.min_px} px, excluding {len(px) - len(keep)} others)")
-    for o in keep[:40]:
-        print(f"    {o:>4}  {names.get(o, ''):<18}{px[o]:>10,} px")
     if args.dry_run:
         return
 
@@ -177,7 +202,8 @@ def main():
 
     json.dump({"gids": keep, "label_of_gid": {str(o): label_of[o] for o in keep},
                "K": len(keep), "source": "gt_raycast", "ignore": IGNORE,
-               "min_px": args.min_px,
+               "min_px_per_view": args.min_px_per_view, "min_views": args.min_views,
+               "n_views_cast": len(cams), "stride": args.stride,
                "class_of_gid": {str(o): names.get(o, "") for o in keep}},
               open(os.path.join(out, "labels_scene", "id_map.json"), "w"), indent=1)
     print(f"[gt-mask] -> {out}/masks/<oid>/masks  and  {out}/labels_scene")
