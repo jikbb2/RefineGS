@@ -21,13 +21,26 @@ set -uo pipefail
 ROOT=${ROOT:-$HOME/RefineGS}
 SCENE=${SCENE:-replica_room0_v2}
 DATA=${DATA:-${ROOT}/data/${SCENE}}
-SCENE_MODEL=${SCENE_MODEL:-${ROOT}/output/${SCENE}/scene_reg}
-OBJ=${OBJ:-${ROOT}/output/${SCENE}/objects_reg}
-PRIOR=${PRIOR:-$HOME/prior_reg}
+# Defaults are the CONFIRMED configuration. scene_reg and scene_n were regularisation
+# experiments that lost (scene-level depth error 5.5mm -> 23.1 / 32.2mm), so `scene` is the
+# model to use; override SCENE_MODEL only to reproduce those.
+SCENE_MODEL=${SCENE_MODEL:-${ROOT}/output/${SCENE}/scene}
+OBJ=${OBJ:-${ROOT}/output/${SCENE}/objects_voted}
+PRIOR=${PRIOR:-$HOME/prior_v3}
 ITER=${ITER:-30000}
 GTD=${GTD:-/home/elicer/nice-slam/Datasets/Replica/room0/results}
 LABEL_DIR=${LABEL_DIR:-${DATA}/labels_scene}
-CSV=${CSV:-$HOME/prior/_scene_reg.csv}
+IMAGES=${IMAGES:-${DATA}/images}
+MASKS=${MASKS:-${DATA}/masks}
+ONLY=${ONLY:-}                     # restrict to some gids, e.g. ONLY="9 11 63"
+# poses live in sparse/0 or sparse_dense/0 depending on how the room was built
+if [ -z "${COLMAP:-}" ]; then
+  for sd in sparse/0 sparse_dense/0; do
+    [ -d "${DATA}/${sd}" ] && { COLMAP=${DATA}/${sd}; break; }
+  done
+fi
+COLMAP=${COLMAP:-${DATA}/sparse/0}
+CSV=${CSV:-$HOME/prior/_scene.csv}
 FROM=${FROM:-vote}                 # vote | extract | mesh | pkl | field | fuse
 CLEAN=${CLEAN:-0}
 GT_MESH=${GT_MESH:-$HOME/room_0/habitat/mesh_semantic.ply}
@@ -48,13 +61,14 @@ stage_at() {                        # is this stage at or after FROM?
 
 echo "[check] paths"
 fail=0
-for p in "${PLY}" "${SCENE_MODEL}/cfg_args" "${DATA}/sparse/0" "${LABEL_DIR}/id_map.json" \
-         "${DATA}/masks" "${GTD}"; do
+for p in "${PLY}" "${SCENE_MODEL}/cfg_args" "${COLMAP}" "${LABEL_DIR}/id_map.json" \
+         "${MASKS}" "${IMAGES}" "${GTD}"; do
   [ -e "${p}" ] || { echo "  MISSING ${p}"; fail=1; }
 done
 [ "${fail}" -eq 0 ] || { echo "[abort] fix the paths above (override with env vars)"; exit 1; }
 echo "  scene=${SCENE_MODEL}"
 echo "  objects=${OBJ}   prior=${PRIOR}"
+echo "  poses=${COLMAP}   gt_depth=${GTD}"
 echo "  pkl=${SHAPER_DIR}/data/${PKL_SUBDIR}   from=${FROM}   clean=${CLEAN}"
 cd "${ROOT}" || exit 1
 
@@ -79,7 +93,7 @@ fi
 # is CLEAN's job, so the two do not have to be reasoned about together.
 if stage_at vote && [ ! -f "${SCENE_MODEL}/vote/labels.npy" ]; then
   echo ""; echo "=== vote: per-gaussian instance labels ==="
-  python vote_labels.py --ply "${PLY}" --colmap "${DATA}/sparse/0" \
+  python vote_labels.py --ply "${PLY}" --colmap "${COLMAP}" \
     --label_dir "${LABEL_DIR}" --gt_depth_dir "${GTD}" \
     --out "${SCENE_MODEL}/vote" || exit 1
   echo "--- label coherence (previous run: mean compactness 0.754, 17 classes >= 0.8) ---"
@@ -98,7 +112,9 @@ fi
 # Name the objects against the GT semantic mesh. Runs on the sliced gaussians, so it fits
 # between extract and mesh. Gives readable logs and, more usefully, real ShapeR captions:
 # without it every object is generated from "a 3D object in a room".
-if stage_at extract && [ ! -f "${OBJ}/names.tsv" ] && [ -f "${GT_MESH}" ]; then
+# Not gated on FROM: the pkl stage consumes names.tsv as its captions, so it has to exist
+# whenever we start at or before pkl.
+if [ ! -f "${OBJ}/names.tsv" ] && [ -f "${GT_MESH}" ] && [ -d "${OBJ}" ]; then
   echo ""; echo "=== name: match each object to a GT class ==="
   python name_objects.py --gt_mesh "${GT_MESH}" --gt_info "${GT_INFO}" \
     --root "${OBJ}" --iter "${ITER}" || true
@@ -106,14 +122,15 @@ fi
 
 if stage_at mesh; then
   echo ""; echo "=== mesh: TSDF per object (the A side) ==="
-  OBJ="${OBJ}" DATA="${DATA}/masks" IT="${ITER}" bash mesh_voted_objects.sh
+  OBJ="${OBJ}" DATA="${MASKS}" IT="${ITER}" bash mesh_voted_objects.sh
 fi
 
 for ph in pkl field fuse; do
   stage_at "${ph}" || continue
   echo ""; echo "=== ${ph} ==="
   PRIOR="${PRIOR}" ITER="${ITER}" OUT="${OBJ}" CSV="${CSV}" PHASE="${ph}" \
-    PKL_SUBDIR="${PKL_SUBDIR}" CAPTIONS="${OBJ}/names.tsv" \
+    PKL_SUBDIR="${PKL_SUBDIR}" CAPTIONS="${OBJ}/names.tsv" COLMAP="${COLMAP}" \
+    MASKS="${MASKS}" IMAGES="${IMAGES}" GT_MESH="${GT_MESH}" ONLY="${ONLY}" \
     bash run_field_fusion_batch.sh || exit 1
 done
 
