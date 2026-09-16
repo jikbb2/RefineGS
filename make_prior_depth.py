@@ -27,6 +27,7 @@ import functools
 import numpy as np
 import open3d as o3d
 from PIL import Image
+from plyfile import PlyData
 
 print = functools.partial(print, flush=True)     # the heavy loops must show progress
 from skimage.measure import marching_cubes
@@ -158,6 +159,27 @@ def orbit(center, radius, n, elev_deg=(-60, -45, -30, -15, 0, 30), up_axis=2,
     return out, np.array(ring)
 
 
+def load_mesh_any(path):
+    """Open3D's PLY reader rejects Replica's mesh_semantic.ply: the per-face object_id
+    property makes it fail with "unable to parse header", and it then returns an empty
+    mesh that crashes RaycastingScene. Fall back to plyfile, which every other script here
+    already uses for it. Quads are fan-triangulated."""
+    path = os.path.expanduser(path)
+    m = o3d.io.read_triangle_mesh(path)
+    if len(m.triangles):
+        return m
+    p = PlyData.read(path)
+    V = np.stack([p["vertex"][k] for k in ("x", "y", "z")], 1).astype(np.float64)
+    T = []
+    for f in p["face"][p["face"].data.dtype.names[0]]:
+        f = np.asarray(f)
+        for k in range(1, len(f) - 1):
+            T.append((f[0], f[k], f[k + 1]))
+    assert T, f"no face in {path}"
+    return o3d.geometry.TriangleMesh(o3d.utility.Vector3dVector(V),
+                                     o3d.utility.Vector3iVector(np.asarray(T, np.int32)))
+
+
 def reachable(rc, eye, center, obj_radius, slack=1.5):
     """False when something blocks the camera before it reaches the object.
 
@@ -246,7 +268,8 @@ def main():
 
     reach = None
     if args.occluder_mesh and os.path.isfile(os.path.expanduser(args.occluder_mesh)):
-        om = o3d.io.read_triangle_mesh(os.path.expanduser(args.occluder_mesh))
+        om = load_mesh_any(args.occluder_mesh)
+        assert len(om.triangles), f"empty occluder mesh: {args.occluder_mesh}"
         reach = o3d.t.geometry.RaycastingScene()
         reach.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(om))
         print(f"[reach] occluder {len(om.triangles):,} tris")
