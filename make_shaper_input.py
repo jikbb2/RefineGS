@@ -374,10 +374,13 @@ def main():
     P_m = (R_align @ (P_w - center).T).T
     clipped = int((np.abs(P_m * scale) > 1.0).any(1).sum())
     ratio = raw_b.max() / bounds.max()
+    # On the depth path raw_b is the MESH bbox while bounds comes from depth points, so the
+    # ratio compares two different things and does not indicate junk.
+    note = "" if args.points_from == "depth" else \
+        ("  <- junk was setting the frame" if ratio > 1.3 else "")
     print(f"[frame] gid {args.gid}: {len(P_w)} pts  "
           f"half-extent={np.round(bounds, 3)}m  scale={scale:.3f}  clipped={clipped}  "
-          f"raw/robust={ratio:.2f}x"
-          + ("  <- junk was setting the frame" if ratio > 1.3 else ""))
+          f"{'mesh/depth' if args.points_from == 'depth' else 'raw/robust'}={ratio:.2f}x{note}")
     if len(stems) > args.n_views:                      # uniform subsample
         idx = np.unique(np.linspace(0, len(stems) - 1, args.n_views).round().astype(int))
         stems = [stems[i] for i in idx]
