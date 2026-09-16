@@ -17,10 +17,12 @@ INJ=${INJ:-${ROOT}/output/${SCENE}/objects_inj}
 MASKS=${MASKS:-${ROOT}/data/${SCENE}/masks}
 COLMAP=${COLMAP:-${ROOT}/data/${SCENE}/sparse/0}
 GT_MESH=${GT_MESH:-$HOME/room_0/habitat/mesh_semantic.ply}
+GTD=${GTD:-/home/elicer/nice-slam/Datasets/Replica/room0/results}
+STEMS_DIR=${STEMS_DIR:-$HOME/See3D/dataset/stage6/clean_stems}
 PRIOR=${PRIOR:-$HOME/prior_smoke}
 ITER=${ITER:-30000}
 GIDS=${GIDS:-"6 2 5"}
-MAX_NEW=${MAX_NEW:-40000}
+MAX_NEW=${MAX_NEW:-0}          # 0 = keep the whole prior surface
 NEW_DIST=${NEW_DIST:-0.02}
 GSCALE=${GSCALE:-0.006}
 VOXEL=${VOXEL:-0.004}
@@ -32,9 +34,12 @@ for g in ${GIDS}; do
   DST=${INJ}/${g}
   [ -f "${NPZ}" ] || { echo "[${g}] no field ${NPZ}"; continue; }
   echo ""; echo "######## gid ${g} ########"
+  STEMS=${STEMS_DIR}/${g}.txt
   python inject_prior_gaussians.py -m "${SRC}" --iteration "${ITER}" \
     --fields "${NPZ}" --out "${DST}" --max_new "${MAX_NEW}" \
-    --new_dist "${NEW_DIST}" --scale "${GSCALE}" || continue
+    --new_dist "${NEW_DIST}" --scale "${GSCALE}" \
+    --carve_depth_dir "${GTD}" --colmap "${COLMAP}" \
+    ${STEMS:+$([ -f "${STEMS}" ] && echo --stems "${STEMS}")} || continue
   # same render.py call as mesh_voted_objects.sh, so A and C are comparable
   python render.py -m "${DST}" -s "${MASKS}/${g}" --iteration "${ITER}" --skip_test \
     --depth_ratio 1 --depth_trunc 5.0 --voxel_size "${VOXEL}" --sdf_trunc 0.02 \

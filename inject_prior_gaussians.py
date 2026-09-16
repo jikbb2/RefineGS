@@ -24,8 +24,52 @@ import shutil
 
 import numpy as np
 from plyfile import PlyData, PlyElement
+import sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from scipy.spatial import cKDTree
 from skimage.measure import marching_cubes
+
+
+def carve_mask(P, args):
+    """True for prior points that sit in space a camera saw THROUGH.
+
+    Without this the injection adds surface wherever the prior hallucinated, and the grid
+    fusion's whole advantage is exactly that it deletes those. Measured without carving:
+    free violation 10.2%% -> 40.7%% on obj2.
+    """
+    from warp_gt_to_pose import read_colmap
+    from sdf_distill_depth import load_gt_depth, load_view_mask
+    cams = read_colmap(args.colmap)
+    if args.stems and os.path.isfile(os.path.expanduser(args.stems)):
+        keep = {l.strip() for l in open(os.path.expanduser(args.stems)) if l.strip()}
+        cams = [c for c in cams if c["stem"] in keep]
+    step = max(1, len(cams) // max(args.carve_views, 1))
+    cams = cams[::step]
+    votes = np.zeros(len(P), np.int32)
+    n_used = 0
+    for c in cams:
+        D = load_gt_depth(args.carve_depth_dir, c["stem"], c["H"], c["W"],
+                          args.gt_depth_scale)
+        if D is None:
+            continue
+        n_used += 1
+        H, W = D.shape
+        sx, sy = W / c["W"], H / c["H"]
+        Xc = P @ c["R"].T + c["t"]
+        z = Xc[:, 2]
+        zz = np.maximum(z, 1e-6)
+        u = (c["fx"] * Xc[:, 0] / zz + c["cx"]) * sx
+        v = (c["fy"] * Xc[:, 1] / zz + c["cy"]) * sy
+        ok = (z > 0.05) & (u >= 0) & (u < W) & (v >= 0) & (v < H)
+        if not ok.any():
+            continue
+        ui = np.clip(u, 0, W - 1).astype(int)
+        vi = np.clip(v, 0, H - 1).astype(int)
+        d = D[vi, ui]
+        votes += (ok & (d > 0.01) & (z < d - args.carve_margin)).astype(np.int32)
+    print(f"  carve: {n_used} views, dropping {(votes >= args.carve_views_min).sum():,}"
+          f"/{len(P):,} points in observed free space")
+    return votes >= args.carve_views_min
 
 
 def inv_sigmoid(x):
@@ -84,7 +128,20 @@ def main():
     ap.add_argument("--out", required=True, help="new model dir")
     ap.add_argument("--new_dist", type=float, default=0.02,
                     help="only inject where no gaussian is within this distance (m)")
-    ap.add_argument("--max_new", type=int, default=40000, help="per prior field")
+    ap.add_argument("--max_new", type=int, default=0,
+                    help="cap per field; 0 = keep all. A cap subsamples the surface at "
+                         "random, so the discs stop overlapping and the TSDF sees holes: "
+                         "40000 of 131935 points left unseen completion unchanged")
+    ap.add_argument("--carve_depth_dir", default="",
+                    help="GT depth folder. Without it the prior is injected into space "
+                         "the cameras saw through")
+    ap.add_argument("--colmap", default="")
+    ap.add_argument("--stems", default="", help="optional per-object view list")
+    ap.add_argument("--carve_views", type=int, default=120)
+    ap.add_argument("--carve_views_min", type=int, default=2,
+                    help="views that must agree before a point is called free")
+    ap.add_argument("--carve_margin", type=float, default=0.02)
+    ap.add_argument("--gt_depth_scale", type=float, default=6553.5)
     ap.add_argument("--scale", type=float, default=0.006, help="disc radius (m)")
     ap.add_argument("--opacity", type=float, default=0.9)
     ap.add_argument("--level", type=float, default=0.0)
@@ -124,7 +181,10 @@ def main():
         keep = d > args.new_dist
         n_tot = len(P)
         P, N, j = P[keep], N[keep], j[keep]
-        if len(P) > args.max_new:
+        if args.carve_depth_dir and args.colmap and len(P):
+            free = carve_mask(P, args)
+            P, N, j = P[~free], N[~free], j[~free]
+        if args.max_new and len(P) > args.max_new:
             s = rng.choice(len(P), args.max_new, replace=False)
             P, N, j = P[s], N[s], j[s]
         report.append((os.path.basename(fp), n_tot, len(P), ""))
