@@ -16,6 +16,7 @@ feeds this directly and mesh_from_gaussians.py consumes the result with -m.
 """
 import os, argparse, functools, random
 import numpy as np
+from PIL import Image
 import torch
 import torch.nn.functional as tf
 
@@ -72,6 +73,43 @@ def fit_to(x, H, W):
     return y.bool() if x.dtype == torch.bool else y
 
 
+def load_masks(cams, root, device):
+    """Object masks for the photometric term.
+
+    objects_voted/<gid> is a label slice of the SCENE model, so its cfg_args carries the
+    scene's source_path and every room frame. Rendering one object against a full-room
+    photo pins L_photo at a constant ~0.73 whose gradient asks the object's gaussians to
+    explain the background. make_object_dirs.py symlinks the room frames unmasked, so
+    restricting the view list is not enough -- both sides have to be masked here.
+    """
+    keep, M, miss = [], [], []
+    for c in cams:
+        p = os.path.join(root, c.image_name + ".png")
+        if not os.path.exists(p):
+            miss.append(c.image_name); continue
+        a = torch.from_numpy(np.array(Image.open(p).convert("L")))[None, None].float()
+        a = tf.interpolate(a, size=(c.image_height, c.image_width), mode="nearest")
+        keep.append(c); M.append((a[0, 0] > 127).to(device))
+    assert len(keep) >= 10, (
+        f"only {len(keep)} of {len(cams)} views have a mask under {root}. "
+        f"Point -s at the per-object dataset (data/<scene>/masks/<gid>), not the scene.")
+    if miss:
+        print(f"[photo] {len(miss)} views without a mask, dropped")
+    cov = float(torch.stack([m.float().mean() for m in M]).mean()) * 100
+    print(f"[photo] masked by {root}   {len(keep)} views, object covers {cov:.2f}% of a frame")
+    return keep, M
+
+
+def photo_loss(pkg, gt, m, opt):
+    if m is None:
+        return (1.0 - opt.lambda_dssim) * l1_loss(pkg["render"], gt) \
+            + opt.lambda_dssim * (1.0 - ssim(pkg["render"], gt))
+    # No SSIM here: masking cuts a hard edge into both images that SSIM reads as
+    # structure to match. L1 inside the mask is the honest term.
+    w = m.float()[None]
+    return ((pkg["render"] - gt).abs() * w).sum() / (w.sum() * 3.0)
+
+
 def novel_loss(pkg, d_ref, mask, args):
     """Depth + opacity on pixels the prior covers and no training view saw.
 
@@ -118,6 +156,10 @@ def main():
     ap.add_argument("--min_sup_px", default=200, type=int)
     ap.add_argument("--freeze_xyz", action="store_true",
                     help="opacity/scale/rotation only; positions stay on the prior surface")
+    ap.add_argument("--masks", default="",
+                    help="per-view object masks; default <source_path>/masks. "
+                         "Pass 'none' to disable (only correct for a model trained "
+                         "on this exact image set).")
     ap.add_argument("--log_every", default=250, type=int)
     ap.add_argument("--seed", default=0, type=int)
     args = get_combined_args(ap)      # source_path and resolution come from -m's cfg_args
@@ -148,6 +190,12 @@ def main():
 
     novel, d_all, m_all = load_novel(args.prior_depth, dev)
     train = scene.getTrainCameras().copy()
+    mroot = args.masks or os.path.join(dataset.source_path, "masks")
+    if mroot == "none":
+        masks = [None] * len(train)
+        print("[photo] unmasked -- correct only if -m was trained on these images")
+    else:
+        train, masks = load_masks(train, os.path.expanduser(mroot), dev)
     bg = torch.tensor([1, 1, 1] if dataset.white_background else [0, 0, 0],
                       dtype=torch.float32, device=dev)
     print(f"[init] {gaussians.get_xyz.shape[0]:,} gaussians  {len(train)} train views  "
@@ -158,11 +206,9 @@ def main():
         gaussians.update_learning_rate(it)
         if not pool:
             pool = list(range(len(train))); random.shuffle(pool)
-        cam = train[pool.pop()]
-        pkg = render(cam, gaussians, pipe, bg)
-        gt = cam.original_image.to(dev)
-        lp = (1.0 - opt.lambda_dssim) * l1_loss(pkg["render"], gt) \
-            + opt.lambda_dssim * (1.0 - ssim(pkg["render"], gt))
+        i = pool.pop()
+        pkg = render(train[i], gaussians, pipe, bg)
+        lp = photo_loss(pkg, train[i].original_image.to(dev), masks[i], opt)
         loss, ld, la = lp, 0.0, 0.0
 
         if it > args.warmup:
