@@ -32,12 +32,39 @@ from scipy.spatial import cKDTree
 from skimage.measure import marching_cubes
 
 
+def disc_samples(P, T1, T2, N, S, k, seed=0):
+    """Spread k points over each gaussian's disc.
+
+    Using only the centres makes the input far sparser than what a view-based TSDF sees:
+    9,815 centres for obj6 against hundreds of views of per-pixel depth. Poisson from that
+    returned an accurate but incomplete surface (seen precision 0.98, recall 0.90; seen
+    completion 2.88 -> 11.41mm). Each gaussian is an oriented disc, so its extent is known.
+    """
+    if k <= 1:
+        return P, N
+    rng = np.random.default_rng(seed)
+    n = len(P)
+    # tangents come from the rotation, not from an arbitrary basis built off the normal:
+    # the disc is elliptical and its axes carry the two scales
+    s1 = S[:, 0:1]
+    s2 = S[:, 1:2] if S.shape[1] > 1 else S[:, 0:1]
+    r = np.sqrt(rng.random((n, k, 1)))                 # uniform over the disc
+    th = rng.random((n, k, 1)) * 2 * np.pi
+    off = (r * np.cos(th)) * (s1 * T1)[:, None] + (r * np.sin(th)) * (s2 * T2)[:, None]
+    Q = (P[:, None] + off).reshape(-1, 3)
+    M = np.repeat(N, k, axis=0)
+    print(f"[disc] {n:,} gaussians x {k} -> {len(Q):,} oriented points")
+    return Q, M
+
+
 def load_gaussians(path, min_opacity=0.1, max_scale=0.2):
     v = PlyData.read(os.path.expanduser(path))["vertex"]
     P = np.stack([v[k] for k in ("x", "y", "z")], 1).astype(np.float64)
     q = np.stack([v[f"rot_{i}"] for i in range(4)], 1).astype(np.float64)
     q /= np.maximum(np.linalg.norm(q, axis=1, keepdims=True), 1e-9)
     w, x, y, z = q.T
+    T1 = np.stack([1 - 2 * (y * y + z * z), 2 * (x * y + w * z), 2 * (x * z - w * y)], 1)
+    T2 = np.stack([2 * (x * y - w * z), 1 - 2 * (x * x + z * z), 2 * (y * z + w * x)], 1)
     N = np.stack([2 * (x * z + w * y), 2 * (y * z - w * x), 1 - 2 * (x * x + y * y)], 1)
     op = 1.0 / (1.0 + np.exp(-np.asarray(v["opacity"], np.float64)))
     ns = sum(1 for n in v.data.dtype.names if n.startswith("scale_"))
@@ -47,7 +74,7 @@ def load_gaussians(path, min_opacity=0.1, max_scale=0.2):
     keep = (op >= min_opacity) & (sc.max(1) <= max_scale)
     print(f"[gauss] {len(P):,} -> {int(keep.sum()):,} after opacity >= {min_opacity} "
           f"and scale <= {max_scale}m")
-    return P[keep], N[keep], sc[keep]
+    return P[keep], T1[keep], T2[keep], N[keep], sc[keep]
 
 
 def splat(P, N, voxel, trunc, band):
@@ -106,7 +133,9 @@ def main():
                     help="ignore voxels farther than this from any gaussian")
     ap.add_argument("--min_opacity", type=float, default=0.1)
     ap.add_argument("--max_scale", type=float, default=0.2)
-    ap.add_argument("--poisson_depth", type=int, default=9)
+    ap.add_argument("--disc_samples", type=int, default=20,
+                    help="points sampled per gaussian disc; 1 uses the centre only")
+    ap.add_argument("--poisson_depth", type=int, default=10)
     ap.add_argument("--poisson_trim", type=float, default=0.02,
                     help="drop vertices below this density quantile. Poisson closes holes, "
                          "which completes an object but can also invent surface where the "
@@ -117,7 +146,8 @@ def main():
 
     ply = os.path.join(os.path.expanduser(args.model), "point_cloud",
                        f"iteration_{args.iteration}", "point_cloud.ply")
-    P, N, _ = load_gaussians(ply, args.min_opacity, args.max_scale)
+    P, T1, T2, N, S = load_gaussians(ply, args.min_opacity, args.max_scale)
+    P, N = disc_samples(P, T1, T2, N, S, args.disc_samples)
     m = (splat(P, N, args.voxel, args.trunc, args.band) if args.method == "splat"
          else poisson(P, N, args.poisson_depth, args.poisson_trim))
     m.remove_duplicated_vertices(); m.remove_degenerate_triangles()
