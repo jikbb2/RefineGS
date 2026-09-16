@@ -23,13 +23,85 @@ import argparse
 import os
 import sys
 
+import functools
 import numpy as np
 import open3d as o3d
+from PIL import Image
+
+print = functools.partial(print, flush=True)     # the heavy loops must show progress
 from skimage.measure import marching_cubes
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from warp_gt_to_pose import read_colmap                          # noqa: E402
-from sdf_distill_depth import load_gt_depth                      # noqa: E402
+# Self-contained on purpose. Importing sdf_distill_depth pulls in torch, and torch loaded
+# after open3d in the same process can segfault -- the script then exits with no output and
+# no traceback, which is exactly what happened.
+
+
+def _qvec2rot(q):
+    w, x, y, z = q
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+        [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+        [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)]])
+
+
+def read_colmap(path):
+    """Minimal COLMAP text reader: [{stem,R,t,fx,fy,cx,cy,W,H}] sorted by name."""
+    path = os.path.expanduser(path)
+    cams = {}
+    with open(os.path.join(path, "cameras.txt")) as f:
+        for l in f:
+            if l.startswith("#") or not l.strip():
+                continue
+            p = l.split()
+            cid, model, W, H = int(p[0]), p[1], int(p[2]), int(p[3])
+            v = [float(x) for x in p[4:]]
+            if model in ("PINHOLE", "OPENCV"):
+                fx, fy, cx, cy = v[0], v[1], v[2], v[3]
+            elif model in ("SIMPLE_PINHOLE", "SIMPLE_RADIAL"):
+                fx = fy = v[0]; cx, cy = v[1], v[2]
+            else:
+                raise SystemExit(f"unsupported camera model {model}")
+            cams[cid] = dict(fx=fx, fy=fy, cx=cx, cy=cy, W=W, H=H)
+    out = []
+    with open(os.path.join(path, "images.txt")) as f:
+        lines = [l for l in f.read().split("\n")]
+    i = 0
+    while i < len(lines) and lines[i].startswith("#"):
+        i += 1
+    while i < len(lines):
+        l = lines[i].strip()
+        if not l:
+            i += 1; continue
+        p = l.split()
+        q = [float(x) for x in p[1:5]]
+        t = np.array([float(x) for x in p[5:8]])
+        c = dict(cams[int(p[8])])
+        c["stem"] = os.path.splitext(p[9])[0]
+        c["R"] = _qvec2rot(q)                       # world -> camera
+        c["t"] = t
+        out.append(c)
+        i += 2                                      # skip the POINTS2D line
+    return sorted(out, key=lambda c: c["stem"])
+
+
+def load_gt_depth(d, stem, H, W, scale):
+    """depth in metres, or None. Naming: frameNNN -> depthNNN, same name, or _depth."""
+    if not d:
+        return None
+    d = os.path.expanduser(d)
+    for nm in (stem.replace("frame", "depth"), stem, stem + "_depth"):
+        for ext in (".png", ".npy"):
+            p = os.path.join(d, nm + ext)
+            if not os.path.isfile(p):
+                continue
+            a = np.load(p) if ext == ".npy" else np.asarray(Image.open(p))
+            if a.ndim == 3:
+                a = a[..., 0]
+            a = a.astype(np.float32) / (1.0 if ext == ".npy" else scale)
+            if a.shape != (H, W):
+                a = np.asarray(Image.fromarray(a).resize((W, H), Image.NEAREST))
+            return a
+    return None
 
 
 def prior_mesh(npz, level=0.0):
@@ -84,7 +156,11 @@ def main():
                     help="orbit radius as a multiple of the object's half-extent")
     ap.add_argument("--margin", type=float, default=0.02,
                     help="|z - d_gt| tolerance for calling a point observed")
-    ap.add_argument("--obs_views", type=int, default=150, help="training views to test against")
+    ap.add_argument("--obs_views", type=int, default=80,
+                    help="training views the observed test runs against")
+    ap.add_argument("--obs_ds", type=int, default=2,
+                    help="downscale the cached GT depth; a visibility test does not need "
+                         "full resolution")
     ap.add_argument("--stems", default="")
     args = ap.parse_args()
 
@@ -112,6 +188,22 @@ def main():
     print(f"[views] {W}x{H}  intrinsics from {c0['stem']}  "
           f"observed test against {len(obs)} training views")
 
+    # Cache the GT depth once. Reading it per pose meant n_poses x obs_views PNG loads
+    # (60 x 150 = 9000) and the script looked hung.
+    print("[cache] loading GT depth ...")
+    OBS = []
+    for c in obs:
+        Dg = load_gt_depth(args.gt_depth_dir, c["stem"], c["H"], c["W"],
+                           args.gt_depth_scale)
+        if Dg is None:
+            continue
+        Dg = np.asarray(Dg, np.float32)
+        if args.obs_ds > 1:
+            Dg = Dg[::args.obs_ds, ::args.obs_ds]
+        OBS.append((c, Dg))
+    assert OBS, "no GT depth matched the training stems -- check --gt_depth_dir"
+    print(f"[cache] {len(OBS)} depth maps, {sum(d.nbytes for _, d in OBS)/1e6:.0f} MB")
+
     poses = orbit(center, radius, args.n_poses)
     D = np.zeros((len(poses), H, W), np.float32)
     U = np.zeros((len(poses), H, W), bool)
@@ -133,11 +225,7 @@ def main():
         y = (vv - K[1, 2]) / K[1, 1] * z
         P = (np.stack([x, y, z], 1) - t) @ R
         seen = np.zeros(len(P), bool)
-        for c in obs:
-            Dg = load_gt_depth(args.gt_depth_dir, c["stem"], c["H"], c["W"],
-                               args.gt_depth_scale)
-            if Dg is None:
-                continue
+        for c, Dg in OBS:
             Hd, Wd = Dg.shape
             sx, sy = Wd / c["W"], Hd / c["H"]
             Xc = P @ c["R"].T + c["t"]
@@ -152,8 +240,8 @@ def main():
         u[vv, uu] = ~seen
         U[i] = u
         n_unseen += int(u.sum())
-        if (i + 1) % 20 == 0:
-            print(f"  pose {i + 1}/{len(poses)}")
+        print(f"  pose {i + 1}/{len(poses)}  hit {hit.mean()*100:4.1f}%  "
+              f"unseen {u.mean()*100:4.1f}%")
 
     out = os.path.expanduser(args.out)
     os.makedirs(os.path.dirname(os.path.abspath(out)) or ".", exist_ok=True)
