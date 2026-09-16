@@ -117,7 +117,7 @@ def prior_mesh(npz, level=0.0):
     return m
 
 
-def look_at(eye, target, up=np.array([0.0, 0.0, 1.0])):
+def look_at(eye, target, up):
     """world->camera R, t for a CV-convention camera (+Z forward)."""
     f = target - eye
     f /= max(np.linalg.norm(f), 1e-9)
@@ -129,18 +129,48 @@ def look_at(eye, target, up=np.array([0.0, 0.0, 1.0])):
     return R, -R @ eye
 
 
-def orbit(center, radius, n, elev_deg=(-30, 0, 30, 60)):
-    """Poses on a few elevation rings. Low rings matter: the underside of a table is the
-    part no training view reached."""
-    out = []
+def orbit(center, radius, n, elev_deg=(-60, -45, -30, -15, 0, 30), up_axis=2,
+          reach=None, obj_radius=0.0):
+    """Poses on elevation rings, and which ring each belongs to.
+
+    Low rings carry the supervision. Measured on a table, per ring: -30 gave up to 10.2%
+    unobserved pixels while +60 gave 0.7-1.0%, because the top was already observed. Rings
+    above the horizon are nearly wasted on furniture, so the default leans downward.
+    """
+    up = np.zeros(3); up[up_axis] = 1.0
+    ax = [i for i in range(3) if i != up_axis]
+    out, ring, blocked = [], [], 0
     per = max(1, n // len(elev_deg))
     for e in elev_deg:
         for i in range(per):
             a = 2 * np.pi * i / per + (0.5 * np.pi / per) * (e / 30.0)
             ce, se = np.cos(np.radians(e)), np.sin(np.radians(e))
-            eye = center + radius * np.array([ce * np.cos(a), ce * np.sin(a), se])
-            out.append(look_at(eye, center))
-    return out
+            off = np.zeros(3)
+            off[ax[0]], off[ax[1]], off[up_axis] = ce * np.cos(a), ce * np.sin(a), se
+            eye = center + radius * off
+            if reach is not None and not reachable(reach, eye, center, obj_radius):
+                blocked += 1
+                continue
+            out.append(look_at(eye, center, up))
+            ring.append(e)
+    if reach is not None:
+        print(f"[reach] {blocked} poses dropped as blocked, {len(out)} kept")
+    return out, np.array(ring)
+
+
+def reachable(rc, eye, center, obj_radius, slack=1.5):
+    """False when something blocks the camera before it reaches the object.
+
+    A pose inside a wall or a sofa renders nothing useful, and its prior depth would
+    supervise the gaussians from a viewpoint that can never occur.
+    """
+    d = center - eye
+    dist = float(np.linalg.norm(d))
+    if dist < 1e-6:
+        return False
+    ray = o3d.core.Tensor([[*eye, *(d / dist)]], dtype=o3d.core.Dtype.Float32)
+    t = float(rc.cast_rays(ray)["t_hit"].numpy()[0])
+    return not (np.isfinite(t) and t < dist - obj_radius * slack)
 
 
 def main():
@@ -152,7 +182,17 @@ def main():
     ap.add_argument("--gt_depth_scale", type=float, default=6553.5)
     ap.add_argument("--out", required=True)
     ap.add_argument("--n_poses", type=int, default=60)
-    ap.add_argument("--radius_scale", type=float, default=2.2,
+    ap.add_argument("--up_axis", type=int, default=2,
+                    help="world up: 2 = Z. On this data the +60 ring was almost fully "
+                         "observed and the 0 ring covered the fewest pixels, which is what "
+                         "a flat table looks like under Z-up")
+    ap.add_argument("--occluder_mesh", default="",
+                    help="scene mesh used to reject poses behind a wall or inside "
+                         "furniture. The GT mesh works")
+    ap.add_argument("--elev", default="-60,-45,-30,-15,0,30",
+                    help="elevation rings in degrees. Negative looks up from below, which "
+                         "is where an unobserved underside is")
+    ap.add_argument("--radius_scale", type=float, default=1.8,
                     help="orbit radius as a multiple of the object's half-extent")
     ap.add_argument("--margin", type=float, default=0.02,
                     help="|z - d_gt| tolerance for calling a point observed")
@@ -204,7 +244,15 @@ def main():
     assert OBS, "no GT depth matched the training stems -- check --gt_depth_dir"
     print(f"[cache] {len(OBS)} depth maps, {sum(d.nbytes for _, d in OBS)/1e6:.0f} MB")
 
-    poses = orbit(center, radius, args.n_poses)
+    reach = None
+    if args.occluder_mesh and os.path.isfile(os.path.expanduser(args.occluder_mesh)):
+        om = o3d.io.read_triangle_mesh(os.path.expanduser(args.occluder_mesh))
+        reach = o3d.t.geometry.RaycastingScene()
+        reach.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(om))
+        print(f"[reach] occluder {len(om.triangles):,} tris")
+    elev = tuple(float(x) for x in args.elev.split(","))
+    poses, ring = orbit(center, radius, args.n_poses, elev, args.up_axis, reach, half)
+    assert poses, "every pose was blocked -- check --occluder_mesh or raise --radius_scale"
     D = np.zeros((len(poses), H, W), np.float32)
     U = np.zeros((len(poses), H, W), bool)
     n_hit = n_unseen = 0
@@ -248,8 +296,13 @@ def main():
     np.savez_compressed(
         out if out.endswith(".npz") else out + ".npz",
         R=np.stack([p[0] for p in poses]), t=np.stack([p[1] for p in poses]),
-        K=K, W=W, H=H, depth=D, unseen=U, center=center, radius=radius)
+        K=K, W=W, H=H, depth=D, unseen=U, center=center, radius=radius, ring=ring)
     px = len(poses) * H * W
+    print(f"\n{'ring':>7}{'poses':>7}{'hit%':>8}{'unseen%':>9}")
+    for e in sorted(set(ring.tolist())):
+        m = ring == e
+        print(f"{e:>7.0f}{int(m.sum()):>7}{(D[m] > 0).mean()*100:>8.1f}"
+              f"{U[m].mean()*100:>9.1f}")
     print(f"\n[out] {out}   {len(poses)} poses")
     print(f"  prior hit   {n_hit / px * 100:5.1f}% of pixels")
     print(f"  supervised  {n_unseen / px * 100:5.1f}% (hit and not observed by training views)")
