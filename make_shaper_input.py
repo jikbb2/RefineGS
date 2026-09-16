@@ -204,7 +204,8 @@ def find_image(images_dir, stem):
 def main():
     ap = argparse.ArgumentParser(description="RefineGS object -> ShapeR input pkl")
     ap.add_argument("--gid", required=True)
-    ap.add_argument("--recon", required=True, help="observed object mesh (fuse_post.ply)")
+    ap.add_argument("--recon", default="", help="observed object mesh (fuse_post.ply); "
+                                                "only needed with --points_from mesh")
     ap.add_argument("--colmap", required=True)
     ap.add_argument("--images", required=True)
     ap.add_argument("--masks_root", default="")
@@ -248,6 +249,15 @@ def main():
                     help="tolerance (m) for calling a point observed: |z - depth| < margin")
     ap.add_argument("--seen_min_views", type=int, default=2,
                     help="views that must confirm a point")
+    ap.add_argument("--points_from", default="mesh", choices=["mesh", "depth"],
+                    help="where the conditioning points come from. 'mesh' samples the "
+                         "reconstruction, so the point count is bounded by gaussian "
+                         "density: measured on room0, a book has 61 gaussians within 2cm "
+                         "of its GT surface and a plate has 0, so no labelling or voting "
+                         "can recover them. 'depth' back-projects masked pixels instead, "
+                         "which gives thousands of points for the same object. Note the "
+                         "pipeline already requires --gt_depth_dir for the carve, so this "
+                         "uses an input it already has -- state the RGB-D assumption")
     ap.add_argument("--free_points", type=int, default=6000,
                     help="observed free-space samples to carry in the pkl (0 = off); "
                          "used by shaper_field.py --guide_free_w to constrain generation")
@@ -255,9 +265,39 @@ def main():
 
     assert read_colmap is not None, "cannot import warp_gt_to_pose -- run from the RefineGS root"
 
+    def points_from_depth(stems, cams):
+        """Back-project masked pixels of each view; the density is set by the mask, not
+        by how many gaussians the reconstruction happened to place."""
+        out = []
+        for st in stems:
+            D = load_depth_map(args.depth_dir, st, args.depth_scale)
+            M = load_mask(args.masks_root, args.gid, st) if args.masks_root else None
+            if D is None or M is None:
+                continue
+            c = cams[st]
+            H, W = D.shape
+            if M.shape != (H, W):
+                M = np.array(Image.fromarray(M.astype(np.uint8))
+                             .resize((W, H), Image.NEAREST)) > 0
+            m = M & (D > 0.01)
+            if not m.any():
+                continue
+            vv, uu = np.nonzero(m)
+            z = D[vv, uu]
+            sx, sy = W / c["W"], H / c["H"]
+            x = (uu / sx - c["cx"]) / c["fx"] * z
+            y = (vv / sy - c["cy"]) / c["fy"] * z
+            out.append((np.stack([x, y, z], 1) - c["t"]) @ c["R"])
+        assert out, f"gid {args.gid}: no masked depth pixel found"
+        P = np.concatenate(out)
+        print(f"[points] gid {args.gid}: {len(P):,} from masked depth in {len(out)} views")
+        return P
+
     # ---- 1) observed points (world, metric) ----
-    m = o3d.io.read_triangle_mesh(os.path.expanduser(args.recon))
-    assert len(m.vertices), f"failed to load recon: {args.recon}"
+    m = o3d.io.read_triangle_mesh(os.path.expanduser(args.recon)) if args.recon \
+        else o3d.geometry.TriangleMesh()
+    assert args.points_from == "depth" or len(m.vertices), \
+        f"failed to load recon: {args.recon}"
     # Unseeded sampling changes the conditioning points, and ShapeR follows them closely.
     # This, not ShapeR's own sampling, was the main source of run-to-run variation.
     _seeded = False
@@ -270,12 +310,14 @@ def main():
     # directly spends the budget on junk the filter deletes. The pool is fixed so changing
     # --n_points cannot move the object frame (which would break ensemble averaging).
     n_pool = max(args.n_pool, args.n_points)
-    try:
-        pc = m.sample_points_uniformly(n_pool, seed=args.seed)
-        _seeded = True
-    except TypeError:
-        pc = m.sample_points_uniformly(n_pool)
-    P_w = np.asarray(pc.points, np.float64)
+    P_w = None
+    if args.points_from == "mesh":
+        try:
+            pc = m.sample_points_uniformly(n_pool, seed=args.seed)
+            _seeded = True
+        except TypeError:
+            pc = m.sample_points_uniformly(n_pool)
+        P_w = np.asarray(pc.points, np.float64)
     if not _seeded:
         print("[points] WARN this Open3D ignores the sampling seed; runs will differ")
 
@@ -301,7 +343,13 @@ def main():
     # exactly the worst reconstructions (measured raw/robust 2.73, 1.69, 1.62, 1.52).
     # Use the filtered points and a percentile bbox.
     F_m = np.zeros((0, 3), np.float32)
-    if args.depth_dir:
+    if args.points_from == "depth":
+        # every point IS a masked depth sample, so filter_observed would pass all of them
+        P_w = points_from_depth(stems, cams)
+        if len(P_w) > n_pool:
+            P_w = P_w[np.random.default_rng(args.seed).choice(len(P_w), n_pool,
+                                                              replace=False)]
+    elif args.depth_dir:
         P_w = filter_observed(P_w, stems, cams, args)
 
     q = args.frame_pct
@@ -315,7 +363,7 @@ def main():
     T_model_world[:3, :3] = R_align
     T_model_world[:3, 3] = -R_align @ center
 
-    V_w = np.asarray(m.vertices, np.float64)
+    V_w = np.asarray(m.vertices, np.float64) if len(m.vertices) else P_w
     raw_b = np.abs((R_align @ (V_w - center).T).T).max(0) * args.bounds_margin
     if args.depth_dir and args.free_points > 0:
         F_m = sample_free_points(stems, cams, center, R_align, bounds, args,

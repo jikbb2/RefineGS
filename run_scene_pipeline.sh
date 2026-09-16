@@ -33,6 +33,7 @@ LABEL_DIR=${LABEL_DIR:-${DATA}/labels_scene}
 IMAGES=${IMAGES:-${DATA}/images}
 MASKS=${MASKS:-${DATA}/masks}
 ONLY=${ONLY:-}                     # restrict to some gids, e.g. ONLY="9 11 63"
+POINTS_FROM=${POINTS_FROM:-mesh}   # mesh | depth  (see make_shaper_input.py)
 # poses live in sparse/0 or sparse_dense/0 depending on how the room was built
 if [ -z "${COLMAP:-}" ]; then
   for sd in sparse/0 sparse_dense/0; do
@@ -53,6 +54,11 @@ PKL_SUBDIR=${PKL_SUBDIR:-$(basename "${OBJ}")}   # keeps pkls apart from other p
 EXTRACT_EXTRA=${EXTRACT_EXTRA:-}
 
 PLY=${SCENE_MODEL}/point_cloud/iteration_${ITER}/point_cloud.ply
+# Voting depends on the LABEL SOURCE, not just the scene model. Two label sets over one
+# scene (SAM3 and GT-raycast, say) must not share a vote directory: the second run finds
+# labels.npy, skips voting, and silently extracts the first run's assignment under the
+# second run's names.
+VOTE=${VOTE:-${OBJ}/vote}
 stage_at() {                        # is this stage at or after FROM?
   local order="vote extract mesh pkl field fuse" i=0 j=0 k=0
   for s in ${order}; do i=$((i+1)); [ "$s" = "$1" ] && j=$i; [ "$s" = "${FROM}" ] && k=$i; done
@@ -69,12 +75,13 @@ done
 echo "  scene=${SCENE_MODEL}"
 echo "  objects=${OBJ}   prior=${PRIOR}"
 echo "  poses=${COLMAP}   gt_depth=${GTD}"
+echo "  labels=${LABEL_DIR}   vote=${VOTE}"
 echo "  pkl=${SHAPER_DIR}/data/${PKL_SUBDIR}   from=${FROM}   clean=${CLEAN}"
 cd "${ROOT}" || exit 1
 
 if [ "${CLEAN}" = "1" ]; then
   echo ""; echo "=== clean: removing outputs from '${FROM}' onward ==="
-  stage_at vote    && { echo "  ${SCENE_MODEL}/vote"; rm -rf "${SCENE_MODEL}/vote"; }
+  stage_at vote    && { echo "  ${VOTE}"; rm -rf "${VOTE}"; }
   stage_at extract && { echo "  ${OBJ}  (incl. names.tsv)"; rm -rf "${OBJ}"; }
   # 'mesh' only re-meshes; extract already removed the dirs when it ran
   if stage_at mesh && [ -d "${OBJ}" ]; then
@@ -91,21 +98,21 @@ fi
 
 # Skip when the output is already there. FROM only sets where to START; deleting outputs
 # is CLEAN's job, so the two do not have to be reasoned about together.
-if stage_at vote && [ ! -f "${SCENE_MODEL}/vote/labels.npy" ]; then
+if stage_at vote && [ ! -f "${VOTE}/labels.npy" ]; then
   echo ""; echo "=== vote: per-gaussian instance labels ==="
   python vote_labels.py --ply "${PLY}" --colmap "${COLMAP}" \
     --label_dir "${LABEL_DIR}" --gt_depth_dir "${GTD}" \
-    --out "${SCENE_MODEL}/vote" || exit 1
+    --out "${VOTE}" || exit 1
   echo "--- label coherence (previous run: mean compactness 0.754, 17 classes >= 0.8) ---"
-  python check_scene_labels.py --ply "${PLY}" --labels "${SCENE_MODEL}/vote/labels.npy" \
+  python check_scene_labels.py --ply "${PLY}" --labels "${VOTE}/labels.npy" \
     | tail -6
 fi
 
 if stage_at extract && [ ! -f "${OBJ}/objects.json" ]; then
   echo ""; echo "=== extract: slice the scene into per-object models ==="
-  python extract_objects.py --ply "${PLY}" --labels "${SCENE_MODEL}/vote/labels.npy" \
+  python extract_objects.py --ply "${PLY}" --labels "${VOTE}/labels.npy" \
     --scene_dir "${SCENE_MODEL}" --id_map "${LABEL_DIR}/id_map.json" \
-    --source_root "${DATA}/masks" --vote_dir "${SCENE_MODEL}/vote" \
+    --source_root "${MASKS}" --vote_dir "${VOTE}" \
     --out "${OBJ}" --iter "${ITER}" ${EXTRACT_EXTRA} || exit 1
 fi
 
@@ -131,6 +138,7 @@ for ph in pkl field fuse; do
   PRIOR="${PRIOR}" ITER="${ITER}" OUT="${OBJ}" CSV="${CSV}" PHASE="${ph}" \
     PKL_SUBDIR="${PKL_SUBDIR}" CAPTIONS="${OBJ}/names.tsv" COLMAP="${COLMAP}" \
     MASKS="${MASKS}" IMAGES="${IMAGES}" GT_MESH="${GT_MESH}" ONLY="${ONLY}" \
+    POINTS_FROM="${POINTS_FROM}" \
     bash run_field_fusion_batch.sh || exit 1
 done
 

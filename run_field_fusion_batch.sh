@@ -63,6 +63,8 @@ BOUNDS_MARGIN=${BOUNDS_MARGIN:-1.15}
 SEEN_MARGIN=${SEEN_MARGIN:-0.02}
 SEEN_MIN_VIEWS=${SEEN_MIN_VIEWS:-2}
 FREE_POINTS=${FREE_POINTS:-0}                # free-space constraint at generation (0=off)
+# mesh: sample the reconstruction (density-bound).  depth: back-project masked pixels.
+POINTS_FROM=${POINTS_FROM:-mesh}
 GUIDE_FREE_W=${GUIDE_FREE_W:-0}
 PHASE=${PHASE:-all}
 ONLY=${ONLY:-}                               # e.g. ONLY="1 6 11"
@@ -95,6 +97,7 @@ done
 echo "targets (${#gids[@]}): ${gids[*]}"
 echo "  out=${OUT} iter=${ITER} prior=${PRIOR} pkl=${PKL_DIR}"
 echo "  n_points=${NPTS} seed=${SEED} grid=${GRID} cfg=${CFG} ensemble=${ENSEMBLE}/${COMBINE}"
+echo "  points_from=${POINTS_FROM}"
 [ -n "${FUSE_EXTRA}" ] && echo "  FUSE_EXTRA=${FUSE_EXTRA}"
 [ -f "${CAPTIONS}" ] || echo "  no caption file (${CAPTIONS}); using the default text"
 
@@ -149,6 +152,7 @@ if [ "${PHASE}" = "pkl" ] || [ "${PHASE}" = "all" ]; then
       --recon "${RECON}" --colmap "${COLMAP}" --images "${IMAGES}" \
       --masks_root "${MASKS}" ${STEMS:+$([ -f "${STEMS}" ] && echo --stems "${STEMS}")} \
       --depth_dir "${GTD}" --seen_margin "${SEEN_MARGIN}" \
+      --points_from "${POINTS_FROM}" \
       --seen_min_views "${SEEN_MIN_VIEWS}" --free_points "${FREE_POINTS}" \
       --caption "$(caption_of "${gid}")" --out "${PKL_DIR}/obj${gid}.pkl" \
       > "${LOGDIR}/pkl_${gid}.log" 2>&1
