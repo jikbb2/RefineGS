@@ -104,6 +104,13 @@ def main():
     for f in args.fields:
         files += sorted(glob.glob(os.path.expanduser(f)))
     print(len(files))
+    if not files:
+        raise SystemExit(
+            "[abort] no prior field matched --fields.\n"
+            "  Quote the pattern so the shell does not expand it: --fields '~/prior/obj*_field.npz'\n"
+            "  NOTE the per-object and scene runs both write obj<gid>_field.npz, so one\n"
+            "  overwrites the other unless PRIOR= points somewhere separate. Check the\n"
+            "  timestamps to see which run produced the files you are about to use.")
 
     n_scale = sum(1 for n in names if n.startswith("scale_"))
     n_rest = sum(1 for n in names if n.startswith("f_rest_"))
@@ -151,7 +158,7 @@ def main():
     print(f"\n{'field':<28}{'surface':>10}{'injected':>10}  note")
     for nm, a, b, note in report:
         print(f"{nm:<28}{a:>10,}{b:>10,}  {note}")
-    n_new = sum(len(c) for c in chunks)
+    n_new = sum(b for _, _, b, _ in report)   # not len(chunks): dry_run fills nothing
     print(f"\ninjected {n_new:,} gaussians "
           f"({n_new / max(len(V), 1) * 100:.1f}% of the scene)")
     if args.dry_run or not chunks:
