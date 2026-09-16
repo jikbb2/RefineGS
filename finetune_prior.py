@@ -94,7 +94,10 @@ def novel_loss(pkg, d_ref, mask, args):
 
 def main():
     ap = argparse.ArgumentParser()
-    mp, pp, op = ModelParams(ap), PipelineParams(ap), OptimizationParams(ap)
+    # sentinel=True makes every ModelParams default None. get_combined_args overwrites
+    # a cfg_args value with any command-line value that is not None, so without it the
+    # empty default source_path wins and Scene looks for sparse/ in the cwd.
+    mp, pp, op = ModelParams(ap, sentinel=True), PipelineParams(ap), OptimizationParams(ap)
     ap.add_argument("--prior_depth", required=True, help="npz from make_prior_depth.py")
     ap.add_argument("--start_ply", default="",
                     help="ply to start from; default = -m's checkpoint. Point this at "
@@ -122,6 +125,10 @@ def main():
 
     dev = torch.device("cuda")
     dataset, pipe, opt = mp.extract(args), pp.extract(args), op.extract(args)
+    assert dataset.source_path and os.path.isdir(dataset.source_path), (
+        f"source_path did not resolve ({dataset.source_path!r}). "
+        f"{args.model_path}/cfg_args is missing or unreadable; pass -s explicitly.")
+    print(f"[cfg] source {dataset.source_path}  resolution {dataset.resolution}")
     opt.iterations = opt.position_lr_max_steps = args.iters
     for k in ("position_lr_init", "position_lr_final", "feature_lr", "opacity_lr",
               "scaling_lr", "rotation_lr"):
