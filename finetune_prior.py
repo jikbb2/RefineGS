@@ -82,17 +82,29 @@ def load_masks(cams, root, device):
     explain the background. make_object_dirs.py symlinks the room frames unmasked, so
     restricting the view list is not enough -- both sides have to be masked here.
     """
+    # Forks disagree on whether image_name is the stem, the file name or a relative
+    # path, so both sides are reduced to the bare stem before matching.
+    stem = lambda s: os.path.splitext(os.path.basename(str(s)))[0]
+    have = {}
+    for f in (os.listdir(root) if os.path.isdir(root) else []):
+        if os.path.splitext(f)[1].lower() in (".png", ".jpg", ".jpeg"):
+            have[stem(f)] = os.path.join(root, f)
     keep, M, miss = [], [], []
     for c in cams:
-        p = os.path.join(root, c.image_name + ".png")
-        if not os.path.exists(p):
+        p = have.get(stem(c.image_name))
+        if p is None:
             miss.append(c.image_name); continue
         a = torch.from_numpy(np.array(Image.open(p).convert("L")))[None, None].float()
         a = tf.interpolate(a, size=(c.image_height, c.image_width), mode="nearest")
         keep.append(c); M.append((a[0, 0] > 127).to(device))
-    assert len(keep) >= 10, (
-        f"only {len(keep)} of {len(cams)} views have a mask under {root}. "
-        f"Point -s at the per-object dataset (data/<scene>/masks/<gid>), not the scene.")
+    if len(keep) < 10:
+        # print what is actually there instead of guessing at the naming convention
+        raise SystemExit(
+            f"[abort] {len(keep)} of {len(cams)} views matched a mask.\n"
+            f"  dir      {root}  ({len(have)} image files)\n"
+            f"  present  {sorted(have)[:4]}\n"
+            f"  wanted   {[stem(c.image_name) for c in cams[:4]]}\n"
+            f"  Masks are matched by stem. Pass --masks if they live elsewhere.")
     if miss:
         print(f"[photo] {len(miss)} views without a mask, dropped")
     cov = float(torch.stack([m.float().mean() for m in M]).mean()) * 100
@@ -120,14 +132,24 @@ def novel_loss(pkg, d_ref, mask, args):
     """
     n = mask.sum()
     if n < args.min_sup_px:
-        return None, 0.0, 0.0
+        return None, None
     m = mask.float()
+    a = pkg["rend_alpha"].squeeze(0)
     e = (pkg["surf_depth"].squeeze(0) - d_ref).abs()
     # Huber: the prior is only approximately right, so outliers must not dominate
     h = args.huber
     ld = ((torch.where(e < h, 0.5 * e ** 2 / h, e - 0.5 * h)) * m).sum() / n
-    la = ((1.0 - pkg["rend_alpha"].squeeze(0)).abs() * m).sum() / n
-    return args.lambda_depth * ld + args.lambda_alpha * la, ld.item(), la.item()
+    la = ((1.0 - a).abs() * m).sum() / n
+    # Split the residual. The injected gaussians sit ON the prior surface and the target
+    # is a raycast of that same mesh, so a covered pixel should already agree; anything
+    # large there means the pose convention is wrong, not that geometry needs fitting.
+    # A hole contributes the full prior depth instead, which is the other way to be wrong.
+    cov = m * (a > 0.5).float()
+    nc = cov.sum()
+    stat = (ld.item(), la.item(),
+            float(1.0 - nc / n),                                  # hole fraction
+            float((e * cov).sum() / nc) if nc > 0 else float("nan"))
+    return args.lambda_depth * ld + args.lambda_alpha * la, stat
 
 
 def main():
@@ -201,7 +223,7 @@ def main():
     print(f"[init] {gaussians.get_xyz.shape[0]:,} gaussians  {len(train)} train views  "
           f"extent {scene.cameras_extent:.2f}m  lr x{args.lr_scale}")
 
-    pool, npool, acc = [], [], np.zeros(4)
+    pool, npool, acc = [], [], np.zeros(6)
     for it in range(1, args.iters + 1):
         gaussians.update_learning_rate(it)
         if not pool:
@@ -209,7 +231,7 @@ def main():
         i = pool.pop()
         pkg = render(train[i], gaussians, pipe, bg)
         lp = photo_loss(pkg, train[i].original_image.to(dev), masks[i], opt)
-        loss, ld, la = lp, 0.0, 0.0
+        loss, st = lp, None
 
         if it > args.warmup:
             if not npool:
@@ -217,18 +239,20 @@ def main():
             j = npool.pop()
             npkg = render(novel[j], gaussians, pipe, bg)
             h, w = npkg["surf_depth"].shape[-2:]
-            ln, ld, la = novel_loss(npkg, fit_to(d_all[j], h, w), fit_to(m_all[j], h, w), args)
+            ln, st = novel_loss(npkg, fit_to(d_all[j], h, w), fit_to(m_all[j], h, w), args)
             if ln is not None:
                 loss = loss + ln
 
         loss.backward()
         gaussians.optimizer.step()
         gaussians.optimizer.zero_grad(set_to_none=True)
-        acc += (lp.item(), ld, la, 1)
+        acc += (lp.item(), 1) + ((st + (1,)) if st else (0, 0, 0, 0, 0))
 
         if it % args.log_every == 0 or it == args.iters:
-            p, dd, aa, n = acc
-            print(f"[{it:5d}/{args.iters}] photo {p/n:.4f}  depth {dd/n:.4f}m  alpha {aa/n:.4f}")
+            p, n, dd, aa, ho, ec, k = acc
+            k = max(k, 1)
+            print(f"[{it:5d}/{args.iters}] photo {p/n:.4f}  depth {dd/k:.4f}  "
+                  f"alpha {aa/k:.4f}  holes {ho/k*100:4.1f}%  err_covered {ec/k*1000:6.1f}mm")
             acc[:] = 0
 
     dst = os.path.join(os.path.expanduser(args.out), "point_cloud",
