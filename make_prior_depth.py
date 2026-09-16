@@ -256,3 +256,7 @@ def main():
     if n_unseen < 0.02 * n_hit:
         print("  WARN almost nothing is unobserved -- either the orbit does not reach the "
               "hidden side, or this object was already fully seen")
+
+
+if __name__ == "__main__":
+    main()
