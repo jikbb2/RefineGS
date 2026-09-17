@@ -18,7 +18,7 @@ is unnecessary: integrate rendered depth over both sets and keep the compositing
   python mesh_tsdf_views.py -m <objects_inj/6> --prior_depth ~/prior/pd6.npz \
       --out <.../train/ours_30000/mesh.ply>
 """
-import os, argparse, functools
+import os, sys, argparse, functools
 import numpy as np
 import torch
 import torch.nn.functional as tf
@@ -108,8 +108,6 @@ def main():
     ap.add_argument("--voxel", default=0.004, type=float, help="render.py's --voxel_size")
     ap.add_argument("--sdf_trunc", default=0.02, type=float)
     ap.add_argument("--depth_trunc", default=5.0, type=float)
-    ap.add_argument("--depth_ratio", default=1.0, type=float,
-                    help="render.py uses 1 (median depth), which is sharper on flat surfaces")
     ap.add_argument("--min_alpha", default=0.5, type=float,
                     help="skip pixels this transparent")
     ap.add_argument("--min_cos", default=0.2, type=float,
@@ -127,8 +125,14 @@ def main():
 
     dev = torch.device("cuda")
     dataset, pipe = mp.extract(args), pp.extract(args)
-    if hasattr(pipe, "depth_ratio"):
-        pipe.depth_ratio = args.depth_ratio
+    # --depth_ratio belongs to PipelineParams. Its default there is not render.py's, and
+    # a silent mismatch would make this mesh incomparable to fuse_post, so force 1 unless
+    # it was given explicitly.
+    if hasattr(pipe, "depth_ratio") and not any(
+            a.startswith("--depth_ratio") for a in sys.argv[1:]):
+        pipe.depth_ratio = 1.0
+    print(f"[cfg] depth_ratio {getattr(pipe, 'depth_ratio', 'n/a')}  "
+          f"min_cos {args.min_cos}  max_jump {args.max_jump}  erode {args.erode}")
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians, load_iteration=args.load_iteration, shuffle=False)
     if args.start_ply:
