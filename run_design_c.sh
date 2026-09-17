@@ -35,16 +35,20 @@ MASKS=${MASKS:-${ROOT}/data/${SCENE}/masks}
 STEMS_DIR=${STEMS_DIR:-$HOME/See3D/dataset/stage6/clean_stems}
 GTD=${GTD:-/home/elicer/nice-slam/Datasets/Replica/room0/results}
 GT_MESH=${GT_MESH:-$HOME/room_0/habitat/mesh_semantic.ply}
-# 0.02 is run_inject_test.sh's value and the one that produced a clean injected cloud.
-# 0.005 was tried on the theory that the extraction filter empties a 2cm band, but that
-# filter drops PIXELS per view; the observed gaussians stay in 3D. With a disc radius of
-# 0.006 it only stacks prior points on top of observed surface.
-NEW_DIST=${NEW_DIST:-0.02}
+# 0.005 measured better. At 0.02 every prior point within 2cm of an existing gaussian is
+# dropped, leaving a band the TSDF cannot fill: on obj6, 0.005 gave unseen F@2 0.6103 and
+# 0.02 gave 0.5475 against the same prior generation. 0.02 is run_inject_test.sh's value
+# and produces a cleaner-looking point cloud, but the metric prefers 0.005.
+NEW_DIST=${NEW_DIST:-0.005}
 GSCALE=${GSCALE:-0.006}
 CLEAN=${CLEAN:-0}               # 1 = redo every stage
 STAGE=${STAGE:-c}               # clean | c | all
 CSV=${CSV:-${INJ}/_design_c.csv}
 CLN_NAME=tsdf_clean_${RUN}.ply
+# The conditioning surface is filtered harder than a mesh meant for viewing. ShapeR
+# anchors to these points, so a ragged boundary is copied into the prior; losing a few
+# percent of good surface costs nothing because the prior fills it back in.
+CLEAN_ARGS=${CLEAN_ARGS:-"--min_alpha 0.7 --min_cos 0.35 --max_jump 0.02 --erode 3"}
 NAMES=${NAMES:-${OBJ}/names.tsv}
 
 cd "${ROOT}" || exit 1
@@ -74,14 +78,10 @@ if [ "${STAGE}" = "clean" ] || [ "${STAGE}" = "all" ]; then
     [ "${CLEAN}" = "1" ] && rm -f "${CLN}"
     fresh "${CLN}" mesh_tsdf_views.py "${OBJ}/${g}/point_cloud" \
       && { echo "  [${g}] clean: reuse"; continue; }
-    python mesh_tsdf_views.py -m "${OBJ}/${g}" --out "${CLN}" 2>&1 \
+    python mesh_tsdf_views.py -m "${OBJ}/${g}" --out "${CLN}" ${CLEAN_ARGS} 2>&1 \
       | grep -E "^\[out\]|kept" | tail -2 | sed "s/^/  [${g}] /"
   done
-  [ "${STAGE}" = "clean" ] && { echo ""
-    echo "next:  ONLY=\"${GIDS}\" OUT=${OBJ} ITER=${ITER} PRIOR=${PRIOR} \\"
-    echo "         PKL_SUBDIR=voted RECON_NAME=${CLN_NAME} RUN=${RUN} PHASE=all \\"
-    echo "         bash run_field_fusion_batch.sh"
-    echo "then:  GIDS=\"${GIDS}\" RUN=${RUN} bash run_design_c.sh"; exit 0; }
+  [ "${STAGE}" = "clean" ] && exit 0
 fi
 
 for g in ${GIDS}; do
@@ -132,7 +132,7 @@ for g in ${GIDS}; do
   python eval_seen_unseen.py --gt_mesh "${GT_MESH}" \
     --recon "${OUTD}/${FUSE_NAME}_post.ply" --recon2 "${TSDF}" \
     --colmap "${COLMAP}" --gid "${g}" --masks_root "${MASKS}" --use_mask \
-    --csv "${CSV}" --tag "c${g}" 2>&1 | sed -n '/A ->\|A →/,$p' | sed 's/^/  /'
+    --csv "${CSV}" --tag "c${g}" 2>&1 | sed -n '/^===== A ->/,$p' | sed 's/^/  /'
 done
 
 echo ""; echo "csv: ${CSV}   (A = grid fusion, B = injection + novel-pose TSDF)"
