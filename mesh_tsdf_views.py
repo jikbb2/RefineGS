@@ -21,6 +21,7 @@ is unnecessary: integrate rendered depth over both sets and keep the compositing
 import os, argparse, functools
 import numpy as np
 import torch
+import torch.nn.functional as tf
 import open3d as o3d
 
 print = functools.partial(print, flush=True)
@@ -39,23 +40,60 @@ def intrinsic_of(cam):
     return o3d.camera.PinholeCameraIntrinsic(W, H, fx, fy, W / 2.0, H / 2.0)
 
 
-def integrate(vol, cam, pkg, min_alpha, depth_trunc):
-    """Integrate one rendered view. Transparent pixels are dropped: an alpha near zero
-    means no gaussian is on that ray, and its depth is meaningless."""
+def valid_mask(cam, pkg, args):
+    """Which pixels carry depth worth integrating.
+
+    The seen/unseen boundary is where a TSDF goes rough, for three reasons that
+    render.py does not guard against:
+
+      alpha      a half-transparent pixel has no surface on its ray, so its
+                 composite depth is a blend of whatever it did hit
+      grazing    where the surface turns away from the camera the disc is seen
+                 edge-on; its depth is the least reliable exactly at the silhouette
+      jump       at the silhouette the depth steps from object to background, and
+                 the volume fills that step with a skirt joining the two
+
+    Dropping these removes the rough band rather than repairing it. That is the
+    intent: the gap is then filled by the prior, so only trustworthy observation
+    reaches the conditioning points.
+    """
+    d = pkg["surf_depth"].squeeze(0)
+    ok = (pkg["rend_alpha"].squeeze(0) >= args.min_alpha) & torch.isfinite(d) & (d > 0)
+
+    n = pkg.get("rend_normal")
+    if n is not None and args.min_cos > 0:
+        # world -> camera; in the CV convention a face-on surface has |n_z| near 1
+        R = cam.world_view_transform.transpose(0, 1)[:3, :3]
+        nz = torch.einsum("ij,jhw->ihw", R, n)[2]
+        ok &= nz.abs() >= args.min_cos
+
+    if args.max_jump > 0:
+        dv = torch.where(ok, d, torch.zeros_like(d))[None, None]
+        hi = tf.max_pool2d(dv, 3, 1, 1)
+        lo = -tf.max_pool2d(-torch.where(ok, d, torch.full_like(d, 1e4))[None, None], 3, 1, 1)
+        ok &= (hi - lo)[0, 0] <= args.max_jump   # among valid pixels; erode handles the rim
+
+    for _ in range(args.erode):                  # min-pool: keep only if every neighbour is ok
+        ok = (-tf.max_pool2d(-ok.float()[None, None], 3, 1, 1)[0, 0]) > 0.5
+    return ok
+
+
+def integrate(vol, cam, pkg, args):
+    ok = valid_mask(cam, pkg, args)
     rgb = pkg["render"].clamp(0, 1).permute(1, 2, 0).contiguous().cpu().numpy()
-    d = pkg["surf_depth"].squeeze(0).cpu().numpy().astype(np.float32)
-    a = pkg["rend_alpha"].squeeze(0).cpu().numpy()
-    d[(a < min_alpha) | ~np.isfinite(d)] = 0.0
+    sd = pkg["surf_depth"].squeeze(0)
+    d = torch.where(ok, sd, torch.zeros_like(sd)).cpu().numpy()
+    d = np.ascontiguousarray(d, np.float32)
     if not (d > 0).any():
-        return False
+        return 0.0
     rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
         o3d.geometry.Image(np.ascontiguousarray((rgb * 255).astype(np.uint8))),
-        o3d.geometry.Image(d), depth_scale=1.0, depth_trunc=depth_trunc,
+        o3d.geometry.Image(d), depth_scale=1.0, depth_trunc=args.depth_trunc,
         convert_rgb_to_intensity=False)
     # world_view_transform is stored transposed; the extrinsic is the plain w2c matrix
     ext = cam.world_view_transform.transpose(0, 1).cpu().numpy().astype(np.float64)
     vol.integrate(rgbd, intrinsic_of(cam), ext)
-    return True
+    return float(ok.float().mean())
 
 
 def main():
@@ -72,7 +110,16 @@ def main():
     ap.add_argument("--depth_trunc", default=5.0, type=float)
     ap.add_argument("--depth_ratio", default=1.0, type=float,
                     help="render.py uses 1 (median depth), which is sharper on flat surfaces")
-    ap.add_argument("--min_alpha", default=0.5, type=float)
+    ap.add_argument("--min_alpha", default=0.5, type=float,
+                    help="skip pixels this transparent")
+    ap.add_argument("--min_cos", default=0.2, type=float,
+                    help="skip pixels whose surface is more than ~78 deg off the view "
+                         "direction. 0 disables.")
+    ap.add_argument("--max_jump", default=0.05, type=float,
+                    help="skip pixels within one pixel of a depth step this large (m), "
+                         "which is what creates the silhouette skirt. 0 disables.")
+    ap.add_argument("--erode", default=1, type=int,
+                    help="shrink the valid region by this many pixels afterwards")
     ap.add_argument("--num_cluster", default=1, type=int, help="0 keeps every component")
     ap.add_argument("--skip_train_views", action="store_true",
                     help="novel poses only, to see what the prior alone contributes")
@@ -99,14 +146,16 @@ def main():
     vol = o3d.pipelines.integration.ScalableTSDFVolume(
         voxel_length=args.voxel, sdf_trunc=args.sdf_trunc,
         color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8)
-    used = 0
+    kept, used = [], 0
     with torch.no_grad():
+        bg = torch.zeros(3, device=dev)
         for i, c in enumerate(cams):
-            bg = torch.zeros(3, device=dev)
-            used += integrate(vol, c, render(c, gaussians, pipe, bg),
-                              args.min_alpha, args.depth_trunc)
+            f = integrate(vol, c, render(c, gaussians, pipe, bg), args)
+            used += f > 0
+            kept.append(f)
             if (i + 1) % 100 == 0 or i + 1 == len(cams):
-                print(f"  {i + 1}/{len(cams)} integrated ({used} non-empty)")
+                print(f"  {i + 1}/{len(cams)}  {used} non-empty  "
+                      f"pixels kept {np.mean(kept) * 100:.2f}%")
 
     m = vol.extract_triangle_mesh()
     m.remove_duplicated_vertices(); m.remove_degenerate_triangles()
