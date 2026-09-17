@@ -16,7 +16,6 @@ feeds this directly and mesh_from_gaussians.py consumes the result with -m.
 """
 import os, argparse, functools, random
 import numpy as np
-from PIL import Image
 import torch
 import torch.nn.functional as tf
 
@@ -28,6 +27,9 @@ from gaussian_renderer import render
 from arguments import ModelParams, PipelineParams, OptimizationParams, get_combined_args
 from utils.loss_utils import l1_loss, ssim
 from utils.graphics_utils import focal2fov, getProjectionMatrix
+# One reader for the mask convention, shared with the fusion path: RGBA carries the mask
+# in alpha (RGB is the instance colour code), and there is an amodal 188 convention too.
+from sdf_distill_depth import load_view_mask
 
 
 class NovelCam:
@@ -82,33 +84,28 @@ def load_masks(cams, root, device):
     explain the background. make_object_dirs.py symlinks the room frames unmasked, so
     restricting the view list is not enough -- both sides have to be masked here.
     """
-    # Forks disagree on whether image_name is the stem, the file name or a relative
-    # path, so both sides are reduced to the bare stem before matching.
-    stem = lambda s: os.path.splitext(os.path.basename(str(s)))[0]
-    have = {}
-    for f in (os.listdir(root) if os.path.isdir(root) else []):
-        if os.path.splitext(f)[1].lower() in (".png", ".jpg", ".jpeg"):
-            have[stem(f)] = os.path.join(root, f)
     keep, M, miss = [], [], []
     for c in cams:
-        p = have.get(stem(c.image_name))
-        if p is None:
+        a = load_view_mask(root, c.image_name, c.image_height, c.image_width)
+        if a is None:
             miss.append(c.image_name); continue
-        a = torch.from_numpy(np.array(Image.open(p).convert("L")))[None, None].float()
-        a = tf.interpolate(a, size=(c.image_height, c.image_width), mode="nearest")
-        keep.append(c); M.append((a[0, 0] > 127).to(device))
+        keep.append(c); M.append(torch.from_numpy(a).to(device))
     if len(keep) < 10:
-        # print what is actually there instead of guessing at the naming convention
+        got = sorted(os.listdir(root))[:4] if os.path.isdir(root) else "(no such dir)"
         raise SystemExit(
             f"[abort] {len(keep)} of {len(cams)} views matched a mask.\n"
-            f"  dir      {root}  ({len(have)} image files)\n"
-            f"  present  {sorted(have)[:4]}\n"
-            f"  wanted   {[stem(c.image_name) for c in cams[:4]]}\n"
-            f"  Masks are matched by stem. Pass --masks if they live elsewhere.")
+            f"  dir      {root}\n  present  {got}\n"
+            f"  wanted   {[c.image_name for c in cams[:4]]}\n"
+            f"  Pass --masks if they live elsewhere.")
     if miss:
         print(f"[photo] {len(miss)} views without a mask, dropped")
-    cov = float(torch.stack([m.float().mean() for m in M]).mean()) * 100
-    print(f"[photo] masked by {root}   {len(keep)} views, object covers {cov:.2f}% of a frame")
+    per = torch.stack([m.float().mean() for m in M]) * 100
+    cov, empty = float(per.mean()), int((per == 0).sum())
+    assert cov >= 0.01, (
+        f"masks matched but carry no object (mean coverage {cov:.4f}%, "
+        f"{empty}/{len(M)} views empty) under {root}")
+    print(f"[photo] masked by {root}   {len(keep)} views, object covers {cov:.2f}% "
+          f"of a frame ({empty} empty)")
     return keep, M
 
 
@@ -223,7 +220,7 @@ def main():
     print(f"[init] {gaussians.get_xyz.shape[0]:,} gaussians  {len(train)} train views  "
           f"extent {scene.cameras_extent:.2f}m  lr x{args.lr_scale}")
 
-    pool, npool, acc = [], [], np.zeros(6)
+    pool, npool, acc = [], [], np.zeros(7)
     for it in range(1, args.iters + 1):
         gaussians.update_learning_rate(it)
         if not pool:
