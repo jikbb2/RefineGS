@@ -89,7 +89,7 @@ def load_masks(cams, root, device):
         a = load_view_mask(root, c.image_name, c.image_height, c.image_width)
         if a is None:
             miss.append(c.image_name); continue
-        keep.append(c); M.append(torch.from_numpy(a).to(device))
+        keep.append(c); M.append(torch.as_tensor(a).to(device).bool())  # it returns a tensor
     if len(keep) < 10:
         got = sorted(os.listdir(root))[:4] if os.path.isdir(root) else "(no such dir)"
         raise SystemExit(
