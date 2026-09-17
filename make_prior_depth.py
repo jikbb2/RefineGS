@@ -30,6 +30,9 @@ from PIL import Image
 from plyfile import PlyData
 
 print = functools.partial(print, flush=True)     # the heavy loops must show progress
+# Replica's mesh_semantic.ply trips Open3D's PLY reader; load_mesh_any falls back to
+# plyfile, so the warning is noise.
+o3d.utility.set_verbosity_level(o3d.utility.VerbosityLevel.Error)
 from skimage.measure import marching_cubes
 
 # Self-contained on purpose. Importing sdf_distill_depth pulls in torch, and torch loaded
@@ -278,6 +281,9 @@ def main():
     assert poses, "every pose was blocked -- check --occluder_mesh or raise --radius_scale"
     D = np.zeros((len(poses), H, W), np.float32)
     U = np.zeros((len(poses), H, W), bool)
+    # world-space surface normals, for a normal term on the novel views. float16 keeps
+    # the array under 300MB; unit vectors do not need more.
+    NR = np.zeros((len(poses), H, W, 3), np.float16)
     n_hit = n_unseen = 0
     for i, (R, t) in enumerate(poses):
         E = np.eye(4); E[:3, :3] = R; E[:3, 3] = t
@@ -286,6 +292,7 @@ def main():
         d = r["t_hit"].numpy()
         hit = np.isfinite(d) & (d > 0)
         D[i] = np.where(hit, d, 0.0)
+        NR[i] = np.where(hit[..., None], r["primitive_normals"].numpy(), 0.0)
         n_hit += int(hit.sum())
         if not hit.any():
             continue
@@ -319,7 +326,8 @@ def main():
     np.savez_compressed(
         out if out.endswith(".npz") else out + ".npz",
         R=np.stack([p[0] for p in poses]), t=np.stack([p[1] for p in poses]),
-        K=K, W=W, H=H, depth=D, unseen=U, center=center, radius=radius, ring=ring)
+        K=K, W=W, H=H, depth=D, normal=NR, unseen=U,
+        center=center, radius=radius, ring=ring)
     px = len(poses) * H * W
     print(f"\n{'ring':>7}{'poses':>7}{'hit%':>8}{'unseen%':>9}")
     for e in sorted(set(ring.tolist())):
