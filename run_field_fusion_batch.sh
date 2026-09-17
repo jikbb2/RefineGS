@@ -74,6 +74,11 @@ PHASE=${PHASE:-all}
 ONLY=${ONLY:-}                               # e.g. ONLY="1 6 11"
 FUSE_EXTRA=${FUSE_EXTRA:-}
 PKL_FORCE=${PKL_FORCE:-0}                    # 1 = rebuild the pkl even if it is current
+# Which reconstruction conditions the generation. filter_observed drops points that miss
+# the GT depth, so free-floating skirt is already removed -- but the rough grazing-angle
+# band sits ON the surface and passes, and ShapeR anchors to it. tsdf_clean.ply is the
+# same TSDF with that band filtered out (mesh_tsdf_views.py).
+RECON_NAME=${RECON_NAME:-fuse_post.ply}
 
 # GT label auto-matching. A SAM3 instance is not 1:1 with a dataset semantic id -- one
 # object spans several (obj1: id9 81% plus four ids at ~5%). At the old 0.10 threshold the
@@ -104,7 +109,7 @@ done
 echo "targets (${#gids[@]}): ${gids[*]}"
 echo "  out=${OUT} iter=${ITER} prior=${PRIOR} pkl=${PKL_DIR}"
 echo "  n_points=${NPTS} seed=${SEED} grid=${GRID} cfg=${CFG} ensemble=${ENSEMBLE}/${COMBINE}"
-echo "  points_from=${POINTS_FROM}"
+echo "  points_from=${POINTS_FROM}  recon=${RECON_NAME}"
 [ -n "${FUSE_EXTRA}" ] && echo "  FUSE_EXTRA=${FUSE_EXTRA}"
 [ -f "${CAPTIONS}" ] || echo "  no caption file (${CAPTIONS}); using the default text"
 
@@ -152,7 +157,7 @@ show_tail() {                                 # failures otherwise hide in the l
 if [ "${PHASE}" = "pkl" ] || [ "${PHASE}" = "all" ]; then
   echo "=== [1/3] ShapeR input pkl ==="
   for gid in "${gids[@]}"; do
-    RECON=${OUT}/${gid}/train/ours_${ITER}/fuse_post.ply
+    RECON=${OUT}/${gid}/train/ours_${ITER}/${RECON_NAME}
     STEMS=${STEMS_DIR}/${gid}.txt
     # Rebuilding the pkl makes it newer than the npz, and the stale guard then regenerates
     # the field -- the most expensive stage. Rebuild only when the generator has changed.
@@ -180,7 +185,8 @@ if [ "${PHASE}" = "pkl" ] || [ "${PHASE}" = "all" ]; then
       grep -hE "^\[filter\]|^\[frame\].*raw/robust|RELAXED" \
         "${LOGDIR}/pkl_${gid}.log" | sed 's/^/  /'
     else
-      echo "  [${gid}] pkl FAILED"; note_fail "${gid}" pkl "make_shaper_input"
+      echo "  [${gid}] pkl FAILED ($([ -f "${RECON}" ] && echo "recon ok" || echo "no ${RECON}"))"
+      note_fail "${gid}" pkl "make_shaper_input"
       show_tail "${LOGDIR}/pkl_${gid}.log"
     fi
   done

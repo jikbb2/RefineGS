@@ -11,9 +11,11 @@
 # from THIS base's reconstruction and produces design B's mesh to compare against. A
 # field conditioned on a different reconstruction is what invalidated the earlier runs.
 #
+#   GIDS="2 5 6" STAGE=clean bash run_design_c.sh          # conditioning reconstruction
 #   ONLY="2 5 6" OUT=~/RefineGS/output/replica_room0_v2/objects_voted ITER=30000 \
-#     PRIOR=~/prior_voted PKL_SUBDIR=voted PHASE=all bash run_field_fusion_batch.sh
-#   GIDS="2 5 6" bash run_design_c.sh
+#     PRIOR=~/prior_voted PKL_SUBDIR=voted RECON_NAME=tsdf_clean.ply PHASE=all \
+#     bash run_field_fusion_batch.sh                        # prior + design B
+#   GIDS="2 5 6" bash run_design_c.sh                       # design C
 set -uo pipefail
 
 ROOT=${ROOT:-$HOME/RefineGS}
@@ -28,9 +30,14 @@ MASKS=${MASKS:-${ROOT}/data/${SCENE}/masks}
 STEMS_DIR=${STEMS_DIR:-$HOME/See3D/dataset/stage6/clean_stems}
 GTD=${GTD:-/home/elicer/nice-slam/Datasets/Replica/room0/results}
 GT_MESH=${GT_MESH:-$HOME/room_0/habitat/mesh_semantic.ply}
-NEW_DIST=${NEW_DIST:-0.005}     # the boundary band the extraction filter empties
+# 0.02 is run_inject_test.sh's value and the one that produced a clean injected cloud.
+# 0.005 was tried on the theory that the extraction filter empties a 2cm band, but that
+# filter drops PIXELS per view; the observed gaussians stay in 3D. With a disc radius of
+# 0.006 it only stacks prior points on top of observed surface.
+NEW_DIST=${NEW_DIST:-0.02}
 GSCALE=${GSCALE:-0.006}
 CLEAN=${CLEAN:-0}               # 1 = redo every stage
+STAGE=${STAGE:-c}               # clean | c | all
 CSV=${CSV:-${INJ}/_design_c.csv}
 NAMES=${NAMES:-${OBJ}/names.tsv}
 
@@ -38,6 +45,22 @@ cd "${ROOT}" || exit 1
 mkdir -p "${PRIOR}" "${INJ}"
 [ "${CLEAN}" = "1" ] && rm -f "${CSV}"
 name_of() { [ -f "${NAMES}" ] && awk -F'\t' -v g="$1" '$1==g{print $2; exit}' "${NAMES}"; }
+
+# Stage "clean": the observed surface without its rough seen/unseen band, which is what
+# should condition the generation. ShapeR anchors to the conditioning points, so a ragged
+# boundary is reproduced in the prior. Run this BEFORE run_field_fusion_batch.sh and point
+# its RECON_NAME here.
+if [ "${STAGE}" = "clean" ] || [ "${STAGE}" = "all" ]; then
+  for g in ${GIDS}; do
+    CLN=${OBJ}/${g}/train/ours_${ITER}/tsdf_clean.ply
+    [ "${CLEAN}" = "1" ] && rm -f "${CLN}"
+    [ -f "${CLN}" ] && { echo "  [${g}] tsdf_clean exists"; continue; }
+    python mesh_tsdf_views.py -m "${OBJ}/${g}" --out "${CLN}" 2>&1 \
+      | grep -E "^\[views\]|^\[out\]|kept" | tail -3 | sed "s/^/  [${g}] /"
+  done
+  [ "${STAGE}" = "clean" ] && {
+    echo ""; echo "next: run_field_fusion_batch.sh with RECON_NAME=tsdf_clean.ply"; exit 0; }
+fi
 
 for g in ${GIDS}; do
   NPZ=${PRIOR}/obj${g}_field.npz
@@ -51,20 +74,12 @@ for g in ${GIDS}; do
   [ -f "${OUTD}/fused_field_post.ply" ] || echo "  WARN no design-B mesh; eval will skip"
   STEMS=${STEMS_DIR}/${g}.txt
 
-  # The prior surface as a mesh, so it can be opened next to the reconstruction. A prior
-  # built from the wrong reconstruction looks plausible in the metrics and wrong here.
+  # prior_mesh.py exists for exactly this: see whether a gap is the generation's fault
+  # or the fusion's. Look at it next to fuse_post.ply before trusting anything downstream.
   [ "${CLEAN}" = "1" ] && rm -f "${PRIOR}/obj${g}_prior.ply"
-  [ -f "${PRIOR}/obj${g}_prior.ply" ] || python -c "
-import numpy as np, os, sys, open3d as o3d
-from skimage.measure import marching_cubes
-z = np.load(sys.argv[1]); F = z['field'].astype(np.float32); G = F.shape[0]
-v, f, _, _ = marching_cubes(F, level=0.0, spacing=(2.0/(G-1),)*3)
-v = ((v - 1.0) / float(z['scale'])) @ z['R_align'] + z['center']
-m = o3d.geometry.TriangleMesh(o3d.utility.Vector3dVector(v), o3d.utility.Vector3iVector(f))
-m.compute_vertex_normals(); o3d.io.write_triangle_mesh(sys.argv[2], m)
-print('  [prior] %d verts  inside %.1f%%  bbox %s %s' % (
-    len(m.vertices), (F < 0).mean()*100, np.round(v.min(0), 2), np.round(v.max(0), 2)))
-" "${NPZ}" "${PRIOR}/obj${g}_prior.ply" || { echo "  prior mesh FAILED"; continue; }
+  [ -f "${PRIOR}/obj${g}_prior.ply" ] || python prior_mesh.py "${NPZ}" \
+      --out "${PRIOR}/obj${g}_prior.ply" 2>&1 | tail -3 | sed 's/^/  /'
+  [ -f "${PRIOR}/obj${g}_prior.ply" ] || { echo "  prior mesh FAILED"; continue; }
 
   [ "${CLEAN}" = "1" ] && rm -f "${PD}"
   [ -f "${PD}" ] || python make_prior_depth.py --npz "${NPZ}" --colmap "${COLMAP}" \
