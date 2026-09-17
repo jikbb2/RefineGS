@@ -79,6 +79,10 @@ PKL_FORCE=${PKL_FORCE:-0}                    # 1 = rebuild the pkl even if it is
 # band sits ON the surface and passes, and ShapeR anchors to it. tsdf_clean.ply is the
 # same TSDF with that band filtered out (mesh_tsdf_views.py).
 RECON_NAME=${RECON_NAME:-fuse_post.ply}
+# Every invocation gets its own tag, so no output is ever written over an earlier one and
+# the numbers already reported stay derivable. Pass RUN=<tag> to resume a run instead.
+RUN=${RUN:-$(date +%m%d_%H%M)}
+FUSE_NAME=${FUSE_NAME:-fused_${RUN}}
 
 # GT label auto-matching. A SAM3 instance is not 1:1 with a dataset semantic id -- one
 # object spans several (obj1: id9 81% plus four ids at ~5%). At the old 0.10 threshold the
@@ -88,9 +92,9 @@ MATCH_MIN_SHARE=${MATCH_MIN_SHARE:-0.03}
 
 # The fuse phase resets the CSV, so an ONLY= run would replace the full-batch results
 # with its handful of rows. Subsets get their own file.
-CSV=${CSV:-${OUT}/_field_batch${ONLY:+_subset}.csv}
-FAILCSV=${FAILCSV:-${OUT}/_field_batch${ONLY:+_subset}_failures.csv}
-LOGDIR=${LOGDIR:-${PRIOR}/logs}
+CSV=${CSV:-${OUT}/_field_${RUN}.csv}
+FAILCSV=${FAILCSV:-${OUT}/_field_${RUN}_failures.csv}
+LOGDIR=${LOGDIR:-${PRIOR}/logs/${RUN}}
 PKL_DIR=${SHAPER_DIR}/data${PKL_SUBDIR:+/${PKL_SUBDIR}}
 PKL_REL=data${PKL_SUBDIR:+/${PKL_SUBDIR}}
 mkdir -p "${PRIOR}" "${LOGDIR}" "${PKL_DIR}"
@@ -106,12 +110,12 @@ for MDIR in ${OUT}/*/; do
   gids+=("${gid}")
 done
 [ ${#gids[@]} -gt 0 ] || { echo "no target object under ${OUT}"; exit 1; }
-echo "targets (${#gids[@]}): ${gids[*]}"
+echo "targets (${#gids[@]}): ${gids[*]}   run=${RUN}"
 echo "  out=${OUT} iter=${ITER} prior=${PRIOR} pkl=${PKL_DIR}"
-echo "  n_points=${NPTS} seed=${SEED} grid=${GRID} cfg=${CFG} ensemble=${ENSEMBLE}/${COMBINE}"
-echo "  points_from=${POINTS_FROM}  recon=${RECON_NAME}"
-[ -n "${FUSE_EXTRA}" ] && echo "  FUSE_EXTRA=${FUSE_EXTRA}"
-[ -f "${CAPTIONS}" ] || echo "  no caption file (${CAPTIONS}); using the default text"
+echo "  recon=${RECON_NAME} -> ${FUSE_NAME}_post.ply   grid=${GRID} cfg=${CFG} ensemble=${ENSEMBLE}/${COMBINE}${FUSE_EXTRA:+   ${FUSE_EXTRA}}"
+[ -f "${CAPTIONS}" ] || echo "  WARN no caption file (${CAPTIONS}); generating from generic text"
+# RUN tags every output, so nothing here can overwrite an earlier result; a field npz is
+# shared on purpose and the stale guard moves the old one aside rather than deleting it.
 
 name_of() { [ -f "${CAPTIONS}" ] && awk -F'\t' -v g="$1" '$1==g{print $2; exit}' "${CAPTIONS}"; }
 
@@ -254,11 +258,11 @@ if [ "${PHASE}" = "fuse" ] || [ "${PHASE}" = "all" ]; then
       python sdf_distill_depth.py -m "${MDIR}" --iteration ${ITER} \
       --prior_field "${NPZ}" --gt_depth_dir "${GTD}" \
       --passthrough_mesh "${OUTD}/fuse_post.ply" \
-      --out "${OUTD}/fused_field.ply" ${FUSE_EXTRA} \
+      --out "${OUTD}/${FUSE_NAME}.ply" ${FUSE_EXTRA} \
       || { note_fail "${gid}" fuse "sdf_distill";
            show_tail "${LOGDIR}/fuse_${gid}.log" 20; ng=$((ng+1)); continue; }
     python eval_seen_unseen.py --gt_mesh "${GT_MESH}" \
-      --recon "${OUTD}/fuse_post.ply" --recon2 "${OUTD}/fused_field_post.ply" \
+      --recon "${OUTD}/fuse_post.ply" --recon2 "${OUTD}/${FUSE_NAME}_post.ply" \
       --colmap "${COLMAP}" --gid "${gid}" --masks_root "${MASKS}" --use_mask \
       ${STEMS:+$([ -f "${STEMS}" ] && echo --stems "${STEMS}")} \
       --match_min_share "${MATCH_MIN_SHARE}" --seed "${EVAL_SEED}" \
