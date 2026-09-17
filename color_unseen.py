@@ -10,12 +10,19 @@ Observed vertices: average the images over the views where the vertex is the fir
 surface, weighted by the viewing angle. Self-occlusion is decided by raycasting the mesh
 itself, so no depth files are needed.
 
-Unobserved vertices carry no information -- any colour there is invented. Two fills:
-  mirror    furniture is close to symmetric, so the back of a chair does look like a
-            reflection of its front. This transfers REAL observed texture, and only
-            where the reflected point lands on observed surface.
-  geodesic  otherwise the nearest observed vertex ALONG THE SURFACE. Straight-line
-            nearest jumps through 2mm of tabletop and paints the underside with the top.
+Unobserved vertices carry no information -- any colour there is invented. The fill is
+continuous at the seam and flat away from it:
+  mirror     where a reflection plane maps the vertex onto observed surface, take that
+             colour. This works for a chair (left-right) but NOT for a table seen only
+             from above: no plane sends the underside to the top, so most of it falls
+             through to the next rule.
+  seam blend near the seam, the observed colour of the nearest vertex ALONG THE SURFACE.
+             Straight-line nearest jumps through 2mm of tabletop and paints the underside
+             with the top.
+  base       far from the seam, a robust colour of the whole observed surface. Copying
+             the nearest source all the way in instead splits a large unobserved region
+             into Voronoi cells of whichever rim vertex happened to be closest, and each
+             rim vertex carries its own baked shading -- which is the two-tone underside.
 
   python color_unseen.py --mesh OUT/objects_voted/6/train/ours_30000/fused_X_post.ply \\
       --colmap DATA/sparse/0 --images DATA/images --masks_root DATA/masks --gid 6 \\
@@ -28,6 +35,7 @@ from scipy.spatial import cKDTree
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import dijkstra
 from PIL import Image
+from scipy.ndimage import binary_erosion
 
 print = functools.partial(print, flush=True)
 
@@ -98,6 +106,11 @@ def project_colours(mesh, V, N, cams, stems, args):
         hh, ww = img.shape[:2]
         H, W = hh // args.ds, ww // args.ds
         dbuf = depth_buffer(rc, c, H, W, args.ds)
+        # A vertex one pixel inside the silhouette still samples the background, which is
+        # what turns a tabletop rim white. Erode the hit region instead of trusting it.
+        valid = dbuf > 0
+        if args.silhouette_erode > 0:
+            valid = binary_erosion(valid, iterations=args.silhouette_erode)
 
         Xc = V @ c["R"].T + c["t"]
         z = Xc[:, 2]
@@ -109,9 +122,13 @@ def project_colours(mesh, V, N, cams, stems, args):
         ok = (z > 0.05) & (iu >= 0) & (iu < W) & (iv >= 0) & (iv < H)
         if not ok.any():
             continue
-        ok[ok] &= np.abs(dbuf[iv[ok], iu[ok]] - z[ok]) < args.margin   # first surface
+        ok[ok] &= valid[iv[ok], iu[ok]]
+        if ok.any():
+            ok[ok] &= np.abs(dbuf[iv[ok], iu[ok]] - z[ok]) < args.margin  # first surface
 
         msk = load_mask(args.masks_root, args.gid, s, (H, W))
+        if msk is not None and args.silhouette_erode > 0:
+            msk = binary_erosion(msk, iterations=args.silhouette_erode)
         if msk is not None and ok.any():
             ok[ok] &= msk[iv[ok], iu[ok]]
         if not ok.any():
@@ -161,15 +178,15 @@ def mirror_plane(P):
 
 
 def geodesic_source(V, F, seen):
-    """For every vertex, the nearest observed vertex measured along the surface."""
+    """Nearest observed vertex along the surface, and how far it is."""
     e = np.concatenate([F[:, [0, 1]], F[:, [1, 2]], F[:, [2, 0]]])
     w = np.linalg.norm(V[e[:, 0]] - V[e[:, 1]], axis=1)
     a = np.concatenate([e[:, 0], e[:, 1]])
     b = np.concatenate([e[:, 1], e[:, 0]])
     g = coo_matrix((np.concatenate([w, w]), (a, b)), shape=(len(V), len(V))).tocsr()
-    _, _, src = dijkstra(g, directed=False, indices=np.where(seen)[0],
-                         min_only=True, return_predecessors=True)
-    return src
+    dist, _, src = dijkstra(g, directed=False, indices=np.where(seen)[0],
+                            min_only=True, return_predecessors=True)
+    return dist, src
 
 
 def smooth(V, F, C, mask, iters):
@@ -208,6 +225,12 @@ def main():
                          "of the object diagonal")
     ap.add_argument("--mirror_tol", default=0.02, type=float,
                     help="a reflected vertex must land this close (m) to observed surface")
+    ap.add_argument("--silhouette_erode", default=3, type=int,
+                    help="pixels to erode the visible region by before sampling, so a "
+                         "vertex near the outline cannot pick up the background")
+    ap.add_argument("--blend_dist", default=0.08, type=float,
+                    help="distance along the surface (m) over which the fill goes from "
+                         "the neighbouring observed colour to the base colour")
     ap.add_argument("--smooth", default=3, type=int, help="Laplacian passes on the fill")
     ap.add_argument("--tint", default=0.0, type=float,
                     help="blend the filled region toward magenta, for a figure that shows "
@@ -257,12 +280,17 @@ def main():
 
     rest = unseen & ~filled
     if rest.any() and seen.any():
-        src = geodesic_source(V, F, seen)
+        dist, src = geodesic_source(V, F, seen)
         i = np.where(rest)[0]
         ok = src[i] >= 0
-        C[i[ok]] = C[src[i][ok]]
+        # A robust colour of the observed surface. The median is dominated by the lit,
+        # widely seen part, so it carries the material rather than a rim's shadow.
+        base = np.median(C[seen], axis=0)
+        w = np.clip(1.0 - dist[i[ok]] / max(args.blend_dist, 1e-6), 0.0, 1.0)[:, None]
+        C[i[ok]] = w * C[src[i][ok]] + (1.0 - w) * base
         filled[i[ok]] = True
-        print(f"[geodesic] filled {int(ok.sum()):,}/{int(rest.sum()):,}")
+        print(f"[fill] base colour {np.round(base, 3)}  blend over {args.blend_dist*100:.0f}cm"
+              f"  ({int((w > 0.01).sum()):,} vertices in the transition)")
     if (unseen & ~filled).any():
         print(f"[fill] {int((unseen & ~filled).sum()):,} vertices left black "
               f"(disconnected from any observed surface)")
