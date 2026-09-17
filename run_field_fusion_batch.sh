@@ -36,7 +36,11 @@ MASKS=${MASKS:-${ROOT}/data/${SCENE}/masks}
 STEMS_DIR=${STEMS_DIR:-$HOME/See3D/dataset/stage6/clean_stems}
 GTD=${GTD:-/home/elicer/nice-slam/Datasets/Replica/room0/results}
 GT_MESH=${GT_MESH:-$HOME/room_0/habitat/mesh_semantic.ply}
-CAPTIONS=${CAPTIONS:-${ROOT}/captions.tsv}   # optional "gid<TAB>caption"; else a default
+# ShapeR is text conditioned, so the caption changes the completion. name_objects.py
+# writes <OUT>/names.tsv as "gid<TAB>class", which is exactly this format; falling back to
+# "a 3D object in a room" asks the model to complete a generic blob.
+CAPTIONS=${CAPTIONS:-$([ -f "${OUT}/names.tsv" ] && echo "${OUT}/names.tsv" \
+                                                || echo "${ROOT}/captions.tsv")}
 NPTS=${NPTS:-20000}
 GRID=${GRID:-256}
 
@@ -69,6 +73,7 @@ GUIDE_FREE_W=${GUIDE_FREE_W:-0}
 PHASE=${PHASE:-all}
 ONLY=${ONLY:-}                               # e.g. ONLY="1 6 11"
 FUSE_EXTRA=${FUSE_EXTRA:-}
+PKL_FORCE=${PKL_FORCE:-0}                    # 1 = rebuild the pkl even if it is current
 
 # GT label auto-matching. A SAM3 instance is not 1:1 with a dataset semantic id -- one
 # object spans several (obj1: id9 81% plus four ids at ~5%). At the old 0.10 threshold the
@@ -76,8 +81,10 @@ FUSE_EXTRA=${FUSE_EXTRA:-}
 # 4.64mm to 26mm.
 MATCH_MIN_SHARE=${MATCH_MIN_SHARE:-0.03}
 
-CSV=${CSV:-${OUT}/_field_batch.csv}
-FAILCSV=${FAILCSV:-${OUT}/_field_batch_failures.csv}
+# The fuse phase resets the CSV, so an ONLY= run would replace the full-batch results
+# with its handful of rows. Subsets get their own file.
+CSV=${CSV:-${OUT}/_field_batch${ONLY:+_subset}.csv}
+FAILCSV=${FAILCSV:-${OUT}/_field_batch${ONLY:+_subset}_failures.csv}
 LOGDIR=${LOGDIR:-${PRIOR}/logs}
 PKL_DIR=${SHAPER_DIR}/data${PKL_SUBDIR:+/${PKL_SUBDIR}}
 PKL_REL=data${PKL_SUBDIR:+/${PKL_SUBDIR}}
@@ -147,6 +154,19 @@ if [ "${PHASE}" = "pkl" ] || [ "${PHASE}" = "all" ]; then
   for gid in "${gids[@]}"; do
     RECON=${OUT}/${gid}/train/ours_${ITER}/fuse_post.ply
     STEMS=${STEMS_DIR}/${gid}.txt
+    # Rebuilding the pkl makes it newer than the npz, and the stale guard then regenerates
+    # the field -- the most expensive stage. Rebuild only when the generator has changed.
+    if [ "${PKL_FORCE}" = "0" ] && [ -f "${PKL_DIR}/obj${gid}.pkl" ] \
+       && [ "${PKL_DIR}/obj${gid}.pkl" -nt make_shaper_input.py ]; then
+      echo "  [${gid}] pkl up to date (PKL_FORCE=1 to rebuild)"; continue
+    fi
+    # These stems come from the per-object pipeline. If its gid numbering differs from
+    # this OUT tree's, the conditioning points get filtered against another object's views.
+    if [ -f "${STEMS}" ] && [ -d "${MASKS}/${gid}/masks" ]; then
+      ns=$(wc -l < "${STEMS}"); nm=$(ls "${MASKS}/${gid}/masks" | wc -l)
+      [ "${ns}" -gt 0 ] && [ $(( ns > nm ? ns - nm : nm - ns )) -gt $(( nm / 2 )) ] \
+        && echo "  [${gid}] WARN stems ${ns} vs masks ${nm}: check they are the same object"
+    fi
     python make_shaper_input.py --gid "${gid}" --n_points "${NPTS}" \
       --seed "${SEED}" --bounds_margin "${BOUNDS_MARGIN}" \
       --recon "${RECON}" --colmap "${COLMAP}" --images "${IMAGES}" \
