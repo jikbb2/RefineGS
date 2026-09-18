@@ -19,10 +19,11 @@ continuous at the seam and flat away from it:
   seam blend near the seam, the observed colour of the nearest vertex ALONG THE SURFACE.
              Straight-line nearest jumps through 2mm of tabletop and paints the underside
              with the top.
-  base       far from the seam, a robust colour of the whole observed surface. Copying
-             the nearest source all the way in instead splits a large unobserved region
-             into Voronoi cells of whichever rim vertex happened to be closest, and each
-             rim vertex carries its own baked shading -- which is the two-tone underside.
+  base       far from the seam, the median colour of the observed vertices FACING THE
+             SAME WAY. The shading is baked into the images, so a downward face is dark
+             and an upward face is light; a single global median makes the invented
+             underside light tan while the parts of it that were actually observed stay
+             dark, and the two tones meet in the middle of the surface.
 
   python color_unseen.py --mesh OUT/objects_voted/6/train/ours_30000/fused_X_post.ply \\
       --colmap DATA/sparse/0 --images DATA/images --masks_root DATA/masks --gid 6 \\
@@ -177,6 +178,20 @@ def mirror_plane(P):
     return best_n, c, best_r
 
 
+def base_colour(N, C, seen, unseen, k, fallback):
+    """Median colour of the observed vertices pointing the same way.
+
+    Orientation is the strongest predictor of shading here, and the shading is baked
+    into the images, so this is what keeps an invented underside the same tone as the
+    parts of the underside that happened to be observed.
+    """
+    ns = N[seen]
+    if len(ns) < k:
+        return np.broadcast_to(fallback, (int(unseen.sum()), 3)).copy()
+    _, j = cKDTree(ns).query(N[unseen], k=min(k, len(ns)), workers=-1)
+    return np.median(C[seen][j], axis=1)
+
+
 def geodesic_source(V, F, seen):
     """Nearest observed vertex along the surface, and how far it is."""
     e = np.concatenate([F[:, [0, 1]], F[:, [1, 2]], F[:, [2, 0]]])
@@ -231,6 +246,12 @@ def main():
     ap.add_argument("--blend_dist", default=0.08, type=float,
                     help="distance along the surface (m) over which the fill goes from "
                          "the neighbouring observed colour to the base colour")
+    ap.add_argument("--base_mode", default="normal", choices=["normal", "global"],
+                    help="normal: median of the observed vertices facing the same way, "
+                         "which keeps the invented underside as dark as the observed "
+                         "underside. global: one median for the whole object")
+    ap.add_argument("--base_k", default=200, type=int,
+                    help="observed vertices entering the per-orientation median")
     ap.add_argument("--smooth", default=3, type=int, help="Laplacian passes on the fill")
     ap.add_argument("--tint", default=0.0, type=float,
                     help="blend the filled region toward magenta, for a figure that shows "
@@ -283,14 +304,16 @@ def main():
         dist, src = geodesic_source(V, F, seen)
         i = np.where(rest)[0]
         ok = src[i] >= 0
-        # A robust colour of the observed surface. The median is dominated by the lit,
-        # widely seen part, so it carries the material rather than a rim's shadow.
-        base = np.median(C[seen], axis=0)
-        w = np.clip(1.0 - dist[i[ok]] / max(args.blend_dist, 1e-6), 0.0, 1.0)[:, None]
-        C[i[ok]] = w * C[src[i][ok]] + (1.0 - w) * base
+        gm = np.median(C[seen], axis=0)
+        if args.base_mode == "normal":
+            B = base_colour(N, C, seen, rest, args.base_k, gm)
+        else:
+            B = np.broadcast_to(gm, (int(rest.sum()), 3)).copy()
+        w = np.clip(1.0 - dist[i] / max(args.blend_dist, 1e-6), 0.0, 1.0)[:, None]
+        C[i[ok]] = (w[ok] * C[src[i][ok]] + (1.0 - w[ok]) * B[ok]).astype(np.float32)
         filled[i[ok]] = True
-        print(f"[fill] base colour {np.round(base, 3)}  blend over {args.blend_dist*100:.0f}cm"
-              f"  ({int((w > 0.01).sum()):,} vertices in the transition)")
+        print(f"[fill] base={args.base_mode}  global median {np.round(gm, 3)}  "
+              f"spread {np.round(B.std(0), 3)}  blend {args.blend_dist*100:.0f}cm")
     if (unseen & ~filled).any():
         print(f"[fill] {int((unseen & ~filled).sum()):,} vertices left black "
               f"(disconnected from any observed surface)")
