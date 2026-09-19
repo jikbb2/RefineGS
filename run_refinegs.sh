@@ -110,10 +110,12 @@ REID=${REID:-0.3}; IOU=${IOU:-0.5}; CAND=${CAND:-0.1}
 # stricter as a scene gets shorter -- revisit it per room, not per experiment.
 MIN_LABEL_VIEWS=${MIN_LABEL_VIEWS:-30}
 OVERLAP=${OVERLAP:-ignore}
-# Off by default upstream, but voted labels 4/9/14/20/30 measured compactness 0.16-0.40,
-# i.e. one label covering several objects, and ShapeR is then asked to complete them as
-# one. Set to 0.5 to keep the largest blob; "" reproduces the older behaviour.
-SPLIT_BELOW=${SPLIT_BELOW:-0.5}
+# Off, as upstream has it. Turning it on (0.5) looked right -- voted labels 4/9/14/20/30
+# measure compactness 0.16-0.40, i.e. one label over several objects -- but measured on
+# room0 it doubled the damage instead: obj2 unseen completion 1430mm off vs 2731mm on.
+# Keeping the largest blob throws away real chair geometry. Merged labels are a
+# segmentation problem and belong in a segmentation ablation, not in a silent default.
+SPLIT_BELOW=${SPLIT_BELOW:-}
 EXTRACT_EXTRA=${EXTRACT_EXTRA:-${SPLIT_BELOW:+--split_below ${SPLIT_BELOW}}}
 COND_NAME=${COND_NAME:-tsdf_clean.ply}
 COND_ARGS=${COND_ARGS:-"--min_alpha 0.7 --min_cos 0.35 --max_jump 0.02 --erode 3"}

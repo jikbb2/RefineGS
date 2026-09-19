@@ -119,7 +119,18 @@ def sample_tris(V, T, n, seed=0):
     return P, idx
 
 
-def auto_match_labels(V, T, L, ref_pts, min_share=0.10, n=300000, max_dist=0.05):
+def _aabb(P):
+    return P.min(0), P.max(0)
+
+
+def _aabb_gap(a, b):
+    """Separation between two axis-aligned boxes in metres; 0 when they overlap."""
+    (alo, ahi), (blo, bhi) = a, b
+    return float(np.linalg.norm(np.maximum(np.maximum(blo - ahi, alo - bhi), 0.0)))
+
+
+def auto_match_labels(V, T, L, ref_pts, min_share=0.10, n=300000, max_dist=0.05,
+                      max_gap=0.15):
     """recon 과 겹치는 object_id 집합을 투표로 선택.
 
     SAM3 인스턴스는 데이터셋 semantic id 와 1:1 이 아니다(한 인스턴스가 여러 GT 객체를
@@ -149,12 +160,36 @@ def auto_match_labels(V, T, L, ref_pts, min_share=0.10, n=300000, max_dist=0.05)
     order = np.argsort(-share)
     print("[auto-match] 득표 구성: " + ", ".join(
         f"id{int(vals[i])} {share[i]*100:.1f}%" for i in order[:6]))
-    sel = [int(vals[i]) for i in order if share[i] >= min_share]
+    # A share threshold alone cannot tell "one object split across several ids" from "our
+    # instance leaked onto the neighbour": both look like a second label holding ~20% of
+    # the vote. The difference is spatial. A split part sits ON the reconstruction; a
+    # neighbouring chair sits a chair-width away, and unioning it makes GT->recon report
+    # the gap between two objects as unseen completion (measured: 1408mm median on obj2).
+    # So a non-dominant label is accepted only if its own box touches the reconstruction's.
+    # Unobserved parts of the SAME object stay inside that box, so this does not penalise
+    # the very geometry the method is meant to complete.
+    rb = _aabb(ref_pts)
+    sel, dropped, cov = [], [], 0.0
+    print(f"{'  label':>8}{'share':>8}{'bbox gap':>10}   verdict")
+    for i in order:
+        if share[i] < min_share:
+            continue
+        lid = int(vals[i])
+        gap = _aabb_gap(_aabb(P[lab == lid]), rb)
+        take = (not sel) or gap <= max_gap            # the top label is always kept
+        print(f"  id{lid:<5}{share[i]*100:7.1f}%{gap*1000:9.0f}mm   "
+              + ("accept" if take else f"DROP (> {max_gap*1000:.0f}mm away)"))
+        (sel if take else dropped).append(lid)
+        if take:
+            cov += float(share[i])
     if not sel:
         sel = [int(vals[order[0]])]
-    cov = float(share[[i for i in order if share[i] >= min_share]].sum()) if sel else 0.0
-    print(f"  → 채택 라벨 {sel} (합계 {cov*100:.1f}%)")
-    if cov < 0.7:
+    print(f"  → 채택 라벨 {sel} (합계 {cov*100:.1f}%)"
+          + (f"   제외 {dropped}" if dropped else ""))
+    if dropped:
+        print("  (제외된 라벨은 재구성과 떨어진 별개 객체입니다 — 합치면 unseen "
+              "completion 이 객체 사이 거리를 재게 됩니다. --match_max_gap 으로 조정)")
+    if cov < 0.7 and not dropped:
         print("  ⚠ 커버리지 낮음 — --gt_labels 로 직접 지정하거나 min_share 조정 권장")
     return sel
 
@@ -484,6 +519,10 @@ def main():
                          "득표가 나온다(obj21 실측). 판정에 쓰지 말고 경고로만 본다")
     ap.add_argument("--match_min_share", type=float, default=0.10,
                     help="자동 매칭 시 채택할 라벨의 최소 득표 비율")
+    ap.add_argument("--match_max_gap", type=float, default=0.15,
+                    help="비1순위 라벨을 받아들일 최대 bbox 간격(m). 득표율만으로는 'GT가 "
+                         "여러 id로 쪼개진 것'과 '우리 인스턴스가 옆 물체로 샌 것'을 "
+                         "구분할 수 없다. 전자는 재구성에 붙어 있고 후자는 떨어져 있다")
     ap.add_argument("--recon", required=True, help="비교 A (보통 fuse_post.ply)")
     ap.add_argument("--recon2", default="", help="비교 B (보통 fused_prior.ply)")
     ap.add_argument("--colmap", required=True)
@@ -557,7 +596,8 @@ def main():
         else:
             ref, _ = sample(args.recon, min(args.n_sample, 100000), args.seed)
             labs = auto_match_labels(V, T, L, ref, args.match_min_share,
-                                     max_dist=args.match_max_dist)
+                                     max_dist=args.match_max_dist,
+                                     max_gap=args.match_max_gap)
         sel = np.isin(L, labs)
         assert sel.any(), f"object_id={labs} 인 면이 없음"
         T = T[sel]
