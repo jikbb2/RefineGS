@@ -11,11 +11,17 @@
 # from THIS base's reconstruction and produces design B's mesh to compare against. A
 # field conditioned on a different reconstruction is what invalidated the earlier runs.
 #
-#   GIDS="2 5 6" STAGE=clean bash run_design_c.sh          # conditioning reconstruction
+# STAGE=clean tags its output tsdf_clean_${RUN}.ply, so RECON_NAME below must carry the
+# same RUN. Pass RUN explicitly rather than letting each invocation mint its own timestamp.
+# For the CONFIRMED pipeline this stage now lives in run_scene_pipeline.sh as the 'cond'
+# stage (fixed name tsdf_clean.ply, no RUN tag); use that unless you are A/B-ing filters.
+#
+#   RUN=0918a GIDS="2 5 6" STAGE=clean bash run_design_c.sh   # conditioning reconstruction
 #   ONLY="2 5 6" OUT=~/RefineGS/output/replica_room0_v2/objects_voted ITER=30000 \
-#     PRIOR=~/prior_voted PKL_SUBDIR=voted RECON_NAME=tsdf_clean.ply PHASE=all \
+#     PRIOR=~/prior_voted PKL_SUBDIR=voted RUN=0918a \
+#     RECON_NAME=tsdf_clean_0918a.ply PHASE=all \
 #     bash run_field_fusion_batch.sh                        # prior + design B
-#   GIDS="2 5 6" bash run_design_c.sh                       # design C
+#   RUN=0918a GIDS="2 5 6" bash run_design_c.sh             # design C
 set -uo pipefail
 
 ROOT=${ROOT:-$HOME/RefineGS}

@@ -26,15 +26,29 @@ cd "${ROOT}" || exit 1
 # names.tsv (name_objects.py) makes the log readable: "[6] table" instead of "[6]"
 NAMES=${NAMES:-${OBJ}/names.tsv}
 name_of() { [ -f "${NAMES}" ] && awk -F'\t' -v g="$1" '$1==g{print $2; exit}' "${NAMES}"; }
-ok=0; ng=0; skip=0
+
+# fuse_post.ply carries no RUN tag, so a mesh left over from an earlier extraction looks
+# exactly like a current one. Reuse it only when it is newer than the point cloud it came
+# from and than render.py -- same rule as run_design_c.sh's fresh().
+fresh() {                                     # fresh TARGET DEP...
+  local t=$1 d; shift
+  [ -f "${t}" ] || return 1
+  for d in "$@"; do [ -e "${d}" ] && [ "${d}" -nt "${t}" ] && return 1; done
+  return 0
+}
+
+ok=0; ng=0; skip=0; stale=0
 for MDIR in "${OBJ}"/*/; do
   gid=$(basename "${MDIR}")
   [[ "${gid}" =~ ^[0-9]+$ ]] || continue
-  [ -f "${MDIR}/point_cloud/iteration_${IT}/point_cloud.ply" ] || {
+  SRC_PLY="${MDIR}/point_cloud/iteration_${IT}/point_cloud.ply"
+  MESH="${MDIR}/train/ours_${IT}/fuse_post.ply"
+  [ -f "${SRC_PLY}" ] || {
     echo "  [skip ${gid}] no ply at iteration_${IT}"; skip=$((skip+1)); continue; }
-  if [ -f "${MDIR}/train/ours_${IT}/fuse_post.ply" ]; then
+  if fresh "${MESH}" "${SRC_PLY}" render.py; then
     skip=$((skip+1)); continue
   fi
+  [ -f "${MESH}" ] && { echo "  [${gid}] stale mesh, re-extracting"; stale=$((stale+1)); }
   D="${DATA}/${gid}"
   [ -d "${D}/masks" ] || { echo "  [skip ${gid}] no ${D}/masks"; skip=$((skip+1)); continue; }
 
@@ -48,5 +62,4 @@ for MDIR in "${OBJ}"/*/; do
 done
 
 echo ""
-echo "meshed ${ok}, failed ${ng}, skipped ${skip}"
-
+echo "meshed ${ok} (${stale} were stale), failed ${ng}, skipped ${skip}"

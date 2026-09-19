@@ -4,6 +4,7 @@
 #   vote     label every gaussian by multi-view voting (GT-depth occlusion test)
 #   extract  slice the scene model into per-object 3DGS dirs
 #   mesh     render.py TSDF per object -> fuse_post.ply   (the A side)
+#   cond     boundary-filtered TSDF -> tsdf_clean.ply     (conditions the generation only)
 #   pkl      ShapeR input
 #   field    ShapeR signed SDF grid
 #   fuse     grid fusion + seen/unseen evaluation         (the B side)
@@ -16,6 +17,14 @@
 #   FROM=mesh bash run_scene_pipeline.sh              # resume, keep existing meshes
 #   CLEAN=1 FROM=vote bash run_scene_pipeline.sh      # redo everything from scratch
 #   EXTRACT_EXTRA="--min_margin 0.3" CLEAN=1 FROM=extract bash run_scene_pipeline.sh
+#   CLEAN=1 FROM=cond bash run_scene_pipeline.sh     # redo the conditioning surface onward
+#   RUN=0918a FROM=fuse bash run_scene_pipeline.sh   # resume into an earlier run's outputs
+#
+# CLEAN=1 (delete outputs) and the 'cond' stage are unrelated despite the old name
+# tsdf_clean.ply. FROM=cond does not delete anything on its own.
+#
+# Stage 0 (COLMAP, SAM3 masks, per-object folders, labels_scene/id_map.json) is NOT here.
+# Run run_stage0.sh first; the [check] block below is exactly its exit contract.
 set -uo pipefail
 
 ROOT=${ROOT:-$HOME/RefineGS}
@@ -41,9 +50,22 @@ if [ -z "${COLMAP:-}" ]; then
   done
 fi
 COLMAP=${COLMAP:-${DATA}/sparse/0}
-CSV=${CSV:-$HOME/prior/_scene.csv}
-FROM=${FROM:-vote}                 # vote | extract | mesh | pkl | field | fuse
+# One tag for the WHOLE pipeline run. run_field_fusion_batch.sh mints its own when it is
+# not given one, and this script calls it three times: without this the logs, the failure
+# CSVs and the fused mesh of a single run land under three different timestamps.
+RUN=${RUN:-$(date +%m%d_%H%M)}
+# Tagged, so a rerun cannot overwrite numbers that were already reported. The batch script
+# deletes ${CSV} at the start of its fuse phase, which used to erase the previous run.
+CSV=${CSV:-${OBJ}/_scene_${RUN}.csv}
+FROM=${FROM:-vote}                 # vote | extract | mesh | cond | pkl | field | fuse
 CLEAN=${CLEAN:-0}
+# Conditioning surface for the generation (the 'cond' stage). NOT the same thing as
+# CLEAN=1, which deletes outputs -- hence the stage is called 'cond', not 'clean'.
+# Filtered harder than a mesh meant for viewing: ShapeR anchors to the conditioning
+# points, so a ragged seen/unseen boundary is copied straight into the prior. Losing a few
+# percent of good surface costs nothing because the prior fills it back in.
+COND_NAME=${COND_NAME:-tsdf_clean.ply}
+COND_ARGS=${COND_ARGS:-"--min_alpha 0.7 --min_cos 0.35 --max_jump 0.02 --erode 3"}
 GT_MESH=${GT_MESH:-$HOME/room_0/habitat/mesh_semantic.ply}
 GT_INFO=${GT_INFO:-$HOME/room_0/habitat/info_semantic.json}
 SHAPER_DIR=${SHAPER_DIR:-$HOME/ShapeR}
@@ -60,9 +82,19 @@ PLY=${SCENE_MODEL}/point_cloud/iteration_${ITER}/point_cloud.ply
 # second run's names.
 VOTE=${VOTE:-${OBJ}/vote}
 stage_at() {                        # is this stage at or after FROM?
-  local order="vote extract mesh pkl field fuse" i=0 j=0 k=0
+  local order="vote extract mesh cond pkl field fuse" i=0 j=0 k=0
   for s in ${order}; do i=$((i+1)); [ "$s" = "$1" ] && j=$i; [ "$s" = "${FROM}" ] && k=$i; done
   [ "$j" -ge "$k" ]
+}
+
+# Existence alone is not freshness: a conditioning surface built from an older point cloud
+# looks identical on disk. Same rule as run_design_c.sh -- reuse only what is newer than
+# its generator and its inputs.
+fresh() {                           # fresh TARGET DEP...
+  local t=$1 d; shift
+  [ -f "${t}" ] || return 1
+  for d in "$@"; do [ -e "${d}" ] && [ "${d}" -nt "${t}" ] && return 1; done
+  return 0
 }
 
 echo "[check] paths"
@@ -71,12 +103,12 @@ for p in "${PLY}" "${SCENE_MODEL}/cfg_args" "${COLMAP}" "${LABEL_DIR}/id_map.jso
          "${MASKS}" "${IMAGES}" "${GTD}"; do
   [ -e "${p}" ] || { echo "  MISSING ${p}"; fail=1; }
 done
-[ "${fail}" -eq 0 ] || { echo "[abort] fix the paths above (override with env vars)"; exit 1; }
+[ "${fail}" -eq 0 ] || { echo "[abort] fix the paths above (run_stage0.sh builds them)"; exit 1; }
 echo "  scene=${SCENE_MODEL}"
 echo "  objects=${OBJ}   prior=${PRIOR}"
 echo "  poses=${COLMAP}   gt_depth=${GTD}"
 echo "  labels=${LABEL_DIR}   vote=${VOTE}"
-echo "  pkl=${SHAPER_DIR}/data/${PKL_SUBDIR}   from=${FROM}   clean=${CLEAN}"
+echo "  pkl=${SHAPER_DIR}/data/${PKL_SUBDIR}   from=${FROM}   clean=${CLEAN}   run=${RUN}"
 cd "${ROOT}" || exit 1
 
 if [ "${CLEAN}" = "1" ]; then
@@ -88,11 +120,17 @@ if [ "${CLEAN}" = "1" ]; then
     echo "  ${OBJ}/*/train/ours_${ITER}/fuse*.ply"
     rm -f "${OBJ}"/*/train/ours_"${ITER}"/fuse.ply "${OBJ}"/*/train/ours_"${ITER}"/fuse_post.ply
   fi
+  if stage_at cond && [ -d "${OBJ}" ]; then
+    echo "  ${OBJ}/*/train/ours_${ITER}/${COND_NAME}"
+    rm -f "${OBJ}"/*/train/ours_"${ITER}"/"${COND_NAME}"
+  fi
   stage_at pkl   && { echo "  ${SHAPER_DIR}/data/${PKL_SUBDIR}"; rm -rf "${SHAPER_DIR}/data/${PKL_SUBDIR}"; }
   stage_at field && { echo "  ${PRIOR}/obj*_field*.npz";         rm -f "${PRIOR}"/obj*_field*.npz; }
+  # The fused meshes and the CSV carry ${RUN}, so an earlier run's outputs are left alone
+  # on purpose: CLEAN removes inputs to redo, not evidence for numbers already reported.
   if stage_at fuse && [ -d "${OBJ}" ]; then
-    echo "  ${OBJ}/*/train/ours_${ITER}/fused_field*.ply  and  ${CSV}"
-    rm -f "${OBJ}"/*/train/ours_"${ITER}"/fused_field*.ply "${CSV}"
+    echo "  ${OBJ}/*/train/ours_${ITER}/fused_${RUN}*.ply"
+    rm -f "${OBJ}"/*/train/ours_"${ITER}"/fused_"${RUN}"*.ply
   fi
 fi
 
@@ -132,18 +170,49 @@ if stage_at mesh; then
   OBJ="${OBJ}" DATA="${MASKS}" IT="${ITER}" bash mesh_voted_objects.sh
 fi
 
+# The surface that conditions the generation, which is NOT the surface we report.
+# fuse_post.ply keeps the rough band where observation runs out (grazing angles, silhouette
+# depth steps, half-transparent pixels); it sits ON the surface, so the free-space filter in
+# make_shaper_input.py passes it, and ShapeR anchors to it. Filtering it out moved obj6
+# unseen F@2 0.5942 -> 0.6382. Before this stage existed the whole-pipeline run silently
+# conditioned on fuse_post.ply and lost that gain.
+# Reported meshes still come from fuse_post.ply (the A side) and the fusion (the B side).
+if stage_at cond; then
+  echo ""; echo "=== cond: conditioning surface (${COND_NAME}) ==="
+  for MDIR in "${OBJ}"/*/; do
+    gid=$(basename "${MDIR}")
+    [[ "${gid}" =~ ^[0-9]+$ ]] || continue
+    [ -z "${ONLY}" ] || [[ " ${ONLY} " == *" ${gid} "* ]] || continue
+    [ -f "${MDIR}point_cloud/iteration_${ITER}/point_cloud.ply" ] || continue
+    CLN=${MDIR}train/ours_${ITER}/${COND_NAME}
+    # The name carries no RUN tag, so a stale file here is invisible: check it against the
+    # generator and the reconstruction it was built from rather than against existence.
+    fresh "${CLN}" mesh_tsdf_views.py "${MDIR}point_cloud" \
+      && { echo "  [${gid}] reuse"; continue; }
+    python mesh_tsdf_views.py -m "${MDIR%/}" --load_iteration "${ITER}" \
+      --out "${CLN}" ${COND_ARGS} 2>&1 \
+      | grep -E "^\[out\]|kept" | tail -2 | sed "s/^/  [${gid}] /"
+    [ -f "${CLN}" ] || echo "  [${gid}] FAILED -- pkl will report a missing recon"
+  done
+fi
+
 for ph in pkl field fuse; do
   stage_at "${ph}" || continue
   echo ""; echo "=== ${ph} ==="
+  # RECON_NAME is what makes the cond stage count. Without it the batch script falls back
+  # to its own default, fuse_post.ply, and the stage above is dead weight.
+  # RUN is passed so all three phases share one log dir and one fused-mesh tag; FAILCSV is
+  # per phase because the batch script truncates it on entry.
   PRIOR="${PRIOR}" ITER="${ITER}" OUT="${OBJ}" CSV="${CSV}" PHASE="${ph}" \
+    RUN="${RUN}" FAILCSV="${OBJ}/_scene_${RUN}_${ph}_failures.csv" \
     PKL_SUBDIR="${PKL_SUBDIR}" CAPTIONS="${OBJ}/names.tsv" COLMAP="${COLMAP}" \
     MASKS="${MASKS}" IMAGES="${IMAGES}" GT_MESH="${GT_MESH}" ONLY="${ONLY}" \
-    POINTS_FROM="${POINTS_FROM}" \
+    POINTS_FROM="${POINTS_FROM}" RECON_NAME="${COND_NAME}" \
     bash run_field_fusion_batch.sh || exit 1
 done
 
 echo ""
-echo "[done] summary csv: ${CSV}"
+echo "[done] run=${RUN}  summary csv: ${CSV}"
 echo "compare against:"
 echo "  per-object   seen F@1 0.895 -> 0.915   unseen F@2 0.185 -> 0.250   free 4.40 -> 4.91%"
 echo "  scene (old)  seen F@1 0.899 -> 0.888   unseen F@2 0.187 -> 0.243   free 9.88 -> 7.15%"
