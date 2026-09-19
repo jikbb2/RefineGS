@@ -16,6 +16,7 @@
 #                                                        setup_instance_folders.py
 #   labels   per-view label maps + id_map.json           make_label_maps.py      [scene only]
 #   train    scene 2DGS model                            train.py                [scene only]
+#   carve    rendered scene depth -> free-space ref      dump_scene_depth.py
 #   objects  scene: vote + slice     perobj: train each  vote_labels.py, extract_objects.py
 #   name     GT class per object -> names.tsv            name_objects.py
 #   mesh     per-object TSDF -> fuse_post.ply  (side A)  mesh_voted_objects.sh
@@ -85,6 +86,14 @@ CSV=${CSV:-${RUNDIR}/results.csv}
 SHAPER_DIR=${SHAPER_DIR:-$HOME/ShapeR}
 RELABEL=${RELABEL:-$HOME/relabel_${SCENE}}
 AMODAL=${AMODAL:-$HOME/amodal_${SCENE}}
+# The scene model's own rendered depth, used wherever the pipeline needs to know what a
+# camera saw past: the vote's first-surface test and the fusion's free-space carve. GT
+# depth answers the same question, but then the hard constraint is oracle-derived and the
+# method cannot run on a dataset without it.
+CARVE_DEPTH=${CARVE_DEPTH:-${ROOT}/output/${SCENE}/carve_depth}
+# none = no depth loss in scene training (the reconstruction claim stops resting on GT).
+# gt   = the earlier setting, kept so the two can be compared.
+DEPTH_SUPERVISION=${DEPTH_SUPERVISION:-none}
 
 # ---------------------------------------------------------------- knobs
 # Settled values live in the tools' own defaults; only what this driver must choose is here.
@@ -131,7 +140,7 @@ cd "${ROOT}" || exit 1
 mkdir -p "${RUNDIR}" "${PRIOR}"
 
 # ---------------------------------------------------------------- helpers
-ORDER="colmap relabel masks labels train objects name mesh cond pkl field fuse"
+ORDER="colmap relabel masks labels train carve objects name mesh cond pkl field fuse"
 idx_of() { local i=0 s; for s in ${ORDER}; do i=$((i+1)); [ "$s" = "$1" ] && { echo "$i"; return; }; done; echo 0; }
 I_FROM=$(idx_of "${FROM}"); I_TO=$(idx_of "${TO}")
 [ "${I_FROM}" -gt 0 ] && [ "${I_TO}" -gt 0 ] || { echo "[abort] FROM/TO must be one of: ${ORDER}"; exit 1; }
@@ -182,6 +191,7 @@ MANIFEST=${RUNDIR}/manifest.txt
   echo "git           ${GITREV}"
   echo "scene         ${SCENE}          pipeline=${PIPELINE}  iter=${ITER}"
   echo "resolution    -r ${RESOLUTION}         data_device=${DATA_DEVICE}"
+  echo "depth         supervision=${DEPTH_SUPERVISION}  carve=${CARVE_DEPTH}"
   echo "stages        ${FROM} .. ${TO}  clean=${CLEAN}  only='${ONLY}'"
   echo "colmap        ${COLMAP}         poses=$(n_poses "${COLMAP}")"
   echo "images        ${IMAGES}         n=$(n_files "${IMAGES}")"
@@ -213,6 +223,8 @@ if [ "${PIPELINE}" = "scene" ] && want objects; then
   want train  || chk "${SCENE_MODEL}/point_cloud/iteration_${ITER}/point_cloud.ply" "stage: train"
 fi
 want_any objects pkl fuse && chk "${GTD}"
+want carve || { want_any objects fuse && [ ! -d "${CARVE_DEPTH}" ] \
+  && echo "  note: no ${CARVE_DEPTH} -- vote and fusion will fall back to GT depth"; }
 [ "${fail}" -eq 0 ] || { echo "[abort] start earlier with FROM=, or fix the paths above"; exit 1; }
 
 # ---------------------------------------------------------------- clean
@@ -321,14 +333,33 @@ if want train; then
     PLY=${SCENE_MODEL}/point_cloud/iteration_${ITER}/point_cloud.ply
     if [ -f "${PLY}" ]; then echo "  ${PLY} exists, reusing"
     elif [ -n "${TRAIN_SCENE_ARGS}" ]; then
+      _dsup=""
+      [ "${DEPTH_SUPERVISION}" = "gt" ] && _dsup="--gt_depth_dir ${GTD} --lambda_gtdepth 0.5"
       python train.py -s "${DATA}" -m "${SCENE_MODEL}" --iterations "${ITER}" \
         -r "${RESOLUTION}" --data_device "${DATA_DEVICE}" \
-        --disable_viewer --gt_depth_dir "${GTD}" ${TRAIN_SCENE_ARGS} || exit 1
+        --disable_viewer ${_dsup} ${TRAIN_SCENE_ARGS} || exit 1
     else
       echo "  [STOP] set TRAIN_SCENE_ARGS (label-embedding and resolution flags)."
       echo "         Guessing them would train for hours and produce the wrong model."
       exit 1
     fi
+  fi
+fi
+
+# ---------------------------------------------------------------- carve
+if want carve; then
+  say "carve: rendered scene depth -> ${CARVE_DEPTH}"
+  PLY=${SCENE_MODEL}/point_cloud/iteration_${ITER}/point_cloud.ply
+  if [ ! -f "${PLY}" ]; then
+    echo "  [skip] no scene model -- the carve reference needs one (stage: train)"
+  elif fresh "${CARVE_DEPTH}/.done" dump_scene_depth.py "${PLY}"; then
+    echo "  up to date ($(ls "${CARVE_DEPTH}"/*.npz 2>/dev/null | wc -l) views)"
+  else
+    # --depth_ratio 1 explicitly: it is a PipelineParams value whose default is not
+    # render.py's, and a mismatch makes this a different quantity from the meshes.
+    python dump_scene_depth.py -m "${SCENE_MODEL}" -s "${DATA}" --iteration "${ITER}" \
+      --depth_ratio 1 --out_dir "${CARVE_DEPTH}" || exit 1
+    touch "${CARVE_DEPTH}/.done"
   fi
 fi
 
@@ -344,8 +375,10 @@ if want objects; then
     if fresh "${VOTE}/labels.npy" vote_labels.py "${PLY}" "${LABEL_DIR}/id_map.json"; then
       echo "  vote up to date"
     else
+      _vref="--gt_depth_dir ${GTD}"
+      [ -d "${CARVE_DEPTH}" ] && _vref="--carve_depth_dir ${CARVE_DEPTH}"
       python vote_labels.py --ply "${PLY}" --colmap "${COLMAP}" --label_dir "${LABEL_DIR}" \
-        --gt_depth_dir "${GTD}" --out "${VOTE}" || exit 1
+        ${_vref} --out "${VOTE}" || exit 1
       echo "  --- label coherence (previous run: mean compactness 0.754, 17 classes >= 0.8) ---"
       python check_scene_labels.py --ply "${PLY}" --labels "${VOTE}/labels.npy" | tail -6
     fi
@@ -433,6 +466,7 @@ for ph in pkl field fuse; do
     RUN="${RUN}" FAILCSV="${RUNDIR}/failures_${ph}.csv" LOGDIR="${RUNDIR}/logs" \
     PKL_SUBDIR="${PKL_SUBDIR}" CAPTIONS="${OBJ}/names.tsv" COLMAP="${COLMAP}" \
     MASKS="${MASKS}" IMAGES="${IMAGES}" GT_MESH="${GT_MESH}" GTD="${GTD}" ONLY="${ONLY}" \
+    CARVE_DEPTH="$([ -d "${CARVE_DEPTH}" ] && echo "${CARVE_DEPTH}")" \
     POINTS_FROM="${POINTS_FROM}" RECON_NAME="${COND_NAME}" FUSE_EXTRA="${FUSE_EXTRA}" \
     SHAPER_DIR="${SHAPER_DIR}" SCENE="${SCENE}" ROOT="${ROOT}" \
     bash run_field_fusion_batch.sh || exit 1

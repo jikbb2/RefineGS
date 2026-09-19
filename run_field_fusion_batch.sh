@@ -35,6 +35,11 @@ IMAGES=${IMAGES:-${ROOT}/data/${SCENE}/images}
 MASKS=${MASKS:-${ROOT}/data/${SCENE}/masks}
 STEMS_DIR=${STEMS_DIR:-$HOME/See3D/dataset/stage6/clean_stems}
 GTD=${GTD:-/home/elicer/nice-slam/Datasets/Replica/room0/results}
+# Free-space reference for the fusion. When set, the scene model's own rendered depth
+# (dump_scene_depth.py) replaces GT depth, and the fuse phase passes no GT depth at all --
+# that is the whole point, so it is all or nothing rather than a per-view fallback.
+# The pkl phase still reads GTD for its seen/unseen test (make_shaper_input --depth_dir).
+CARVE_DEPTH=${CARVE_DEPTH:-}
 GT_MESH=${GT_MESH:-$HOME/room_0/habitat/mesh_semantic.ply}
 # ShapeR is text conditioned, so the caption changes the completion. name_objects.py
 # writes <OUT>/names.tsv as "gid<TAB>class", which is exactly this format; falling back to
@@ -112,6 +117,7 @@ done
 [ ${#gids[@]} -gt 0 ] || { echo "no target object under ${OUT}"; exit 1; }
 echo "targets (${#gids[@]}): ${gids[*]}   run=${RUN}"
 echo "  out=${OUT} iter=${ITER} prior=${PRIOR} pkl=${PKL_DIR}"
+echo "  carve=$([ -n "${CARVE_DEPTH}" ] && echo "rendered scene depth ${CARVE_DEPTH}" || echo "GT depth ${GTD}")"
 echo "  recon=${RECON_NAME} -> ${FUSE_NAME}_post.ply   grid=${GRID} cfg=${CFG} ensemble=${ENSEMBLE}/${COMBINE}${FUSE_EXTRA:+   ${FUSE_EXTRA}}"
 [ -f "${CAPTIONS}" ] || echo "  WARN no caption file (${CAPTIONS}); generating from generic text"
 # RUN tags every output, so nothing here can overwrite an earlier result; a field npz is
@@ -246,6 +252,15 @@ fi
 # ---------------- fuse + eval ----------------
 if [ "${PHASE}" = "fuse" ] || [ "${PHASE}" = "all" ]; then
   echo "=== [3/3] fusion + seen/unseen evaluation ==="
+  # One reference, named in the log. sdf_distill_depth.py also auto-fills a default GT
+  # depth dir when none is given, so the GT flag has to be absent, not merely unused.
+  if [ -n "${CARVE_DEPTH}" ]; then
+    [ -d "${CARVE_DEPTH}" ] || { echo "[abort] CARVE_DEPTH not a directory: ${CARVE_DEPTH}"; exit 1; }
+    DEPTH_ARGS="--carve_depth_dir ${CARVE_DEPTH}"
+  else
+    DEPTH_ARGS="--gt_depth_dir ${GTD}"
+  fi
+  echo "  free-space reference: ${DEPTH_ARGS}"
   rm -f "${CSV}"
   ok=0; ng=0
   for gid in "${gids[@]}"; do
@@ -256,7 +271,7 @@ if [ "${PHASE}" = "fuse" ] || [ "${PHASE}" = "all" ]; then
                          ng=$((ng+1)); continue; }
     run_progress "${LOGDIR}/fuse_${gid}.log" "[${gid}] $(name_of "${gid}")" \
       python sdf_distill_depth.py -m "${MDIR}" --iteration ${ITER} \
-      --prior_field "${NPZ}" --gt_depth_dir "${GTD}" \
+      --prior_field "${NPZ}" ${DEPTH_ARGS} \
       --passthrough_mesh "${OUTD}/fuse_post.ply" \
       --out "${OUTD}/${FUSE_NAME}.ply" ${FUSE_EXTRA} \
       || { note_fail "${gid}" fuse "sdf_distill";
@@ -271,6 +286,8 @@ if [ "${PHASE}" = "fuse" ] || [ "${PHASE}" = "all" ]; then
       || { echo "    eval FAILED"; note_fail "${gid}" eval "eval_seen_unseen";
            show_tail "${LOGDIR}/eval_${gid}.log" 20; ng=$((ng+1)); continue; }
     # A bad GT match makes the metrics meaningless, so keep that line visible.
+    grep -hE "^\[carve-src\]|^\[grid-fuse\]|^\[gt-check\]" "${LOGDIR}/fuse_${gid}.log" \
+      | head -3 | sed "s/^/    [${gid}] /"
     grep -h "auto-match" "${LOGDIR}/eval_${gid}.log" | tail -1 | sed "s/^/    [${gid}] /"
     ok=$((ok+1))
   done
