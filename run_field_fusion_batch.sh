@@ -166,6 +166,11 @@ show_tail() {                                 # failures otherwise hide in the l
 # ---------------- pkl ----------------
 if [ "${PHASE}" = "pkl" ] || [ "${PHASE}" = "all" ]; then
   echo "=== [1/3] ShapeR input pkl ==="
+  # make_shaper_input decides which reconstruction points count as observed. Same
+  # reference as the carve, or the conditioning and the constraint disagree.
+  if [ -n "${CARVE_DEPTH}" ]; then PKL_DEPTH="--carve_depth_dir ${CARVE_DEPTH}"
+  else PKL_DEPTH="--depth_dir ${GTD}"; fi
+  echo "  observation reference: ${PKL_DEPTH}"
   for gid in "${gids[@]}"; do
     RECON=${OUT}/${gid}/train/ours_${ITER}/${RECON_NAME}
     STEMS=${STEMS_DIR}/${gid}.txt
@@ -186,7 +191,7 @@ if [ "${PHASE}" = "pkl" ] || [ "${PHASE}" = "all" ]; then
       --seed "${SEED}" --bounds_margin "${BOUNDS_MARGIN}" \
       --recon "${RECON}" --colmap "${COLMAP}" --images "${IMAGES}" \
       --masks_root "${MASKS}" ${STEMS:+$([ -f "${STEMS}" ] && echo --stems "${STEMS}")} \
-      --depth_dir "${GTD}" --seen_margin "${SEEN_MARGIN}" \
+      ${PKL_DEPTH} --seen_margin "${SEEN_MARGIN}" \
       --points_from "${POINTS_FROM}" \
       --seen_min_views "${SEEN_MIN_VIEWS}" --free_points "${FREE_POINTS}" \
       --caption "$(caption_of "${gid}")" --out "${PKL_DIR}/obj${gid}.pkl" \
@@ -286,9 +291,13 @@ if [ "${PHASE}" = "fuse" ] || [ "${PHASE}" = "all" ]; then
       || { echo "    eval FAILED"; note_fail "${gid}" eval "eval_seen_unseen";
            show_tail "${LOGDIR}/eval_${gid}.log" 20; ng=$((ng+1)); continue; }
     # A bad GT match makes the metrics meaningless, so keep that line visible.
-    grep -hE "^\[carve-src\]|^\[grid-fuse\]|^\[gt-check\]" "${LOGDIR}/fuse_${gid}.log" \
-      | head -3 | sed "s/^/    [${gid}] /"
-    grep -h "auto-match" "${LOGDIR}/eval_${gid}.log" | tail -1 | sed "s/^/    [${gid}] /"
+    # [gt-check] is the line that says whether the carve reference is registered at all,
+    # and grid-fuse prints two lines ahead of it -- head -3 used to cut it off.
+    grep -hE "^\[carve-src\]|^\[grid-fuse\] free|^\[gt-check\]" "${LOGDIR}/fuse_${gid}.log" \
+      | head -4 | sed "s/^/    [${gid}] /"
+    # the absolute distance matters more than the vote share: a recon 3 m from every GT
+    # object still gets a confident-looking 95% match
+    grep -hE "auto-match" "${LOGDIR}/eval_${gid}.log" | head -3 | sed "s/^/    [${gid}] /"
     ok=$((ok+1))
   done
   echo "fusion/eval done: ${ok} ok, ${ng} failed"

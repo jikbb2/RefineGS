@@ -65,8 +65,17 @@ def load_mask(masks_root, gid, stem):
     return a > 127
 
 
-def load_depth_map(depth_dir, stem, scale):
-    """stem -> depth in metres. Naming: frameNNNN->depthNNNN, same name, or _depth."""
+def load_depth_map(depth_dir, stem, scale, carve_dir=""):
+    """stem -> depth in metres. Naming: frameNNNN->depthNNNN, same name, or _depth.
+
+    carve_dir (dump_scene_depth.py npz) wins when given: it is the scene model's own
+    rendered depth, so the observation test here uses the same reference the fusion carves
+    with, and the pipeline needs no ground-truth depth. Exclusive, not a fallback -- mixing
+    the two across views would make "observed" mean different things per view.
+    """
+    if carve_dir:
+        q = os.path.join(os.path.expanduser(carve_dir), stem + ".npz")
+        return np.load(q)["depth"].astype(np.float32) if os.path.exists(q) else None
     for c in (stem.replace("frame", "depth"), stem, stem + "_depth"):
         for ext in (".png", ".npy"):
             p = os.path.join(os.path.expanduser(depth_dir), c + ext)
@@ -83,7 +92,7 @@ def _count_seen(P_w, stems, cams, args, margin):
     n_seen = np.zeros(len(P_w), np.int32)
     n_dep = n_msk = 0
     for s in stems:
-        D = load_depth_map(args.depth_dir, s, args.depth_scale)
+        D = load_depth_map(args.depth_dir, s, args.depth_scale, args.carve_depth_dir)
         if D is None:
             continue
         n_dep += 1
@@ -160,7 +169,7 @@ def sample_free_points(stems, cams, center, R_align, bounds, args, n_target=6000
     per = max(64, n_target // max(1, len(stems)))
     out = []
     for s in stems:
-        D = load_depth_map(args.depth_dir, s, args.depth_scale)
+        D = load_depth_map(args.depth_dir, s, args.depth_scale, args.carve_depth_dir)
         if D is None:
             continue
         c = cams[s]
@@ -234,6 +243,9 @@ def main():
                          "points condition the generation, so junk in the unobserved part "
                          "of the recon cannot corrupt it")
     ap.add_argument("--depth_scale", type=float, default=6553.5)
+    ap.add_argument("--carve_depth_dir", default="",
+                    help="dump_scene_depth.py npz folder. Replaces --depth_dir as the "
+                         "observation reference: same occlusion evidence, no ground truth")
     ap.add_argument("--min_kept", type=int, default=200,
                     help="minimum verified points before the margin is relaxed")
     ap.add_argument("--allow_unfiltered", action="store_true",
@@ -262,6 +274,11 @@ def main():
                     help="observed free-space samples to carry in the pkl (0 = off); "
                          "used by shaper_field.py --guide_free_w to constrain generation")
     args = ap.parse_args()
+    # Both flags enable the same machinery; carve_depth_dir simply names a different source.
+    use_depth = bool(args.depth_dir or args.carve_depth_dir)
+    print(f"[depth] observation reference: "
+          + (f"rendered scene depth {args.carve_depth_dir}" if args.carve_depth_dir
+             else f"GT depth {args.depth_dir}" if args.depth_dir else "NONE (filter off)"))
 
     assert read_colmap is not None, "cannot import warp_gt_to_pose -- run from the RefineGS root"
 
@@ -270,7 +287,7 @@ def main():
         by how many gaussians the reconstruction happened to place."""
         out = []
         for st in stems:
-            D = load_depth_map(args.depth_dir, st, args.depth_scale)
+            D = load_depth_map(args.depth_dir, st, args.depth_scale, args.carve_depth_dir)
             M = load_mask(args.masks_root, args.gid, st) if args.masks_root else None
             if D is None or M is None:
                 continue
@@ -349,7 +366,7 @@ def main():
         if len(P_w) > n_pool:
             P_w = P_w[np.random.default_rng(args.seed).choice(len(P_w), n_pool,
                                                               replace=False)]
-    elif args.depth_dir:
+    elif use_depth:
         P_w = filter_observed(P_w, stems, cams, args)
 
     q = args.frame_pct
@@ -365,7 +382,7 @@ def main():
 
     V_w = np.asarray(m.vertices, np.float64) if len(m.vertices) else P_w
     raw_b = np.abs((R_align @ (V_w - center).T).T).max(0) * args.bounds_margin
-    if args.depth_dir and args.free_points > 0:
+    if use_depth and args.free_points > 0:
         F_m = sample_free_points(stems, cams, center, R_align, bounds, args,
                                  n_target=args.free_points)
     if len(P_w) > args.n_points:                       # budget now lands on real surface
@@ -424,8 +441,8 @@ def main():
         # on the far side counted as visible (obj10: 13133/14252 = 92% across all 32
         # views), telling ShapeR there is nothing to complete. Keep first-surface only.
         vis = infr.copy()
-        if args.depth_dir:
-            d = load_depth_map(args.depth_dir, s, args.depth_scale)
+        if use_depth:
+            d = load_depth_map(args.depth_dir, s, args.depth_scale, args.carve_depth_dir)
             if d is not None:
                 if d.shape != (H, W):
                     d = np.array(Image.fromarray(d).resize((W, H), Image.NEAREST))
@@ -446,7 +463,7 @@ def main():
     _mv, _mi = int(np.median(n_vis)), int(np.median(n_infr))
     vis = _mv / max(_mi, 1)
     print(f"[views] {len(image_data)} ({n_mask} masked)  visible {_mv}/{_mi} "
-          f"({vis*100:.0f}%)  occlusion {'on' if args.depth_dir else 'OFF'}"
+          f"({vis*100:.0f}%)  occlusion {'on' if use_depth else 'OFF'}"
           + ("  <- too high; nothing left for ShapeR to complete" if vis > 0.8 else ""))
 
     # ---- 4) assemble the pkl ----
