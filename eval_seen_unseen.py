@@ -314,11 +314,77 @@ def sample(mesh_path, n, seed=0):
     return np.asarray(pc.points), N
 
 
+# --------------------------------------------------------------------------
+# Completion-side metrics. Chamfer and F-score are SURFACE measures: a hollow
+# shell and a solid of the same outline score alike, and an inflated surface is
+# only penalised where it drifts past the threshold. Design C failed by
+# inflating, so volume and closedness are measured directly.
+
+def mesh_watertight(path):
+    """(open boundary edges, is_watertight). An unfilled region leaves a hole, so
+    this is the completion counterpart to a distance metric."""
+    m = o3d.io.read_triangle_mesh(os.path.expanduser(path))
+    T = np.asarray(m.triangles)
+    if len(T) == 0:
+        return -1, False
+    e = np.concatenate([T[:, [0, 1]], T[:, [1, 2]], T[:, [2, 0]]])
+    e = np.sort(e, axis=1)
+    _, cnt = np.unique(e, axis=0, return_counts=True)
+    n_open = int((cnt == 1).sum())
+    return n_open, bool(m.is_watertight())
+
+
+def occupancy_iou(Vg, Tg, recon_path, voxel):
+    """Solid IoU over a shared voxel grid, via ray-parity occupancy.
+
+    0.01 m, not the fusion's 0.005: this measures gross volume (hollow, inflated),
+    which the surface metrics already cover at fine scale, and halving the voxel
+    costs 8x the queries for no change in what it detects.
+    Occupancy is only meaningful on closed meshes; returns nan when either side is
+    open rather than reporting a number that means nothing.
+    """
+    mr = o3d.io.read_triangle_mesh(os.path.expanduser(recon_path))
+    if len(mr.triangles) == 0:
+        return float("nan")
+    mg = o3d.geometry.TriangleMesh(o3d.utility.Vector3dVector(Vg),
+                                   o3d.utility.Vector3iVector(Tg.astype(np.int32)))
+    if not (mr.is_watertight() and mg.is_watertight()):
+        return float("nan")
+    lo = np.minimum(np.asarray(mr.vertices).min(0), Vg.min(0)) - 2 * voxel
+    hi = np.maximum(np.asarray(mr.vertices).max(0), Vg.max(0)) + 2 * voxel
+    g = np.stack(np.meshgrid(*[np.arange(lo[i], hi[i], voxel) for i in range(3)],
+                             indexing="ij"), -1).reshape(-1, 3).astype(np.float32)
+    if len(g) > 40_000_000:
+        print(f"[iou] grid {len(g):,} too large at voxel {voxel} -- skipped")
+        return float("nan")
+    q = o3d.core.Tensor(g)
+    occ = []
+    for m in (mr, mg):
+        sc = o3d.t.geometry.RaycastingScene()
+        sc.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(m))
+        occ.append(sc.compute_occupancy(q).numpy().astype(bool))
+    inter = float((occ[0] & occ[1]).sum()); union = float((occ[0] | occ[1]).sum())
+    return inter / union if union > 0 else float("nan")
+
+
+def preservation(A, B, thr):
+    """Share of A's surface that survives in B, within thr.
+
+    The claim is that fusion fills the unobserved WITHOUT disturbing the observed,
+    and seen_acc only shows that indirectly: a method can hold its accuracy while
+    replacing the surface with a different one of similar quality. This is
+    one-directional on purpose -- B's new material is the contribution, not an error.
+    """
+    d, _ = cKDTree(B).query(A, workers=-1)
+    return float((d < thr).mean())
+
+
 def _stat(d):
     return (float(d.mean() * 1000), float(np.median(d) * 1000)) if len(d) else (float("nan"),) * 2
 
 
-def report(name, RN, G, gs, gf, thresholds, views, args, GN=None):
+def report(name, RN, G, gs, gf, thresholds, views, args, GN=None,
+           mesh_path="", gt_VT=None):
     """recon (점,법선) RN, GT 점군 G, GT 라벨(gs=seen) 로 영역별 지표 출력 + dict 반환."""
     R, RNn = RN if isinstance(RN, tuple) else (RN, None)
     rs, rf = classify(R, views, args.margin, args.min_views, args.use_mask)
@@ -367,6 +433,15 @@ def report(name, RN, G, gs, gf, thresholds, views, args, GN=None):
         am, _ = _stat(dR[rf])
         print(f"  [FREE 위반] {int(rf.sum())}점 ({rf.mean()*100:.1f}%) — "
               f"관측된 빈 공간의 표면, accuracy {am:.2f}mm  ※ 명백한 오류")
+    if mesh_path and not args.no_extra_metrics:
+        n_open, wt = mesh_watertight(mesh_path)
+        M["open_edges"] = n_open
+        M["watertight"] = int(wt)
+        M["vol_iou"] = (occupancy_iou(gt_VT[0], gt_VT[1], mesh_path, args.iou_voxel)
+                        if gt_VT is not None else float("nan"))
+        print(f"  [closure] open boundary edges {n_open}  watertight {wt}"
+              + (f"   volumetric IoU {M['vol_iou']:.4f}" if M["vol_iou"] == M["vol_iou"]
+                 else "   volumetric IoU n/a (a mesh is open)"))
     M["seen_acc_mm"] = M["seen_acc"]; M["unseen_comp_mm"] = M["unseen_comp"]
     return M
 
@@ -378,7 +453,10 @@ def write_csv(path, rows, tag):
             "seen_acc", "seen_acc_med", "seen_comp", "seen_comp_med",
             "seen_F1.0", "seen_P1.0", "seen_R1.0",
             "unseen_acc", "unseen_acc_med", "unseen_comp", "unseen_comp_med",
-            "unseen_F2.0", "unseen_P2.0", "unseen_R2.0"]
+            "unseen_F2.0", "unseen_P2.0", "unseen_R2.0",
+            # NC was computed in report() but never reached the CSV
+            "all_NC", "seen_NC", "unseen_NC",
+            "open_edges", "watertight", "vol_iou", "preservation"]
     path = os.path.expanduser(path)
     new = not os.path.exists(path)
     with open(path, "a", newline="") as fh:
@@ -439,6 +517,18 @@ def main():
     ap.add_argument("--csv", default="", help="스윕 비교용 CSV 누적 경로")
     ap.add_argument("--tag", default="", help="CSV 행 태그(예: d0.010)")
     ap.add_argument("--csv_all", action="store_true", help="A 행도 CSV 에 기록(기본 B만)")
+    # Completion-side metrics. Surface distances cannot separate "filled the hole"
+    # from "left it open", nor "solid" from "inflated shell".
+    ap.add_argument("--iou_voxel", type=float, default=0.01,
+                    help="volumetric IoU voxel (m). Coarser than the fusion's 0.005 on "
+                         "purpose: this measures gross volume, and halving it costs 8x "
+                         "the queries for the same verdict")
+    ap.add_argument("--preserve_thr", type=float, default=0.01,
+                    help="A->B preservation radius (m). Share of the observed surface "
+                         "that survives fusion -- the direct form of the claim that "
+                         "seen_acc only supports indirectly")
+    ap.add_argument("--no_extra_metrics", action="store_true",
+                    help="skip watertightness / volumetric IoU / preservation")
     args = ap.parse_args()
 
     thr = [float(x) for x in args.thresholds.split(",")]
@@ -494,12 +584,19 @@ def main():
         print("  ⚠ unseen 이 거의 없음 — margin 과다 또는 뷰/depth 매칭 확인")
 
     rows = []
-    a = report("A: " + args.recon, sample(args.recon, args.n_sample, args.seed),
-               G, gs, None, thr, views, args, GN)
+    gt_VT = (V, T)
+    SA = sample(args.recon, args.n_sample, args.seed)
+    a = report("A: " + args.recon, SA, G, gs, None, thr, views, args, GN,
+               mesh_path=args.recon, gt_VT=gt_VT)
     rows.append(a)
     if args.recon2:
-        b = report("B: " + args.recon2, sample(args.recon2, args.n_sample, args.seed),
-                   G, gs, None, thr, views, args, GN)
+        SB = sample(args.recon2, args.n_sample, args.seed)
+        b = report("B: " + args.recon2, SB, G, gs, None, thr, views, args, GN,
+                   mesh_path=args.recon2, gt_VT=gt_VT)
+        # A -> B, one-directional: what B adds is the contribution, not an error
+        if not args.no_extra_metrics:
+            b["preservation"] = preservation(SA[0], SB[0], args.preserve_thr)
+            a["preservation"] = 1.0
         rows.append(b)
         print("\n===== A → B 변화 (원하는 방향: seen acc 유지, unseen comp 감소) =====")
         print(f"  seen accuracy      {a['seen_acc']:7.2f} → {b['seen_acc']:7.2f} mm  "
@@ -511,6 +608,17 @@ def main():
               f"R {a['unseen_R2.0']:.3f}→{b['unseen_R2.0']:.3f})")
         print(f"  free 위반 비율     {a['free_pct']:6.2f}% → {b['free_pct']:6.2f}%  "
               f"({b['free_pct']-a['free_pct']:+.2f}%p, 낮을수록 좋음)")
+        if not args.no_extra_metrics:
+            print(f"  관측 보존율        {b.get('preservation', float('nan')):7.4f}        "
+                  f"(A 표면 중 {args.preserve_thr*100:.0f}cm 내 남은 비율, 1 에 가까울수록 무손상)")
+            if "open_edges" in a and "open_edges" in b:
+                print(f"  열린 경계 엣지     {a['open_edges']:7d} → {b['open_edges']:7d}  "
+                      f"(완성될수록 감소)")
+            if a.get("vol_iou", float("nan")) == a.get("vol_iou", float("nan")):
+                print(f"  volumetric IoU     {a['vol_iou']:7.4f} → {b['vol_iou']:7.4f}  "
+                      f"(부피 기준, 팽창/속빔을 잡음)")
+            print(f"  생성 기여 영역     recon 중 unseen {a['recon_unseen_pct']:.1f}% → "
+                  f"{b['recon_unseen_pct']:.1f}%   |  GT unseen {100-a['gt_seen_pct']:.1f}%")
     if args.csv:
         write_csv(args.csv, rows if args.csv_all else rows[-1:], args.tag or "")
 

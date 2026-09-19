@@ -7,9 +7,14 @@ has no reason to pick the right one. Measured after 30k iters from a random init
 CE 0.02-0.4 and locally smooth embeddings (knn 0.02), yet only 6 of 34 classes were
 spatially compact. Voting reads the assignment straight off the 3-D structure.
 
-Visibility uses GT depth, the same test as make_shaper_input.py: a gaussian counts
-in a view only if it is the first surface there (|z - d_gt| < margin). Without it,
-points on the far side of an object collect votes through the object.
+Visibility: a gaussian counts in a view only if it is the first surface there
+(|z - d| < margin). Without it, points on the far side of an object collect votes
+through the object.
+
+The reference depth d can come from two places. --carve_depth_dir is the scene model's
+own rendered depth (dump_scene_depth.py) and is preferred: "is this gaussian the first
+surface" is a question about the model being labelled, so the model answers it, and the
+pipeline then needs no ground-truth depth at all. --gt_depth_dir is the fallback.
 
 Output: labels.npy (int32, one class per gaussian) plus a vote-margin array that
 says how contested each gaussian was.
@@ -52,6 +57,9 @@ def main():
     ap.add_argument("--colmap", required=True)
     ap.add_argument("--label_dir", required=True)
     ap.add_argument("--gt_depth_dir", default="", help="omit to skip the occlusion test")
+    ap.add_argument("--carve_depth_dir", default="",
+                    help="dump_scene_depth.py npz folder (rendered scene depth). Preferred "
+                         "over --gt_depth_dir: same occlusion evidence, no ground truth")
     ap.add_argument("--gt_depth_scale", type=float, default=6553.5)
     ap.add_argument("--margin", type=float, default=0.03,
                     help="|z - d_gt| tolerance (m) for 'first surface in this view'")
@@ -69,21 +77,32 @@ def main():
     print(f"[vote] {N:,} gaussians, K={K}, {len(cams)} views with labels")
     assert cams, "no camera stem matches a label map"
 
+    src = ("rendered scene depth" if args.carve_depth_dir
+           else "GT depth" if args.gt_depth_dir else "NONE (no occlusion test)")
+    print(f"[vote] visibility reference: {src}")
     votes = np.zeros((N, K + 1), np.int32)
-    n_vis_tot = 0
+    n_vis_tot = n_depth = 0
     for vi, c in enumerate(cams):
         lab = load_png(os.path.join(lab_dir, c["stem"] + ".png"), dtype=np.int32)
         H, W = lab.shape
         sx, sy = W / c["W"], H / c["H"]                       # label map may be resized
+        # One reference for every view. Falling back per view would mix the scene render
+        # and GT depth across the vote with nothing downstream saying so.
         d = None
-        if args.gt_depth_dir:
+        if args.carve_depth_dir:
+            q = os.path.join(os.path.expanduser(args.carve_depth_dir), c["stem"] + ".npz")
+            if os.path.isfile(q):
+                d = np.load(q)["depth"].astype(np.float32)
+        elif args.gt_depth_dir:
             for nm in (c["stem"].replace("frame", "depth"), c["stem"]):
                 p = os.path.join(os.path.expanduser(args.gt_depth_dir), nm + ".png")
                 if os.path.isfile(p):
                     d = load_png(p, args.gt_depth_scale)
-                    if d.shape != (H, W):
-                        d = np.asarray(Image.fromarray(d).resize((W, H), Image.NEAREST))
                     break
+        if d is not None:
+            n_depth += 1
+            if d.shape != (H, W):
+                d = np.asarray(Image.fromarray(d).resize((W, H), Image.NEAREST))
 
         for i in range(0, N, args.chunk):
             X = xyz[i:i + args.chunk]
@@ -124,7 +143,11 @@ def main():
     np.save(os.path.join(od, "votes_total.npy"), tot.astype(np.int32))
 
     unass = int((labels < 0).sum())
-    print(f"\n[vote] {n_vis_tot / max(len(cams), 1):,.0f} visible gaussians per view")
+    print(f"\n[vote] depth reference found for {n_depth}/{len(cams)} views ({src})")
+    if (args.carve_depth_dir or args.gt_depth_dir) and n_depth < len(cams):
+        print(f"       WARN {len(cams) - n_depth} views voted with NO occlusion test -- "
+              f"back faces collect votes through the object there")
+    print(f"[vote] {n_vis_tot / max(len(cams), 1):,.0f} visible gaussians per view")
     print(f"       unassigned (never visible) {unass:,} ({unass / N * 100:.1f}%)")
     print(f"       vote margin: median {np.median(marg[labels >= 0]):.2f}  "
           f"below 0.2 -> {(marg[labels >= 0] < 0.2).mean() * 100:.0f}% contested")

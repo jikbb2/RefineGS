@@ -264,6 +264,40 @@ def load_view_mask(mask_dir, image_name, H, W):
     return None
 
 
+_carve_src_printed = False
+
+
+def load_carve_depth(carve_dir, image_name, H, W):
+    """Rendered whole-scene depth (dump_scene_depth.py npz) as the free-space reference.
+
+    The free-space vote asks "did a camera see PAST this point", which is a question about
+    the whole room. The object model cannot answer it -- it holds one object, so every ray
+    beyond that object reads as empty and the carve eats its neighbours. GT depth answers
+    it, but then the hard constraint is oracle-derived. The scene model answers it from the
+    reconstruction itself, which is the same information without the oracle.
+
+    npz keys: depth (float16 HxW, 0 = invalid), fx, fy, cx, cy, c2w. Only depth is read
+    here: the object render supplies the pose and intrinsics, and a resolution mismatch is
+    resized the same way load_gt_depth does.
+    """
+    global _carve_src_printed
+    stem = os.path.splitext(image_name)[0]
+    p = os.path.join(os.path.expanduser(carve_dir), stem + ".npz")
+    if not os.path.exists(p):
+        return None
+    a = np.load(p)["depth"].astype(np.float32)
+    if a.shape != (H, W):
+        from PIL import Image
+        a = np.array(Image.fromarray(a).resize((W, H), Image.NEAREST))
+    if not _carve_src_printed:
+        v = a[a > 0]
+        print(f"[carve-src] rendered scene depth {os.path.basename(p)} "
+              f"{a.shape} valid {len(v)/a.size*100:.1f}%  "
+              f"median {np.median(v) if len(v) else float('nan'):.3f}m")
+        _carve_src_printed = True
+    return a
+
+
 def load_gt_depth(depth_dir, image_name, H, W, scale):
     """Load dataset GT depth, used to carve free space against the WHOLE scene.
     Unlike the rendered depth (the gaussian model has no table legs) it reflects real
@@ -363,11 +397,20 @@ def collect_oriented_points(scene, gaussians, pipe, background, args, mask_dir=N
                  "fx": fx / ds, "fy": fy / ds, "cx": cx / ds, "cy": cy / ds,
                  "W": dbuf.shape[1], "H": dbuf.shape[0],
                  "depth": dbuf, "mask": mbuf}
-            if getattr(args, "gt_depth_dir", ""):
+            # Free-space reference for the carve. carve_depth_dir (rendered whole-scene
+            # depth) takes precedence: it carries the same occlusion evidence with no GT
+            # depth map, which is what lets this run on a dataset that has none.
+            dg = None
+            if getattr(args, "carve_depth_dir", ""):
+                # No per-view fallback to GT: a run that carved some views from the scene
+                # render and others from GT depth would be neither, and nothing downstream
+                # would say so. Missing views are simply dropped and counted.
+                dg = load_carve_depth(args.carve_depth_dir, cam.image_name, H, W)
+            elif getattr(args, "gt_depth_dir", ""):
                 dg = load_gt_depth(args.gt_depth_dir, cam.image_name, H, W,
                                    args.gt_depth_scale)
-                if dg is not None:
-                    b["dgt"] = dg[::ds, ::ds]
+            if dg is not None:
+                b["dgt"] = dg[::ds, ::ds]
             VB.append(b)
             if len(VB) > vb_cap:                # halve, coverage stays uniform
                 VB = VB[::2]
@@ -598,10 +641,14 @@ def grid_fuse_tsdf(VB, sd_fn, center, scale, args, debug_pts=None):
               f"cos_weight={args.obs_cos_weight} -> rejected {rej*100:.0f}%")
 
     n_gt = sum(1 for b in VB if "dgt" in b)
-    print(f"[grid-fuse] GT depth buffers {n_gt}/{len(VB)} views"
-          + ("" if n_gt else "  WARN no GT depth -- falling back to silhouette carve, legs at risk"))
-    # [gt-check] GT depth vs rendered depth. A large value (cm scale) means a scale or
-    # frame-matching error, which invalidates every free-space decision. Expect ~0.
+    _csrc = ("rendered scene depth" if getattr(args, "carve_depth_dir", "") else "GT depth")
+    print(f"[grid-fuse] free-space reference: {_csrc} -- {n_gt}/{len(VB)} views"
+          + ("" if n_gt else "  WARN none found -- falling back to silhouette carve, legs at risk"))
+    # [gt-check] reference depth vs this object's rendered depth, inside the mask. A cm
+    # scale value means a scale or frame-matching error and invalidates every free-space
+    # decision. Expect ~0.
+    # With carve_depth_dir the two sides are the scene model and its own slice, so this
+    # also checks that slicing kept the surface: a large value means the slice lost it.
     for b in VB[:5]:
         dg = b.get("dgt")
         if dg is not None:
@@ -1588,7 +1635,7 @@ def main():
         args.data_device = "cpu"              # saves GPU memory, does not change results
     if args.prior_field and not args.grid_fuse and "--no_grid_fuse" not in _given:
         args.grid_fuse = True                 # passing prior_field already states the intent
-    if not args.gt_depth_dir and "--no_gt_depth" not in _given:
+    if not args.gt_depth_dir and not args.carve_depth_dir and "--no_gt_depth" not in _given:
         _d = os.environ.get("REFINEGS_GT_DEPTH", DEFAULT_GT_DEPTH_DIR)
         if os.path.isdir(_d):
             args.gt_depth_dir = _d
@@ -1612,7 +1659,8 @@ def main():
         ("free_hard_alpha", args.free_hard_alpha,  "skip fully saturated observation (0.95)"),
         ("voxel_size",      args.voxel_size,       "voxel size (m)"),
         ("prior_carve_ds",  args.prior_carve_ds,   "view-buffer downscale (keep 1)"),
-        ("gt_depth_dir",    args.gt_depth_dir,     "GT depth (carve reference)"),
+        ("gt_depth_dir",    args.gt_depth_dir,     "GT depth (carve reference; unused when carve_depth_dir is set)"),
+        ("carve_depth_dir", args.carve_depth_dir,  "rendered scene depth (preferred carve reference)"),
         ("pts_seed",        args.pts_seed,         "point sampling seed (reproducibility)"),
         ("fuse_device",     args.fuse_device,      "fusion device"),
     ]:
@@ -1951,7 +1999,9 @@ def main():
 
     # 1c) carve samples from whole-scene depth; takes precedence over empty-ray
     CV = None
-    if args.carve_depth_dir:
+    if args.carve_depth_dir and not args.grid_fuse:
+        # CV is consumed by train_sdf only. Under grid_fuse the carve comes from the view
+        # buffers, and sampling millions of ray points here would cost minutes for nothing.
         CV = load_carve_points(args.carve_depth_dir, center, scale)
         print(f"[carve] {len(CV)} samples (whole-scene depth, inside the bbox)")
 
