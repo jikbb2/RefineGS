@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+ㅍ#!/usr/bin/env bash
 # RefineGS end to end: raw scene -> seen/unseen numbers, in one command.
 #
 #   bash run_refinegs.sh                          # whole thing, scene pipeline
@@ -230,23 +230,46 @@ want carve || { want_any objects fuse && [ ! -d "${CARVE_DEPTH}" ] \
 [ "${fail}" -eq 0 ] || { echo "[abort] start earlier with FROM=, or fix the paths above"; exit 1; }
 
 # ---------------------------------------------------------------- clean
+# CLEAN is whole-tree: this stage's outputs AND everything after, because a changed input
+# makes those stale too. ONLY is per-object. Together they destroy every other object in
+# order to rebuild one, which is not what anybody means by it.
+if [ "${CLEAN}" = "1" ] && [ -n "${ONLY}" ]; then
+  echo "[abort] CLEAN=1 with ONLY='${ONLY}': CLEAN retires the whole ${OBJ} tree, not just"
+  echo "        those gids. Drop ONLY to rebuild everything, or drop CLEAN and let fresh()"
+  echo "        rebuild whatever is actually stale."
+  exit 1
+fi
 if [ "${CLEAN}" = "1" ]; then
-  say "clean: removing outputs from '${FROM}' onward"
-  at_or_after labels  && { echo "  ${LABEL_DIR}"; rm -rf "${LABEL_DIR}"; }
-  at_or_after objects && { echo "  ${OBJ}"; rm -rf "${OBJ}"; }
-  if at_or_after mesh && [ -d "${OBJ}" ]; then
-    echo "  ${OBJ}/*/train/ours_${ITER}/fuse_post.ply"
-    rm -f "${OBJ}"/*/train/ours_"${ITER}"/fuse.ply "${OBJ}"/*/train/ours_"${ITER}"/fuse_post.ply
+  say "clean: retiring outputs from '${FROM}' onward"
+  # Move, do not delete. These cost tens of minutes (vote, meshes) to hours (ShapeR
+  # fields) to rebuild, and a mistyped command should not spend that.
+  TRASH=${ROOT}/output/${SCENE}/_trash/${RUN}
+  retire() {
+    local q rel n=0
+    for q in "$@"; do
+      [ -e "${q}" ] || continue
+      mkdir -p "${TRASH}"
+      rel=${q#"${ROOT}/"}; rel=${rel//\//__}
+      mv "${q}" "${TRASH}/${rel}" 2>/dev/null && n=$((n + 1))
+    done
+    [ "${n}" -gt 0 ] && echo "  retired ${n} under $(dirname "$1")"
+    return 0
+  }
+  if [ "${TO}" != "fuse" ]; then
+    echo "  NOTE TO=${TO}, but CLEAN still retires pkl/field/fuse outputs -- they go stale"
+    echo "       the moment an earlier stage is rebuilt."
   fi
-  if at_or_after cond && [ -d "${OBJ}" ]; then
-    echo "  ${OBJ}/*/train/ours_${ITER}/${COND_NAME}"
-    rm -f "${OBJ}"/*/train/ours_"${ITER}"/"${COND_NAME}"
-  fi
-  at_or_after pkl   && { echo "  ${SHAPER_DIR}/data/${PKL_SUBDIR}"; rm -rf "${SHAPER_DIR}/data/${PKL_SUBDIR}"; }
-  at_or_after field && { echo "  ${PRIOR}/obj*_field*.npz"; rm -f "${PRIOR}"/obj*_field*.npz; }
-  # Results carry ${RUN}, so an earlier run's evidence is left alone on purpose.
-  at_or_after fuse  && { echo "  ${OBJ}/*/train/ours_${ITER}/fused_${RUN}*.ply"
-                         rm -f "${OBJ}"/*/train/ours_"${ITER}"/fused_"${RUN}"*.ply; }
+  at_or_after labels  && retire "${LABEL_DIR}"
+  at_or_after objects && retire "${OBJ}"
+  at_or_after mesh    && retire "${OBJ}"/*/train/ours_"${ITER}"/fuse.ply \
+                                "${OBJ}"/*/train/ours_"${ITER}"/fuse_post.ply
+  at_or_after cond    && retire "${OBJ}"/*/train/ours_"${ITER}"/"${COND_NAME}"
+  at_or_after pkl     && retire "${SHAPER_DIR}/data/${PKL_SUBDIR}"
+  at_or_after field   && retire "${PRIOR}"/obj*_field*.npz
+  # Fused meshes and the CSV carry ${RUN}: CLEAN removes inputs to redo, never evidence
+  # for numbers already reported.
+  at_or_after fuse    && retire "${OBJ}"/*/train/ours_"${ITER}"/fused_"${RUN}"*.ply
+  [ -d "${TRASH}" ] && echo "  -> ${TRASH}   (restore by moving back; '__' was '/')"
 fi
 
 # ---------------------------------------------------------------- colmap
