@@ -91,6 +91,18 @@ AMODAL=${AMODAL:-$HOME/amodal_${SCENE}}
 # depth answers the same question, but then the hard constraint is oracle-derived and the
 # method cannot run on a dataset without it.
 CARVE_DEPTH=${CARVE_DEPTH:-${ROOT}/output/${SCENE}/carve_depth}
+# The vote is the exception. Its first-surface test needs a reference INDEPENDENT of the
+# model being labelled, and the scene render is not one: a gaussian of that model is
+# trivially within the margin of that model's own rendered surface, so the test partly
+# answers itself. Measured on room0, switching the vote to it moved 19.24% of all
+# gaussians -- unassigned +93%, background -27%, every object label +2..31% -- partly for
+# that reason and partly because dump_scene_depth zeroes every pixel below alpha 0.5, so
+# the background stops voting at all. The fusion's carve is a different question ("did a
+# camera see PAST this point") that the scene model is entitled to answer, and it checks
+# out at 1-3mm against the object render.
+#   gt    = GT depth. Every recorded number comes from this.
+#   carve = rendered scene depth, kept so the GT-free variant stays measurable.
+VOTE_REF=${VOTE_REF:-gt}
 # none = no depth loss in scene training (the reconstruction claim stops resting on GT).
 # gt   = the earlier setting, kept so the two can be compared.
 DEPTH_SUPERVISION=${DEPTH_SUPERVISION:-none}
@@ -126,7 +138,14 @@ COND_NAME=${COND_NAME:-tsdf_clean.ply}
 # Side A, the observed surface we report. Measured on gid2: min_alpha closes the holes
 # (0.7 -> 0.3, the chair's gaussians have median opacity 0.61 and rarely reach 0.7),
 # min_cos removes the panel its back faces produce (0.0 -> 0.35), erode only shrinks.
-MESH_ARGS=${MESH_ARGS:-"--min_alpha 0.3 --min_cos 0.35 --max_jump 0.02 --erode 0 --num_cluster 0 --min_comp_frac 0.02"}
+# min_cos 0.35 is not tunable downward: at 0.15 the grazing pixels that survive are the
+# WALL behind the chair, the GT match then unions id89, and seen completion goes to 943mm.
+# max_jump 0.05 over 0.02 closes the holes -- an armchair's own arms and cushion make
+# depth steps larger than 2cm inside its silhouette, so a tight jump filter erases real
+# surface. Measured gid2: seen completion 25.11 -> 7.93mm, NC 0.894 -> 0.926, against
+# seen accuracy 3.60 -> 4.07mm and free 1.2 -> 3.6%. Holes are the worse error here: they
+# move observed surface into the unseen bucket and flatter B's improvement.
+MESH_ARGS=${MESH_ARGS:-"--min_alpha 0.3 --min_cos 0.35 --max_jump 0.05 --erode 0 --num_cluster 0 --min_comp_frac 0.02"}
 # Conditioning, filtered harder on purpose: ShapeR anchors to these points so a ragged
 # boundary is copied into the prior, and the holes that leaves are what the prior fills.
 COND_ARGS=${COND_ARGS:-"--min_alpha 0.7 --min_cos 0.35 --max_jump 0.02 --erode 3 --num_cluster 0 --min_comp_frac 0.02"}
@@ -204,7 +223,8 @@ MANIFEST=${RUNDIR}/manifest.txt
   echo "git           ${GITREV}"
   echo "scene         ${SCENE}          pipeline=${PIPELINE}  iter=${ITER}"
   echo "resolution    -r ${RESOLUTION}         data_device=${DATA_DEVICE}"
-  echo "depth         supervision=${DEPTH_SUPERVISION}  carve=${CARVE_DEPTH}"
+  echo "depth         supervision=${DEPTH_SUPERVISION}  vote_ref=${VOTE_REF}"
+  echo "carve         ${CARVE_DEPTH}"
   echo "stages        ${FROM} .. ${TO}  clean=${CLEAN}  only='${ONLY}'"
   echo "colmap        ${COLMAP}         poses=$(n_poses "${COLMAP}")"
   echo "images        ${IMAGES}         n=$(n_files "${IMAGES}")"
@@ -413,7 +433,8 @@ if want objects; then
       echo "  vote up to date"
     else
       _vref="--gt_depth_dir ${GTD}"
-      [ -d "${CARVE_DEPTH}" ] && _vref="--carve_depth_dir ${CARVE_DEPTH}"
+      [ "${VOTE_REF}" = "carve" ] && [ -d "${CARVE_DEPTH}" ] \
+        && _vref="--carve_depth_dir ${CARVE_DEPTH}"
       python vote_labels.py --ply "${PLY}" --colmap "${COLMAP}" --label_dir "${LABEL_DIR}" \
         ${_vref} --out "${VOTE}" || exit 1
       echo "  --- label coherence (previous run: mean compactness 0.754, 17 classes >= 0.8) ---"
