@@ -1,4 +1,4 @@
-ㅍ#!/usr/bin/env bash
+#!/usr/bin/env bash
 # RefineGS end to end: raw scene -> seen/unseen numbers, in one command.
 #
 #   bash run_refinegs.sh                          # whole thing, scene pipeline
@@ -19,7 +19,7 @@
 #   carve    rendered scene depth -> free-space ref      dump_scene_depth.py
 #   objects  scene: vote + slice     perobj: train each  vote_labels.py, extract_objects.py
 #   name     GT class per object -> names.tsv            name_objects.py
-#   mesh     per-object TSDF -> fuse_post.ply  (side A)  mesh_voted_objects.sh
+#   mesh     per-object TSDF -> fuse_post.ply  (side A)  mesh_tsdf_views.py
 #   cond     boundary-filtered TSDF -> tsdf_clean.ply    mesh_tsdf_views.py
 #   pkl      ShapeR input                                run_field_fusion_batch.sh
 #   field    ShapeR signed SDF grid                      run_field_fusion_batch.sh [shaper env]
@@ -118,7 +118,18 @@ OVERLAP=${OVERLAP:-ignore}
 SPLIT_BELOW=${SPLIT_BELOW:-}
 EXTRACT_EXTRA=${EXTRACT_EXTRA:-${SPLIT_BELOW:+--split_below ${SPLIT_BELOW}}}
 COND_NAME=${COND_NAME:-tsdf_clean.ply}
-COND_ARGS=${COND_ARGS:-"--min_alpha 0.7 --min_cos 0.35 --max_jump 0.02 --erode 3"}
+# Both meshes come from mesh_tsdf_views.py now, at two filter strengths. render.py's TSDF
+# has no alpha gate, so rays that miss the object still contribute a composited depth; on
+# room0's chairs that sheet became the largest component and --num_cluster 1 reported it
+# instead of the chair (a 2.4x3.4x0.13 m slab at floor level for a 1.6x1.7x1.1 m chair).
+#
+# Side A, the observed surface we report. Measured on gid2: min_alpha closes the holes
+# (0.7 -> 0.3, the chair's gaussians have median opacity 0.61 and rarely reach 0.7),
+# min_cos removes the panel its back faces produce (0.0 -> 0.35), erode only shrinks.
+MESH_ARGS=${MESH_ARGS:-"--min_alpha 0.3 --min_cos 0.35 --max_jump 0.02 --erode 0 --num_cluster 0 --min_comp_frac 0.02"}
+# Conditioning, filtered harder on purpose: ShapeR anchors to these points so a ragged
+# boundary is copied into the prior, and the holes that leaves are what the prior fills.
+COND_ARGS=${COND_ARGS:-"--min_alpha 0.7 --min_cos 0.35 --max_jump 0.02 --erode 3 --num_cluster 0 --min_comp_frac 0.02"}
 POINTS_FROM=${POINTS_FROM:-mesh}
 FUSE_EXTRA=${FUSE_EXTRA:-}
 # One resolution for BOTH pipelines, which is what removes the r1/r2 confound from the
@@ -206,6 +217,7 @@ MANIFEST=${RUNDIR}/manifest.txt
   echo "prior         ${PRIOR}"
   echo "pkl           ${SHAPER_DIR}/data/${PKL_SUBDIR}"
   echo "extract_extra ${EXTRACT_EXTRA:-<none>}"
+  echo "mesh_args     ${MESH_ARGS}"
   echo "cond_args     ${COND_ARGS}"
   echo "fuse_extra    ${FUSE_EXTRA:-<none>}"
   echo "relabel       stride=${STRIDE} window=${WINDOW} min_area=${MIN_AREA} min_track=${MIN_TRACK}"
@@ -457,8 +469,22 @@ fi
 
 # ---------------------------------------------------------------- mesh (side A)
 if want mesh; then
-  say "mesh: per-object TSDF (side A)"
-  OBJ="${OBJ}" DATA="${MASKS}" IT="${ITER}" bash mesh_voted_objects.sh || exit 1
+  say "mesh: per-object TSDF -> fuse_post.ply (side A)"
+  # Same tool as cond, weaker filters, so the only difference between the reported
+  # surface and the conditioning surface is one line of arguments.
+  for MDIR in "${OBJ}"/*/; do
+    gid=$(basename "${MDIR}")
+    [[ "${gid}" =~ ^[0-9]+$ ]] || continue
+    [ -z "${ONLY}" ] || [[ " ${ONLY} " == *" ${gid} "* ]] || continue
+    [ -f "${MDIR}point_cloud/iteration_${ITER}/point_cloud.ply" ] || continue
+    MSH=${MDIR}train/ours_${ITER}/fuse_post.ply
+    fresh "${MSH}" mesh_tsdf_views.py "${MDIR}point_cloud" \
+      && { echo "  [${gid}] reuse"; continue; }
+    python mesh_tsdf_views.py -m "${MDIR%/}" --load_iteration "${ITER}" \
+      --out "${MSH}" ${MESH_ARGS} 2>&1 \
+      | grep -E "^\[comp\]|^\[out\]|kept" | tail -3 | sed "s/^/  [${gid}] /"
+    [ -f "${MSH}" ] || echo "  [${gid}] FAILED -- no side A for this object"
+  done
 fi
 
 # ---------------------------------------------------------------- cond

@@ -119,6 +119,12 @@ def main():
     ap.add_argument("--erode", default=1, type=int,
                     help="shrink the valid region by this many pixels afterwards")
     ap.add_argument("--num_cluster", default=1, type=int, help="0 keeps every component")
+    # A count cap is the wrong knob on an object the TSDF leaves in pieces. Measured on a
+    # room0 chair: --num_cluster 1 reported a plank off the seat front, and 0 kept a
+    # floater a metre away. Size relative to the largest component separates the two.
+    # Same idea and name as shaper_field.py --min_comp_frac.
+    ap.add_argument("--min_comp_frac", default=0.0, type=float,
+                    help="drop components smaller than this fraction of the largest")
     ap.add_argument("--skip_train_views", action="store_true",
                     help="novel poses only, to see what the prior alone contributes")
     args = get_combined_args(ap)
@@ -163,10 +169,17 @@ def main():
 
     m = vol.extract_triangle_mesh()
     m.remove_duplicated_vertices(); m.remove_degenerate_triangles()
-    if args.num_cluster > 0 and len(m.triangles):
+    if len(m.triangles) and (args.num_cluster > 0 or args.min_comp_frac > 0):
         lab, cnt, _ = m.cluster_connected_triangles()
-        keep = np.argsort(-np.asarray(cnt))[:args.num_cluster]
-        m.remove_triangles_by_mask(~np.isin(np.asarray(lab), keep))
+        lab = np.asarray(lab); cnt = np.asarray(cnt)
+        keep = np.arange(len(cnt))
+        if args.min_comp_frac > 0:
+            keep = keep[cnt[keep] >= args.min_comp_frac * cnt.max()]
+        if args.num_cluster > 0:
+            keep = keep[np.argsort(-cnt[keep])][:args.num_cluster]
+        print(f"[comp] {len(cnt)} components -> kept {len(keep)} "
+              f"({cnt[keep].sum() / max(cnt.sum(), 1) * 100:.1f}% of triangles)")
+        m.remove_triangles_by_mask(~np.isin(lab, keep))
         m.remove_unreferenced_vertices()
     m.compute_vertex_normals()
     out = os.path.expanduser(args.out)
