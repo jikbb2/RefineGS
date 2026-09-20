@@ -148,6 +148,15 @@ def main():
     # The mask and the gaussians must describe the same thing. Measured on room0's break:
     # 0.55 m apart along the up axis, which no correct assignment produces.
     ap.add_argument("--max_centre_dist", type=float, default=0.40, help="m")
+    # A raw min/max box is set by its worst point. A handful of gaussians that the vote
+    # dropped on the wrong object stretches a cushion to 2.8 m, and every size-based test
+    # then reads the strays instead of the object. Measure the body, report the tail.
+    ap.add_argument("--ext_pct", type=float, default=1.0,
+                    help="percentile for the robust extent (0 = raw min/max)")
+    ap.add_argument("--max_stray_ratio", type=float, default=1.6,
+                    help="raw extent / robust extent above which the label is carrying "
+                         "strays. extract_objects.py --min_margin / --min_votes / "
+                         "--min_opacity exist for this and are off by default")
     ap.add_argument("--out", default="", help="default <root>/audit.tsv")
     args = ap.parse_args()
 
@@ -184,13 +193,21 @@ def main():
         if not os.path.isfile(p):
             continue
         P = load_xyz(p)
-        lo, hi = P.min(0), P.max(0)
-        ext = hi - lo
+        raw = P.max(0) - P.min(0)
+        q = args.ext_pct
+        lo, hi = (np.percentile(P, q, axis=0), np.percentile(P, 100 - q, axis=0)) \
+            if q > 0 else (P.min(0), P.max(0))
+        ext = np.maximum(hi - lo, 1e-6)
+        stray = float(np.max(raw / ext))
+        n_out = int((~np.all((P >= lo) & (P <= hi), axis=1)).sum())
         horiz = [i for i in range(3) if i != up]
         area = float(ext[horiz[0]] * ext[horiz[1]])
         gap = float(lo[up] - floor)
 
         verdict, why = "object", []
+        if stray > args.max_stray_ratio:
+            verdict = "OUTLIERS"
+            why.append(f"raw box {stray:.1f}x robust, {n_out} pts outside")
         if ext[up] < args.slab_thick and area > args.slab_area and gap < args.floor_gap:
             verdict = "STRUCTURE"; why.append("slab on the floor")
         if (min(ext[horiz]) < args.wall_thick and max(ext[horiz]) > args.wall_span
@@ -204,7 +221,7 @@ def main():
                             args.gt_depth_dir, args.gt_depth_scale, args.view_stride)
             if len(M) > 50:
                 dctr = float(np.linalg.norm(np.median(M, 0) - np.median(P, 0)))
-                if dctr > args.max_centre_dist and verdict == "object":
+                if dctr > args.max_centre_dist and verdict in ("object", "OUTLIERS"):
                     verdict = "MISMATCH"; why.append(f"mask {dctr*100:.0f}cm off")
 
         cls, share = "", 0.0
@@ -218,21 +235,24 @@ def main():
                 tid, n = cnt.most_common(1)[0]
                 cls = names.get(int(tid), str(tid)) if names else str(tid)
                 share = n / sum(cnt.values())
-        rows.append((gid, len(P), ext, area, gap, dctr, cls, share, verdict, ";".join(why)))
+        rows.append((gid, len(P), ext, area, gap, dctr, cls, share, verdict,
+                     ";".join(why), stray))
 
-    hdr = (f"{'gid':>5}{'gauss':>9}  {'extent (m)':<20}{'area':>7}{'floor':>7}"
+    hdr = (f"{'gid':>5}{'gauss':>9}  {'extent p{:g} (m)'.format(args.ext_pct):<20}"
+           f"{'raw/rob':>8}{'area':>7}{'floor':>7}"
            f"{'mask off':>10}  {'GT class (control)':<24}verdict")
     print("\n" + hdr); print("-" * len(hdr))
-    for g, n, e, a, gap, dc, cls, sh, v, why in rows:
+    for g, n, e, a, gap, dc, cls, sh, v, why, st in rows:
         off = "--" if dc != dc else f"{dc * 100:.0f}cm"
         gt = f"{cls} {sh * 100:.0f}%" if cls else "-"
-        print(f"{g:>5}{n:>9,}  {e[0]:.2f}x{e[1]:.2f}x{e[2]:<10.2f}{a:>6.2f}m2{gap:>+7.2f}"
-              f"{off:>10}  {gt:<24}{v}" + (f"  ({why})" if why else ""))
+        print(f"{g:>5}{n:>9,}  {e[0]:.2f}x{e[1]:.2f}x{e[2]:<10.2f}{st:>7.1f}x{a:>6.2f}m2"
+              f"{gap:>+7.2f}{off:>10}  {gt:<24}{v}" + (f"  ({why})" if why else ""))
 
     bad = [r for r in rows if r[8] != "object"]
     print(f"\n[audit] {len(rows) - len(bad)} objects, {len(bad)} flagged "
           f"({sum(1 for r in bad if r[8] == 'STRUCTURE')} structure, "
-          f"{sum(1 for r in bad if r[8] == 'MISMATCH')} mask/gaussian mismatch)")
+          f"{sum(1 for r in bad if r[8] == 'MISMATCH')} mask/gaussian mismatch, "
+          f"{sum(1 for r in bad if r[8] == 'OUTLIERS')} stray votes)")
     if any(r[6] and any(w in r[6] for w in STRUCTURE_WORDS) and r[8] == "object" for r in rows):
         print("  WARN a GT structure class appears on an object the geometry rule passed "
               "-- widen the rule rather than trusting the GT column, which is a control")
@@ -240,10 +260,10 @@ def main():
     out = os.path.expanduser(args.out) if args.out else os.path.join(rd, "audit.tsv")
     with open(out, "w") as f:
         f.write("gid\tgaussians\text_x\text_y\text_z\tarea\tfloor_gap\tmask_off\t"
-                "gt_class\tgt_share\tverdict\twhy\n")
-        for g, n, e, a, gap, dc, cls, sh, v, why in rows:
+                "gt_class\tgt_share\tverdict\twhy\tstray_ratio\n")
+        for g, n, e, a, gap, dc, cls, sh, v, why, st in rows:
             f.write(f"{g}\t{n}\t{e[0]:.3f}\t{e[1]:.3f}\t{e[2]:.3f}\t{a:.3f}\t{gap:.3f}\t"
-                    f"{'' if dc != dc else f'{dc:.3f}'}\t{cls}\t{sh:.2f}\t{v}\t{why}\n")
+                    f"{'' if dc != dc else f'{dc:.3f}'}\t{cls}\t{sh:.2f}\t{v}\t{why}\t{st:.2f}\n")
     keep = " ".join(r[0] for r in rows if r[8] == "object")
     print(f"[audit] -> {out}")
     print(f'[audit] evaluate only what passed:  ONLY="{keep}"')
