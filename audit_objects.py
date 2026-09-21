@@ -164,6 +164,13 @@ def main():
                     help="raw extent / robust extent above which the label is carrying "
                          "strays. extract_objects.py --min_margin / --min_votes / "
                          "--min_opacity exist for this and are off by default")
+    # The ratio alone punishes thin objects: a 4 cm picture whose raw box is 7.6 cm reads
+    # 1.9x, the same as a 0.4 m object with a stray a metre away. The ratio says how far
+    # the tail reaches relative to the body, the length says whether it reaches anywhere
+    # at all, and only both together mean a foreign object got voted in.
+    ap.add_argument("--max_stray_m", type=float, default=0.15,
+                    help="longest tail outside the robust box (m); flagged only when the "
+                         "ratio is also above --max_stray_ratio")
     ap.add_argument("--out", default="", help="default <root>/audit.tsv")
     args = ap.parse_args()
 
@@ -206,15 +213,17 @@ def main():
             if q > 0 else (P.min(0), P.max(0))
         ext = np.maximum(hi - lo, 1e-6)
         stray = float(np.max(raw / ext))
+        stray_m = float(np.max(raw - ext))
         n_out = int((~np.all((P >= lo) & (P <= hi), axis=1)).sum())
         horiz = [i for i in range(3) if i != up]
         area = float(ext[horiz[0]] * ext[horiz[1]])
         gap = float(lo[up] - floor)
 
         verdict, why = "object", []
-        if stray > args.max_stray_ratio:
+        if stray > args.max_stray_ratio and stray_m > args.max_stray_m:
             verdict = "OUTLIERS"
-            why.append(f"raw box {stray:.1f}x robust, {n_out} pts outside")
+            why.append(f"raw box {stray:.1f}x robust, tail {stray_m*100:.0f}cm, "
+                       f"{n_out} pts outside")
         if ext[up] < args.slab_thick and area > args.slab_area and gap < args.floor_gap:
             verdict = "STRUCTURE"; why.append("slab on the floor")
         if (min(ext[horiz]) < args.wall_thick and max(ext[horiz]) > args.wall_span
@@ -246,16 +255,17 @@ def main():
                 cls = names.get(int(tid), str(tid)) if names else str(tid)
                 share = n / sum(cnt.values())
         rows.append((gid, len(P), ext, area, gap, dctr, cls, share, verdict,
-                     ";".join(why), stray))
+                     ";".join(why), stray, stray_m))
 
     hdr = (f"{'gid':>5}{'gauss':>9}  {'extent p{:g} (m)'.format(args.ext_pct):<20}"
-           f"{'raw/rob':>8}{'area':>7}{'floor':>7}"
+           f"{'raw/rob':>8}{'tail':>7}{'area':>7}{'floor':>7}"
            f"{'mask off':>10}  {'GT class (control)':<24}verdict")
     print("\n" + hdr); print("-" * len(hdr))
-    for g, n, e, a, gap, dc, cls, sh, v, why, st in rows:
+    for g, n, e, a, gap, dc, cls, sh, v, why, st, sm in rows:
         off = "--" if dc != dc else f"{dc * 100:.0f}cm"
         gt = f"{cls} {sh * 100:.0f}%" if cls else "-"
-        print(f"{g:>5}{n:>9,}  {e[0]:.2f}x{e[1]:.2f}x{e[2]:<10.2f}{st:>7.1f}x{a:>6.2f}m2"
+        print(f"{g:>5}{n:>9,}  {e[0]:.2f}x{e[1]:.2f}x{e[2]:<10.2f}{st:>7.1f}x"
+              f"{sm * 100:>6.0f}c{a:>6.2f}m2"
               f"{gap:>+7.2f}{off:>10}  {gt:<24}{v}" + (f"  ({why})" if why else ""))
 
     bad = [r for r in rows if r[8] != "object"]
@@ -270,10 +280,11 @@ def main():
     out = os.path.expanduser(args.out) if args.out else os.path.join(rd, "audit.tsv")
     with open(out, "w") as f:
         f.write("gid\tgaussians\text_x\text_y\text_z\tarea\tfloor_gap\tmask_off\t"
-                "gt_class\tgt_share\tverdict\twhy\tstray_ratio\n")
-        for g, n, e, a, gap, dc, cls, sh, v, why, st in rows:
+                "gt_class\tgt_share\tverdict\twhy\tstray_ratio\tstray_m\n")
+        for g, n, e, a, gap, dc, cls, sh, v, why, st, sm in rows:
             f.write(f"{g}\t{n}\t{e[0]:.3f}\t{e[1]:.3f}\t{e[2]:.3f}\t{a:.3f}\t{gap:.3f}\t"
-                    f"{'' if dc != dc else f'{dc:.3f}'}\t{cls}\t{sh:.2f}\t{v}\t{why}\t{st:.2f}\n")
+                    f"{'' if dc != dc else f'{dc:.3f}'}\t{cls}\t{sh:.2f}\t{v}\t{why}\t"
+                    f"{st:.2f}\t{sm:.3f}\n")
     keep = " ".join(r[0] for r in rows if r[8] == "object")
     print(f"[audit] -> {out}")
     print(f'[audit] evaluate only what passed:  ONLY="{keep}"')
