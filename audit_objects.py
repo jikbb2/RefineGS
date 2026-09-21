@@ -147,7 +147,14 @@ def main():
     ap.add_argument("--wall_thick", type=float, default=0.30, help="m")
     # The mask and the gaussians must describe the same thing. Measured on room0's break:
     # 0.55 m apart along the up axis, which no correct assignment produces.
-    ap.add_argument("--max_centre_dist", type=float, default=0.40, help="m")
+    ap.add_argument("--max_centre_dist", type=float, default=0.40,
+                    help="floor for the mismatch limit (m), for objects too small for the "
+                         "relative test to mean anything")
+    # An absolute limit is unfair to large objects: a 2.3 m sofa whose mask covers its
+    # front face puts the two centres 44 cm apart, which is normal, while a 0.3 m book
+    # 1.9 m from its mask is six times its own size. Scale with the object.
+    ap.add_argument("--max_centre_frac", type=float, default=0.5,
+                    help="mismatch limit as a fraction of the object's own diagonal")
     # A raw min/max box is set by its worst point. A handful of gaussians that the vote
     # dropped on the wrong object stretches a cushion to 2.8 m, and every size-based test
     # then reads the strays instead of the object. Measure the body, report the tail.
@@ -221,8 +228,11 @@ def main():
                             args.gt_depth_dir, args.gt_depth_scale, args.view_stride)
             if len(M) > 50:
                 dctr = float(np.linalg.norm(np.median(M, 0) - np.median(P, 0)))
-                if dctr > args.max_centre_dist and verdict in ("object", "OUTLIERS"):
-                    verdict = "MISMATCH"; why.append(f"mask {dctr*100:.0f}cm off")
+                lim = max(args.max_centre_dist,
+                          args.max_centre_frac * float(np.linalg.norm(ext)))
+                if dctr > lim and verdict in ("object", "OUTLIERS"):
+                    verdict = "MISMATCH"
+                    why.append(f"mask {dctr*100:.0f}cm off, limit {lim*100:.0f}cm")
 
         cls, share = "", 0.0
         if G is not None:

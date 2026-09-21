@@ -451,13 +451,15 @@ if want objects; then
       echo "  --- label coherence (previous run: mean compactness 0.754, 17 classes >= 0.8) ---"
       python check_scene_labels.py --ply "${PLY}" --labels "${VOTE}/labels.npy" | tail -6
     fi
-    if fresh "${OBJ}/objects.json" extract_objects.py "${VOTE}/labels.npy"; then
+    if fresh "${OBJ}/objects.json" extract_objects.py "${VOTE}/labels.npy" \
+       && stamp "${OBJ}/.extract_config" "${EXTRACT_EXTRA}"; then
       echo "  extract up to date"
     else
       python extract_objects.py --ply "${PLY}" --labels "${VOTE}/labels.npy" \
         --scene_dir "${SCENE_MODEL}" --id_map "${LABEL_DIR}/id_map.json" \
         --source_root "${MASKS}" --vote_dir "${VOTE}" \
         --out "${OBJ}" --iter "${ITER}" ${EXTRACT_EXTRA} || exit 1
+      mark "${OBJ}/.extract_config" "${EXTRACT_EXTRA}"
     fi
   else
     say "objects: train one model per object"
