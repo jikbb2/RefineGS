@@ -190,6 +190,15 @@ fresh() {
   return 0
 }
 
+# fresh() compares file times, so a change that lives only in a flag -- VOTE_REF,
+# MESH_ARGS, COND_ARGS -- leaves every input file untouched and the stage is skipped. The
+# run then silently answers the previous question: reverting the vote to GT depth looked
+# like it had run, reported "vote up to date", and reused the carve-depth labels.
+stamp() {                                  # stamp FILE VALUE -- true when unchanged
+  [ -f "$1" ] && [ "$(cat "$1" 2>/dev/null)" = "$2" ]
+}
+mark() { mkdir -p "$(dirname "$1")"; printf '%s' "$2" > "$1"; }
+
 # sam3 and split_and_splat cannot share a process (cuDNN), and `conda run` breaks on the
 # cross-compiler activate hook, so the env is entered the way the field phase already does.
 in_env() {
@@ -429,14 +438,16 @@ if want objects; then
     # one scene must not share a vote dir, or the second run finds labels.npy, skips, and
     # extracts the first run's assignment under the second run's names.
     VOTE=${VOTE:-${OBJ}/vote}
-    if fresh "${VOTE}/labels.npy" vote_labels.py "${PLY}" "${LABEL_DIR}/id_map.json"; then
-      echo "  vote up to date"
+    if fresh "${VOTE}/labels.npy" vote_labels.py "${PLY}" "${LABEL_DIR}/id_map.json" \
+       && stamp "${VOTE}/.config" "vote_ref=${VOTE_REF}"; then
+      echo "  vote up to date (ref=${VOTE_REF})"
     else
       _vref="--gt_depth_dir ${GTD}"
       [ "${VOTE_REF}" = "carve" ] && [ -d "${CARVE_DEPTH}" ] \
         && _vref="--carve_depth_dir ${CARVE_DEPTH}"
       python vote_labels.py --ply "${PLY}" --colmap "${COLMAP}" --label_dir "${LABEL_DIR}" \
         ${_vref} --out "${VOTE}" || exit 1
+      mark "${VOTE}/.config" "vote_ref=${VOTE_REF}"
       echo "  --- label coherence (previous run: mean compactness 0.754, 17 classes >= 0.8) ---"
       python check_scene_labels.py --ply "${PLY}" --labels "${VOTE}/labels.npy" | tail -6
     fi
@@ -499,8 +510,11 @@ if want mesh; then
     [ -z "${ONLY}" ] || [[ " ${ONLY} " == *" ${gid} "* ]] || continue
     [ -f "${MDIR}point_cloud/iteration_${ITER}/point_cloud.ply" ] || continue
     MSH=${MDIR}train/ours_${ITER}/fuse_post.ply
-    fresh "${MSH}" mesh_tsdf_views.py "${MDIR}point_cloud" \
-      && { echo "  [${gid}] reuse"; continue; }
+    if fresh "${MSH}" mesh_tsdf_views.py "${MDIR}point_cloud" \
+       && stamp "${MDIR}train/ours_${ITER}/.mesh_config" "${MESH_ARGS}"; then
+      echo "  [${gid}] reuse"; continue
+    fi
+    mark "${MDIR}train/ours_${ITER}/.mesh_config" "${MESH_ARGS}"
     python mesh_tsdf_views.py -m "${MDIR%/}" --load_iteration "${ITER}" \
       --out "${MSH}" ${MESH_ARGS} 2>&1 \
       | grep -E "^\[comp\]|^\[out\]|kept" | tail -3 | sed "s/^/  [${gid}] /"
@@ -520,7 +534,11 @@ if want cond; then
     [ -z "${ONLY}" ] || [[ " ${ONLY} " == *" ${gid} "* ]] || continue
     [ -f "${MDIR}point_cloud/iteration_${ITER}/point_cloud.ply" ] || continue
     CLN=${MDIR}train/ours_${ITER}/${COND_NAME}
-    fresh "${CLN}" mesh_tsdf_views.py "${MDIR}point_cloud" && { echo "  [${gid}] reuse"; continue; }
+    if fresh "${CLN}" mesh_tsdf_views.py "${MDIR}point_cloud" \
+       && stamp "${MDIR}train/ours_${ITER}/.cond_config" "${COND_ARGS}"; then
+      echo "  [${gid}] reuse"; continue
+    fi
+    mark "${MDIR}train/ours_${ITER}/.cond_config" "${COND_ARGS}"
     python mesh_tsdf_views.py -m "${MDIR%/}" --load_iteration "${ITER}" \
       --out "${CLN}" ${COND_ARGS} 2>&1 | grep -E "^\[out\]|kept" | tail -2 | sed "s/^/  [${gid}] /"
     [ -f "${CLN}" ] || echo "  [${gid}] FAILED -- pkl will report a missing recon"

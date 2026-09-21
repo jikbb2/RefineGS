@@ -147,7 +147,11 @@ run_progress() {                              # run_progress LOG LABEL -- cmd...
   local pid=$! t0=$SECONDS cur
   while kill -0 "${pid}" 2>/dev/null; do
     sleep "${PROGRESS_EVERY}"
-    cur=$(tail -1 "${log}" 2>/dev/null | tr -d '\r' | tr -cd '\11\12\40-\176' | cut -c1-64)
+    # tqdm rewrites a single line with \r, so the file's last LINE holds every update
+    # concatenated and deleting \r shows the FIRST one forever ("0%|" for the whole run).
+    # Split on \r and take the last segment instead.
+    cur=$(tail -c 8192 "${log}" 2>/dev/null | tr '\r' '\n' | grep -v '^[[:space:]]*$' \
+          | tail -1 | tr -cd '\11\40-\176' | cut -c1-64)
     printf "\r    %-18s %4ds  %-64s" "${label}" "$((SECONDS - t0))" "${cur}"
   done
   wait "${pid}"; local rc=$?
