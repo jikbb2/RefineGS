@@ -210,7 +210,16 @@ in_env() {
 }
 
 n_poses() { grep -cE '\.(jpg|jpeg|png|JPG|PNG)[[:space:]]*$' "$1/images.txt" 2>/dev/null || echo 0; }
-n_files() { ls "$1" 2>/dev/null | wc -l; }
+# n_files DIR [suffix] -- with a suffix, count only files ending in it. images/ is a dump of
+# the Replica results/ folder, so it holds 2000 frame*.jpg AND 2000 depth*.png. Counting all
+# 4000 against 2000 poses made the colmap stage believe poses were still missing and re-lift
+# on every run -- which also rotated sparse/0 into sparse/0_sfm_<date> again, leaving
+# --colmap_in pointing at the lifted poses so make_dense_colmap validated them against
+# themselves. Counting only IMG_EXT makes the stage idempotent and keeps that check honest.
+n_files() {
+  if [ -n "${2:-}" ]; then ls "$1"/*"$2" 2>/dev/null | wc -l
+  else ls "$1" 2>/dev/null | wc -l; fi
+}
 # `ls -d dir/*/ | wc -l` reports 1 on an empty dir under nullglob, because ls falls back to
 # the working directory. Count the loop instead.
 count_dirs() {                                # count_dirs ROOT [numeric-only]
@@ -236,7 +245,7 @@ MANIFEST=${RUNDIR}/manifest.txt
   echo "carve         ${CARVE_DEPTH}"
   echo "stages        ${FROM} .. ${TO}  clean=${CLEAN}  only='${ONLY}'"
   echo "colmap        ${COLMAP}         poses=$(n_poses "${COLMAP}")"
-  echo "images        ${IMAGES}         n=$(n_files "${IMAGES}")"
+  echo "images        ${IMAGES}         n=$(n_files "${IMAGES}" "${IMG_EXT}") ${IMG_EXT} of $(n_files "${IMAGES}") files"
   echo "masks         ${MASKS}"
   echo "labels        ${LABEL_DIR}      min_views=${MIN_LABEL_VIEWS} overlap=${OVERLAP}"
   echo "gt_depth      ${GTD}"
@@ -320,8 +329,8 @@ if want colmap; then
     if [ -n "${FRAMES_CMD}" ]; then eval "${FRAMES_CMD}" || exit 1
     else echo "  [STOP] ${IMAGES} is empty. Set FRAMES_CMD to the Replica frame dump."; exit 1; fi
   fi
-  NP=$(n_poses "${COLMAP}"); NF=$(n_files "${IMAGES}")
-  echo "  poses ${NP} / frames ${NF}"
+  NP=$(n_poses "${COLMAP}"); NF=$(n_files "${IMAGES}" "${IMG_EXT}")
+  echo "  poses ${NP} / frames ${NF} (${IMG_EXT})"
   if [ "${NP}" -lt "${NF}" ]; then
     # convert.py's exhaustive_matcher is quadratic, so the SfM is run on a stride subset
     # and make_dense_colmap.py lifts it to every frame off the GT trajectory. It verifies
