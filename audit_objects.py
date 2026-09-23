@@ -182,6 +182,9 @@ def main():
     ap.add_argument("--max_stray_m", type=float, default=0.15,
                     help="longest tail outside the robust box (m); flagged only when the "
                          "ratio is also above --max_stray_ratio")
+    ap.add_argument("--max_pair_iou", type=float, default=0.30,
+                    help="two labels whose robust boxes reach this IoU are one object "
+                         "reported twice; both are flagged DUPLICATE. 0 = off")
     ap.add_argument("--out", default="", help="default <root>/audit.tsv")
     args = ap.parse_args()
 
@@ -212,7 +215,7 @@ def main():
     floor = float(np.percentile(allz, 1))
     print(f"[audit] {len(gids)} objects, up={args.up}, floor ~ {floor:+.2f} m")
 
-    rows = []
+    rows, boxes = [], {}
     for gid in gids:
         p = os.path.join(rd, gid, "point_cloud", f"iteration_{args.iter}", "point_cloud.ply")
         if not os.path.isfile(p):
@@ -265,8 +268,34 @@ def main():
                 tid, n = cnt.most_common(1)[0]
                 cls = names.get(int(tid), str(tid)) if names else str(tid)
                 share = n / sum(cnt.values())
-        rows.append((gid, len(P), ext, area, gap, dctr, cls, share, verdict,
-                     ";".join(why), stray, stray_m))
+        boxes[gid] = (lo, hi)
+        rows.append([gid, len(P), ext, area, gap, dctr, cls, share, verdict,
+                     ";".join(why), stray, stray_m])
+
+    # One physical object split into two labels is invisible to every per-object test above:
+    # each half is a plausible object on its own. It only shows up between objects. Measured
+    # on room1, gid 0 and gid 3 are both "pillow" at 1.6 x 0.9 m, 29 cm apart, IoU 0.44 --
+    # one bed reported twice. IoU (not containment) is the right test: a vase standing inside
+    # a cabinet's box scores low because the volumes differ, while two halves of one object
+    # score high because they overlap AND are the same size.
+    if args.max_pair_iou > 0:
+        idx = {r[0]: r for r in rows}
+        for i, ga in enumerate(sorted(boxes, key=int)):
+            for gb in sorted(boxes, key=int)[i + 1:]:
+                (la, ha), (lb, hb) = boxes[ga], boxes[gb]
+                inter = float(np.prod(np.maximum(np.minimum(ha, hb) - np.maximum(la, lb), 0)))
+                if inter <= 0:
+                    continue
+                va, vb = float(np.prod(ha - la)), float(np.prod(hb - lb))
+                iou = inter / max(va + vb - inter, 1e-12)
+                if iou < args.max_pair_iou:
+                    continue
+                for g, other in ((ga, gb), (gb, ga)):
+                    r = idx[g]
+                    if r[8] == "object":
+                        r[8] = "DUPLICATE"
+                    note = f"overlaps gid {other} at IoU {iou:.2f}"
+                    r[9] = f"{r[9]};{note}" if r[9] else note
 
     hdr = (f"{'gid':>5}{'gauss':>9}  {'extent p{:g} (m)'.format(args.ext_pct):<20}"
            f"{'raw/rob':>8}{'tail':>7}{'area':>7}{'floor':>7}"
@@ -283,7 +312,8 @@ def main():
     print(f"\n[audit] {len(rows) - len(bad)} objects, {len(bad)} flagged "
           f"({sum(1 for r in bad if r[8] == 'STRUCTURE')} structure, "
           f"{sum(1 for r in bad if r[8] == 'MISMATCH')} mask/gaussian mismatch, "
-          f"{sum(1 for r in bad if r[8] == 'OUTLIERS')} stray votes)")
+          f"{sum(1 for r in bad if r[8] == 'OUTLIERS')} stray votes, "
+          f"{sum(1 for r in bad if r[8] == 'DUPLICATE')} split across two labels)")
     if any(is_structure_class(r[6]) and r[8] == "object" for r in rows):
         print("  WARN a GT structure class appears on an object the geometry rule passed "
               "-- widen the rule rather than trusting the GT column, which is a control")
