@@ -254,6 +254,12 @@ MANIFEST=${RUNDIR}/manifest.txt
   echo "objects       ${OBJ}"
   echo "prior         ${PRIOR}"
   echo "pkl           ${SHAPER_DIR}/data/${PKL_SUBDIR}"
+  # The room0 scene model was trained with --gt_depth_dir and lambda_gtdepth's default 0.5,
+  # while DEPTH_SUPERVISION=none says otherwise: the line above described the driver's switch,
+  # not the flags that actually reached train.py. A model carries no record of its own
+  # OptimizationParams (cfg_args stores only ModelParams), so this is the only place the
+  # training loss configuration is written down. Do not drop it.
+  echo "train_args    ${TRAIN_SCENE_ARGS:-<none>}"
   echo "extract_extra ${EXTRACT_EXTRA:-<none>}"
   echo "mesh_args     ${MESH_ARGS}"
   echo "cond_args     ${COND_ARGS}"
