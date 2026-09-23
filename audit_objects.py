@@ -27,6 +27,7 @@ import argparse
 import collections
 import json
 import os
+import re
 import sys
 
 import numpy as np
@@ -42,6 +43,16 @@ except Exception:
 
 STRUCTURE_WORDS = ("floor", "wall", "ceiling", "rug", "carpet", "window", "door",
                    "blind", "curtain", "beam", "pillar", "column", "stair")
+
+
+def is_structure_class(name):
+    """True when a GT class name IS a structure, by whole word.
+
+    Substring matching fires on 'door' inside 'indoor-plant', which is how room1's
+    indoor-plant raised the structure warning on a perfectly ordinary object. Split the
+    name into words instead: Replica class names are lowercase words joined by '-' or ' '.
+    """
+    return any(t in STRUCTURE_WORDS for t in re.split(r"[^a-z]+", (name or "").lower()))
 
 
 def load_xyz(path):
@@ -273,7 +284,7 @@ def main():
           f"({sum(1 for r in bad if r[8] == 'STRUCTURE')} structure, "
           f"{sum(1 for r in bad if r[8] == 'MISMATCH')} mask/gaussian mismatch, "
           f"{sum(1 for r in bad if r[8] == 'OUTLIERS')} stray votes)")
-    if any(r[6] and any(w in r[6] for w in STRUCTURE_WORDS) and r[8] == "object" for r in rows):
+    if any(is_structure_class(r[6]) and r[8] == "object" for r in rows):
         print("  WARN a GT structure class appears on an object the geometry rule passed "
               "-- widen the rule rather than trusting the GT column, which is a control")
 
