@@ -150,12 +150,20 @@ run_progress() {                              # run_progress LOG LABEL -- cmd...
     # tqdm rewrites a single line with \r, so the file's last LINE holds every update
     # concatenated and deleting \r shows the FIRST one forever ("0%|" for the whole run).
     # Split on \r and take the last segment instead.
-    cur=$(tail -c 8192 "${log}" 2>/dev/null | tr '\r' '\n' | grep -v '^[[:space:]]*$' \
-          | tail -1 | tr -cd '\11\40-\176' | cut -c1-64)
-    printf "\r    %-18s %4ds  %-64s" "${label}" "$((SECONDS - t0))" "${cur}"
+    # -a: a log with NUL or invalid UTF-8 makes grep print "binary file matches" and drop
+    # the line entirely. Keep reading it as text.
+    # The old sanitizer was `tr -cd '\11\40-\176'`, which keeps only ASCII -- and tqdm draws
+    # its bar with Unicode blocks (U+2588 and friends). It deleted the FILLED part of every
+    # bar and left the unfilled spaces, so "44%|#####    |" rendered as "44%|     |" and 100%
+    # as "||": the bar looked wrong while the numbers were right. Strip ANSI escapes and
+    # control characters instead, and leave every byte >= 0x80 alone.
+    cur=$(tail -c 8192 "${log}" 2>/dev/null | tr '\r' '\n' | grep -a -v '^[[:space:]]*$' \
+          | tail -1 | sed $'s/\033\\[[0-9;]*[a-zA-Z]//g' \
+          | tr -d '\000-\010\013\014\016-\037\177' | cut -c1-72)
+    printf "\r    %-18s %4ds  %-72s" "${label}" "$((SECONDS - t0))" "${cur}"
   done
   wait "${pid}"; local rc=$?
-  printf "\r    %-18s %4ds  %-64s\n" "${label}" "$((SECONDS - t0))" \
+  printf "\r    %-18s %4ds  %-72s\n" "${label}" "$((SECONDS - t0))" \
          "$([ ${rc} -eq 0 ] && echo ok || echo FAILED)"
   return ${rc}
 }
