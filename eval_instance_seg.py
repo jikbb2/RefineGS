@@ -37,14 +37,36 @@ import numpy as np
 from plyfile import PlyData
 from scipy.spatial import cKDTree
 
-STRUCTURE_WORDS = ("floor", "wall", "ceiling", "rug", "carpet", "window", "door",
-                   "blind", "curtain", "beam", "pillar", "column", "stair")
+# The first nine entries are exactly run_refinegs.sh's EXCLUDE list, which is what the
+# relabel stage is told never to instantiate; the rest are the structural classes the
+# geometry side already treats as scene, not object. Recall has to be measured against the
+# instances the method actually attempts -- counting a class the pipeline is configured to
+# skip as a miss measures the configuration, not the method.
+EXCLUDE_DEFAULT = ("door,blind,vent,window,wall,floor,ceiling,light switch,thermostat,"
+                   "rug,carpet,curtain,beam,pillar,column,stair")
 
 
-def is_structure_class(name):
-    """True when a GT class name IS a structure, by whole word (not substring: 'door'
-    is inside 'indoor-plant')."""
-    return any(t in STRUCTURE_WORDS for t in re.split(r"[^a-z]+", (name or "").lower()))
+def _singular(w):
+    # Replica writes 'blinds' and 'stairs'. Whole-word matching against 'blind' then fails
+    # and eight window blinds land in room0's miss list, which is where this came from.
+    return w[:-1] if len(w) > 3 and w.endswith("s") else w
+
+
+def is_excluded_class(name, words):
+    """True when a GT class name is one the pipeline never tries to segment.
+
+    Whole word, not substring -- 'door' is inside 'indoor-plant' -- with singular/plural
+    folded, plus a plain containment test for the multi-word entries ('light switch').
+    """
+    low = (name or "").lower()
+    toks = [_singular(t) for t in re.split(r"[^a-z]+", low) if t]
+    for w in words:
+        if " " in w:
+            if w in low:
+                return True
+        elif _singular(w) in toks:
+            return True
+    return False
 
 
 def load_xyz(path):
@@ -104,10 +126,15 @@ def main():
                     help="drop GT instances with fewer samples than this: they are too "
                          "small to be detected at this sampling density, and counting them "
                          "as misses only measures the sampling rate")
+    ap.add_argument("--exclude_classes", default=EXCLUDE_DEFAULT,
+                    help="comma-separated GT classes to leave out of the denominator. The "
+                         "default mirrors run_refinegs.sh's relabel EXCLUDE plus the "
+                         "structural classes")
     ap.add_argument("--all_gt", action="store_true",
-                    help="also score structural GT instances (wall/floor/rug/...). Off by "
-                         "default: the pipeline never tries to segment them, so including "
-                         "them would report a recall the method never aimed at")
+                    help="score every GT instance, ignoring --exclude_classes. Off by "
+                         "default: the pipeline never tries to segment blinds, vents or "
+                         "walls, so including them would report a recall the method never "
+                         "aimed at")
     ap.add_argument("--out", default="", help="default <root>/instance_seg.tsv")
     args = ap.parse_args()
 
@@ -141,8 +168,11 @@ def main():
     # --- GT instances worth scoring ---
     cnt_gt = collections.Counter(GL.tolist())
     gt_ids = [g for g, c in cnt_gt.items() if c >= args.min_gt_points]
+    excl = tuple(w.strip().lower() for w in args.exclude_classes.split(",") if w.strip())
+    dropped = []
     if not args.all_gt:
-        gt_ids = [g for g in gt_ids if not is_structure_class(names.get(int(g), ""))]
+        dropped = sorted(g for g in gt_ids if is_excluded_class(names.get(int(g), ""), excl))
+        gt_ids = [g for g in gt_ids if g not in set(dropped)]
     gt_ids = sorted(gt_ids)
     assert gt_ids, "no GT instance survived the filters -- check --gt_info and --min_gt_points"
 
@@ -183,8 +213,12 @@ def main():
     over = sorted(g for g in gt_ids if len(pieces_of_gt.get(g, [])) >= 2)
     under = sorted(p for p in preds if len(spans_of_pred.get(p, [])) >= 2)
 
+    if dropped:
+        by_cls = collections.Counter(names.get(int(g), "?") for g in dropped)
+        print("[seg] left out of the denominator (--exclude_classes): "
+              + ", ".join(f"{c} x{n}" for c, n in sorted(by_cls.items())))
     print(f"[seg] {len(gt_ids)} GT instances scored "
-          f"({'all classes' if args.all_gt else 'structure classes excluded'}, "
+          f"({'all classes' if args.all_gt else f'{len(dropped)} excluded by class'}, "
           f">= {args.min_gt_points} samples), {len(preds)} predicted, thr {args.thr*100:.0f}cm")
 
     hdr = f"{'GT id':>7}{'class':>16}{'pts':>9}{'coverage':>10}{'best':>7}{'pieces':>8}  note"
