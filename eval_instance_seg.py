@@ -88,6 +88,53 @@ def load_xyz(path):
     return np.stack([v[k] for k in ("x", "y", "z")], 1).astype(np.float64)
 
 
+def flush_ceiling_ids(P, L, names, cand, thick, gap):
+    """GT instances that are thin slabs lying flush against the ceiling plane.
+
+    The exclusion list's principle is "surfaces belonging to the building rather than
+    free-standing objects" -- that is what `ceiling`, `vent`, `light switch` and `blind` have
+    in common. It was implemented lexically, and recessed ceiling light panels escape it for
+    one reason only: Replica gives them class `lamp`, the same name as the floor and table
+    lamps we do want. Measured in room0 and room1, the two groups are not close:
+
+        missed   1.32 x 1.02 x 0.02 m   centroid at the ceiling plane
+        found    0.47 x 0.50 x 0.66 m   centroid at 0.42 of room height
+
+    A 2 cm slab whose back face IS the ceiling also has no unobserved side, so the method's
+    completion axis is undefined for it -- it is not a thing this pipeline can be right or
+    wrong about.
+
+    The rule is deliberately narrow: thin AND at the ceiling. Widening it to walls would
+    take `picture`, `painting` and `wall art` with it, which are thin, wall-flush, kept in
+    the vocabulary on purpose, and among our best matches (room1 picture, coverage 0.998).
+    That the lexical list already treats ceilings as structure and wall art as objects is
+    what decides where this line goes -- not which side of it happens to help.
+
+    Returns (ids, note). Inert, with a note, when the scene has no GT floor or ceiling.
+    """
+    ids = set(L.tolist())
+    floor_ids = [g for g in ids if names.get(int(g), "") == "floor"]
+    ceil_ids = [g for g in ids if names.get(int(g), "") == "ceiling"]
+    if not floor_ids or not ceil_ids:
+        return [], "no GT floor/ceiling -- flush-ceiling rule not applied"
+
+    # Up is whichever axis the floor is flattest in. Replica's world frame is not something
+    # to assume: guessing here would silently measure depth instead of height.
+    F = P[np.isin(L, floor_ids)]
+    up = int(np.argmin(F.max(0) - F.min(0)))
+    plane = float(np.median(P[np.isin(L, ceil_ids)][:, up]))
+
+    out = []
+    for g in cand:
+        Q = P[L == g]
+        if len(Q) < 3:
+            continue
+        ext = Q.max(0) - Q.min(0)
+        if float(ext.min()) <= thick and abs(float(Q.mean(0)[up]) - plane) <= gap:
+            out.append((int(g), ext, float(Q.mean(0)[up]) - plane))
+    return out, f"up axis {'xyz'[up]}, ceiling plane {plane:.2f} m"
+
+
 def gt_samples(mesh, info, n, seed=0):
     """Area-weighted GT points with their instance id, plus id -> class name."""
     p = PlyData.read(os.path.expanduser(mesh))
@@ -130,6 +177,17 @@ def main():
                     help="a GT point joins a predicted instance within this distance (m). "
                          "Matches audit_objects.py's GT-class test, so the two agree")
     ap.add_argument("--iou_thresholds", default="0.25,0.5")
+    # Fixed before looking at any scene other than the two that motivated them, and applied
+    # unchanged to all of them. Both are far from the boundary: the panels are 2-3cm thick
+    # sitting 1-5cm from the plane, the lamps we keep are 66-73cm tall and 1.3m below it.
+    ap.add_argument("--flush_thick", type=float, default=0.05,
+                    help="a GT instance thinner than this (m) in its smallest dimension may "
+                         "be treated as a flush fixture")
+    ap.add_argument("--flush_gap", type=float, default=0.10,
+                    help="...if its centroid is also within this distance (m) of the "
+                         "ceiling plane")
+    ap.add_argument("--no_flush_rule", action="store_true",
+                    help="score flush ceiling fixtures like any other instance")
     # A fragment is counted by its share of the thing it fragments, not by IoU: three
     # drawers each covering a third of one cabinet have IoU ~0.33 at best, so an IoU rule
     # would call them all misses and never say "one object, three labels".
@@ -184,9 +242,14 @@ def main():
     gt_ids = [g for g, c in cnt_gt.items() if c >= args.min_gt_points]
     excl = tuple(w.strip().lower() for w in args.exclude_classes.split(",") if w.strip())
     dropped = []
+    flush, flush_note = [], "disabled"
     if not args.all_gt:
         dropped = sorted(g for g in gt_ids if is_excluded_class(names.get(int(g), ""), excl))
         gt_ids = [g for g in gt_ids if g not in set(dropped)]
+        if not args.no_flush_rule:
+            flush, flush_note = flush_ceiling_ids(G, GL, names, gt_ids,
+                                                  args.flush_thick, args.flush_gap)
+            gt_ids = [g for g in gt_ids if g not in {i for i, _, _ in flush}]
     gt_ids = sorted(gt_ids)
     assert gt_ids, "no GT instance survived the filters -- check --gt_info and --min_gt_points"
 
@@ -231,6 +294,15 @@ def main():
         by_cls = collections.Counter(names.get(int(g), "?") for g in dropped)
         print("[seg] left out of the denominator (--exclude_classes): "
               + ", ".join(f"{c} x{n}" for c, n in sorted(by_cls.items())))
+    # Printed per instance, with the dimensions that triggered it, because a geometric rule
+    # is only as honest as its audit trail: anyone reading the numbers can see exactly what
+    # it removed and satisfy themselves it took ceiling panels and nothing else.
+    print(f"[seg] flush-ceiling rule ({flush_note}): "
+          f"min dim <= {args.flush_thick*100:.0f}cm and within "
+          f"{args.flush_gap*100:.0f}cm of the ceiling -> {len(flush)} removed")
+    for g, ext, dz in flush:
+        print(f"         id {g:5d}  {names.get(int(g), '?'):<14} "
+              f"{ext[0]:.2f}x{ext[1]:.2f}x{ext[2]:.2f} m   {dz*100:+.0f}cm from ceiling")
     print(f"[seg] {len(gt_ids)} GT instances scored "
           f"({'all classes' if args.all_gt else f'{len(dropped)} excluded by class'}, "
           f">= {args.min_gt_points} samples), {len(preds)} predicted, thr {args.thr*100:.0f}cm")
