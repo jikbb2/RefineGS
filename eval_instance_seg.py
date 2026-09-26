@@ -38,12 +38,26 @@ from plyfile import PlyData
 from scipy.spatial import cKDTree
 
 # The first nine entries are exactly run_refinegs.sh's EXCLUDE list, which is what the
-# relabel stage is told never to instantiate; the rest are the structural classes the
+# relabel stage is told never to instantiate; the next group is the structural classes the
 # geometry side already treats as scene, not object. Recall has to be measured against the
 # instances the method actually attempts -- counting a class the pipeline is configured to
 # skip as a miss measures the configuration, not the method.
+#
+# 'undefined' is a different kind of entry and the line between them matters. It is what
+# Replica writes as class_name for an instance carrying class_id -1: the annotation itself
+# is empty, so no vocabulary, ours or anyone's, can name it and no method can be prompted
+# for it. That is a property of the dataset, identical for every method compared on it, and
+# so it belongs out of the denominator. A class we merely FAIL on does not: dropping one
+# because our vocabulary missed it would measure the objects we happened to be able to
+# name, which is not a segmentation score. room1's `bed` is exactly that case and stays in,
+# at 4.265 of 26.63 m^2 -- 16% of the scored surface, reported as the miss it is.
+#
+# The share is scene-dependent and has to be reported per scene: 2 instances in room0 and
+# room1, but 23 in office0 and 42 in office2, where the largest single scored instance was
+# an `undefined` at 6.59 m^2.
 EXCLUDE_DEFAULT = ("door,blind,vent,window,wall,floor,ceiling,light switch,thermostat,"
-                   "rug,carpet,curtain,beam,pillar,column,stair")
+                   "rug,carpet,curtain,beam,pillar,column,stair,"
+                   "undefined")
 
 
 def _singular(w):

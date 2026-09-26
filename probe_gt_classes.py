@@ -97,7 +97,11 @@ def main():
             orphan_a += a; orphan_n += 1
             continue
         nm = name_of[oid]
-        if not nm:
+        # Replica does not leave class_name empty. An instance with class_id -1 carries the
+        # literal string "undefined", which is why a first pass here reported zero unnamed
+        # instances while the vocabulary audit -- reading class_id, not class_name -- counted
+        # 42 in office2. Both were right about their own field; only this bucket was wrong.
+        if not nm or nm == "undefined":
             unnamed_a += a; unnamed_n += 1
             unnamed_rows.append((a, oid))
         elif is_excluded_class(nm, excl):
