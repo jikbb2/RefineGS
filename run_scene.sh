@@ -72,6 +72,48 @@ else
   echo "[stage0] ${DATA}/sparse/0 exists -- skipping conversion"
 fi
 
+# The step that was missing from every script, and the reason room2's first run reached SAM3
+# with 200 views and produced zero native tracks.
+#
+# replica_to_refinegs.py applies --subsample to the image links as well as the poses (its own
+# header says so: "images/frameXXXXXX.jpg (심볼릭 링크, subsample 적용)"), so a fresh scene has
+# 200 links. make_dense_colmap.py then globs that directory and writes one pose per file it
+# finds -- it creates no links of its own. The lift therefore produces 200 poses, the colmap
+# stage's "poses < frames" test is false, it prints "up to date", and nothing anywhere reports
+# that the run is using a tenth of the trajectory.
+#
+# room0 and room1 got their 2000 links from a command typed by hand between stage 0 and the
+# colmap stage: `ln -sfn <scene>/results/* .` inside images/. That is why their manifests read
+# "n=2000 .jpg of 4000 files" -- results/ holds 2000 frame*.jpg AND 2000 depth*.png, and the
+# glob took both.
+#
+# This links results/* rather than just *.jpg on purpose. run_refinegs.sh counts only .jpg and
+# make_dense_colmap.py globs only .jpg, so the depth PNGs change nothing there -- but whether
+# some loader downstream globs images/ more broadly has not been verified, and room0 and room1
+# were built and trained with those PNGs present. Reproducing the directory they actually had
+# costs nothing; deviating from it would put an unchecked difference underneath a table that
+# compares the scenes to each other.
+NT=$([ -f "${TRAJ}" ] && awk 'NF{n++} END{print n+0}' "${TRAJ}" || echo 0)
+count_jpg() { ls "${DATA}/images"/*"${IMG_EXT:-.jpg}" 2>/dev/null | wc -l; }
+NF=$(count_jpg)
+echo "[frames] linked ${NF} ${IMG_EXT:-.jpg} / trajectory ${NT}"
+if [ "${NT}" -gt 0 ] && [ "${NF}" -lt "${NT}" ]; then
+  if [ "${DRY}" -eq 1 ]; then
+    echo "  (dry) would link ${GTD}/* into ${DATA}/images  (+$((NT - NF)) frames)"
+  else
+    echo "  linking ${GTD}/* into images/  (frames and depth, as room0/room1 have)"
+    mkdir -p "${DATA}/images"
+    # -f so re-running is idempotent: the 200 links stage 0 made point at the same files.
+    ln -sfn "${GTD}"/* "${DATA}/images/" || exit 1
+    NF=$(count_jpg)
+    echo "  linked now ${NF} ${IMG_EXT:-.jpg}, $(ls "${DATA}/images" | wc -l) files total"
+    [ "${NF}" -ge "${NT}" ] || {
+      echo "[abort] ${NF} frames for a ${NT}-frame trajectory -- names in ${GTD} may not end in ${IMG_EXT:-.jpg}"
+      exit 1
+    }
+  fi
+fi
+
 if [ "${DRY}" -eq 1 ]; then
   echo "(dry) SCENE=${SCENE} TRAJ=${TRAJ} GTD=${GTD} GT_MESH=${GT_MESH} GT_INFO=${GT_INFO} ${ARGS[*]} bash run_refinegs.sh"
   exit 0
