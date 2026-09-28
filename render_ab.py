@@ -75,6 +75,49 @@ def load_mesh(path):
     return m
 
 
+def load_gt(path, ids):
+    """The GT mesh, restricted to the given object_id values.
+
+    Read with plyfile, never with open3d. Replica's mesh_semantic.ply carries a per-face
+    `object_id` property, and open3d's RPly parser rejects the header outright ("Invalid file
+    format") -- which is also why every other script in this pipeline uses plyfile for it.
+    Reading it here and handing open3d a plain vertex/triangle mesh sidesteps the parser
+    entirely, and selecting the faces first means the renderer never sees the whole room.
+    """
+    from plyfile import PlyData
+    p = PlyData.read(os.path.expanduser(path))
+    fe = p["face"]
+    key = "vertex_indices" if "vertex_indices" in fe.data.dtype.names else "vertex_index"
+    V = np.stack([p["vertex"][k] for k in ("x", "y", "z")], 1).astype(np.float64)
+
+    keep = {int(x) for x in ids.replace(",", " ").split()} if ids else None
+    if keep is None:
+        print("[warn] --gt without --gt_ids draws the whole scene mesh; pass the GT id "
+              "from names.tsv")
+    T = []
+    for face, oid in zip(fe[key], fe["object_id"]):
+        if keep is not None and int(oid) not in keep:
+            continue
+        for k in range(1, len(face) - 1):
+            T.append((face[0], face[k], face[k + 1]))
+    if not T:
+        have = sorted({int(o) for o in fe["object_id"]})[:20]
+        sys.exit(f"[abort] no GT faces with object_id in {sorted(keep)}. "
+                 f"ids present (first 20): {have}")
+
+    # Drop the vertices no kept face uses, so the mesh's bounds are the object's bounds.
+    T = np.asarray(T, np.int64)
+    used = np.unique(T)
+    remap = np.full(len(V), -1, np.int64)
+    remap[used] = np.arange(len(used))
+    gt = o3d.geometry.TriangleMesh(
+        o3d.utility.Vector3dVector(V[used]),
+        o3d.utility.Vector3iVector(remap[T].astype(np.int32)))
+    gt.compute_vertex_normals()
+    print(f"[gt] {len(T)} triangles for object_id {sorted(keep) if keep else 'ALL'}")
+    return gt
+
+
 def look_at(eye, target, up=(0, 0, 1)):
     """World->camera extrinsic (4x4) for a camera at `eye` pointing at `target`."""
     f = np.asarray(target, float) - np.asarray(eye, float)
@@ -199,28 +242,7 @@ def main():
     meshes = [("A: observation only", A), ("B: fused", B)]
 
     if args.gt:
-        gt = load_mesh(args.gt)
-        if args.gt_ids:
-            keep = {int(x) for x in args.gt_ids.replace(",", " ").split()}
-            import plyfile
-            p = plyfile.PlyData.read(os.path.expanduser(args.gt))
-            fe = p["face"]
-            key = "vertex_indices" if "vertex_indices" in fe.data.dtype.names else "vertex_index"
-            V = np.stack([p["vertex"][k] for k in ("x", "y", "z")], 1).astype(np.float64)
-            T = []
-            for face, oid in zip(fe[key], fe["object_id"]):
-                if int(oid) in keep:
-                    for k in range(1, len(face) - 1):
-                        T.append((face[0], face[k], face[k + 1]))
-            if not T:
-                sys.exit(f"[abort] no GT faces with object_id in {sorted(keep)}")
-            gt = o3d.geometry.TriangleMesh(
-                o3d.utility.Vector3dVector(V),
-                o3d.utility.Vector3iVector(np.asarray(T, np.int32)))
-            gt.compute_vertex_normals()
-        else:
-            print("[warn] --gt without --gt_ids draws the whole scene mesh")
-        meshes.insert(0, ("GT", gt))
+        meshes.insert(0, ("GT", load_gt(args.gt, args.gt_ids)))
 
     az0 = np.arctan2(front[1], front[0])
     el = np.radians(args.elev)
