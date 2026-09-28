@@ -186,6 +186,13 @@ def main():
                          "trajectory camera that sees A best")
     ap.add_argument("--out", required=True, help="output PNG")
     ap.add_argument("--tag", default="", help="printed to stdout with the numbers")
+    # The rows used to be labelled "A: observation only" / "B: fused" whatever was passed.
+    # Comparing two fusion settings then produced a picture whose own caption said the top
+    # row was the observation -- a figure that lies about what it shows is worse than no
+    # figure, so the labels follow the meshes.
+    ap.add_argument("--labels", default="",
+                    help="comma-separated row labels, in the order GT (if any), recon, "
+                         "recon2. Default: 'A: observation only,B: fused'")
     ap.add_argument("--size", type=int, default=640, help="pixels per panel")
     ap.add_argument("--views", type=int, default=2,
                     help="azimuths, evenly spaced from the front. 2 = front and back")
@@ -200,6 +207,12 @@ def main():
     meshes = [("A: observation only", A), ("B: fused", B)]
     if args.gt:
         meshes.insert(0, ("GT", load_gt(args.gt, args.gt_ids)))
+    if args.labels:
+        given = [s.strip() for s in args.labels.split(",")]
+        if len(given) != len(meshes):
+            sys.exit(f"[abort] --labels has {len(given)} entries but {len(meshes)} rows "
+                     f"are drawn ({', '.join(n for n, _ in meshes)})")
+        meshes = [(given[i], m) for i, (_, m) in enumerate(meshes)]
 
     # One frame for every row. The camera must be fitted to ALL the meshes drawn, not just
     # A and B: the GT instance is usually a little larger (it has the legs and the parts the

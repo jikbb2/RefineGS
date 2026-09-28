@@ -1,15 +1,20 @@
 #!/usr/bin/env bash
-# RefineGS end to end: raw scene -> seen/unseen numbers, in one command.
+# RefineGS end to end: a Replica scene name -> seen/unseen numbers, in one command.
 #
-#   bash run_refinegs.sh                          # whole thing, scene pipeline
-#   SCENE=replica_room1 bash run_refinegs.sh      # another room
-#   PIPELINE=perobj bash run_refinegs.sh          # the per-object variant
-#   FROM=cond bash run_refinegs.sh                # resume
-#   FROM=extract TO=cond CLEAN=1 bash run_refinegs.sh
-#   RUN=0919a FROM=fuse bash run_refinegs.sh      # add rows to an earlier run
+#   bash run_refinegs.sh room2                      # whole thing, from the raw Replica dump
+#   bash run_refinegs.sh office0 FROM=train TO=name # resume a span
+#   bash run_refinegs.sh room2 --dry                # print every resolved path, run nothing
+#   bash run_refinegs.sh room2 ONLY="14" FROM=cond TO=cond
+#   bash run_refinegs.sh                            # no scene name: use the SCENE/TRAJ/... env
+#   RUN=0919a bash run_refinegs.sh room0 FROM=fuse  # add rows to an earlier run
+#
+# Anything after the scene name is either VAR=value (applied before the defaults below, so it
+# behaves exactly like an environment variable) or --dry. A bare `bash run_refinegs.sh` with
+# no scene name still works the way it always did: every path comes from the environment.
 #
 # Stages (linear; FROM/TO select a span):
 #
+#   stage0   Replica dump -> data/<scene>, frame links   tools/replica_to_refinegs.py
 #   colmap   poses for every frame                       convert.py, make_dense_colmap.py
 #   relabel  SAM3 video instances -> per-gid masks       [sam3 env]
 #   masks    amodal + per-object folders                 amodal_mask.py, prepare_folder.sh,
@@ -27,7 +32,10 @@
 #
 # Why this file exists: the same run used to be three drivers and three manual steps, and
 # each boundary lost something -- the conditioning surface, the RUN tag, the pose set, the
-# pkl directory. Everything that must agree is resolved once, here, and printed.
+# pkl directory. Everything that must agree is resolved once, here, and printed. run_scene.sh
+# was the last of those boundaries: it resolved five GT paths and topped up the frame links,
+# and forgetting it is what sent room2's first run into SAM3 with 200 of 2000 views. It is
+# the stage0 block below now, so there is nothing left to forget.
 #
 # It does NOT reimplement the two drivers that carry hard-won logic: mesh_voted_objects.sh
 # and run_field_fusion_batch.sh (stale-prior guard, progress lines, per-object failure
@@ -35,17 +43,62 @@
 set -uo pipefail
 shopt -s nullglob
 
-# ---------------------------------------------------------------- identity
+# ---------------------------------------------------------------- arguments
+# Parsed before anything else, because a VAR=value argument must reach the ${VAR:-default}
+# lines below as if it had been exported. A bare first word is the scene name.
+SCENE_NAME=""
+DRY=0
+for a in "$@"; do
+  case "${a}" in
+    --dry)        DRY=1 ;;
+    [A-Za-z_]*=*) export "${a?}" ;;
+    -*)           echo "[abort] unknown flag ${a}"; exit 1 ;;
+    *)  [ -z "${SCENE_NAME}" ] || { echo "[abort] two scene names: ${SCENE_NAME} and ${a}"; exit 1; }
+        SCENE_NAME=${a} ;;
+  esac
+done
+
+# ---------------------------------------------------------------- scene name -> GT paths
+# This run needs five paths to agree (SCENE, TRAJ, GTD, GT_MESH, GT_INFO), and they come from
+# two directory trees with different naming -- nice-slam writes `room1`, the Replica v1
+# tarball writes `room_1`. room0 sits in a third place again (~/room_0), because it was
+# extracted before ~/replica_dl existed. Typing those five by hand per scene is how a run ends
+# up evaluating one room's reconstruction against another room's GT mesh: nothing downstream
+# checks, and the numbers look plausible.
 ROOT=${ROOT:-$HOME/RefineGS}
+NICE=${NICE:-$HOME/nice-slam/Datasets/Replica}
+DL=${DL:-$HOME/replica_dl}
+
+if [ -n "${SCENE_NAME}" ]; then
+  # nice-slam name -> Replica v1 directory name: room2 -> room_2, office0 -> office_0.
+  V1_NAME=$(echo "${SCENE_NAME}" | sed -E 's/^(room|office)([0-9]+)$/\1_\2/')
+  # The habitat/ tree moved twice. Take the first one that actually exists rather than
+  # encoding a rule that only holds for the scenes already run.
+  HAB=""
+  for cand in "${DL}/${V1_NAME}/habitat" "$HOME/${V1_NAME}/habitat" "${NICE}/${SCENE_NAME}/habitat"; do
+    [ -f "${cand}/mesh_semantic.ply" ] && { HAB=${cand}; break; }
+  done
+  REPLICA_SCENE=${REPLICA_SCENE:-${NICE}/${SCENE_NAME}}
+  SCENE=${SCENE:-replica_${SCENE_NAME}_v2}
+  TRAJ=${TRAJ:-${NICE}/${SCENE_NAME}/traj.txt}
+  GTD=${GTD:-${NICE}/${SCENE_NAME}/results}
+  GT_MESH=${GT_MESH:-${HAB}/mesh_semantic.ply}
+  GT_INFO=${GT_INFO:-${HAB}/info_semantic.json}
+else
+  HAB=""; REPLICA_SCENE=${REPLICA_SCENE:-}
+fi
+
+# ---------------------------------------------------------------- identity
 SCENE=${SCENE:-replica_room0_v2}
 PIPELINE=${PIPELINE:-scene}            # scene = slice one trained model | perobj = train each
 # One tag for the whole run. Every result file carries it, so a number that was reported
 # can always be traced back to the inputs that produced it.
 RUN=${RUN:-$(date +%m%d_%H%M)}
-FROM=${FROM:-colmap}
+FROM=${FROM:-stage0}
 TO=${TO:-fuse}
 CLEAN=${CLEAN:-0}                      # delete this stage's outputs and everything after
 ONLY=${ONLY:-}                         # restrict to some gids, e.g. ONLY="2 5 6"
+SUBSAMPLE=${SUBSAMPLE:-10}             # stage0 SfM subset; the frame links are topped back up
 
 # ---------------------------------------------------------------- data
 DATA=${DATA:-${ROOT}/data/${SCENE}}
@@ -61,6 +114,7 @@ if [ -z "${COLMAP:-}" ]; then
   done
 fi
 COLMAP=${COLMAP:-${DATA}/sparse/0}
+# Fallbacks for a run with no scene name, i.e. the room0 layout this driver was written on.
 GTD=${GTD:-/home/elicer/nice-slam/Datasets/Replica/room0/results}
 GT_MESH=${GT_MESH:-$HOME/room_0/habitat/mesh_semantic.ply}
 GT_INFO=${GT_INFO:-$HOME/room_0/habitat/info_semantic.json}
@@ -148,6 +202,15 @@ COND_NAME=${COND_NAME:-tsdf_clean.ply}
 MESH_ARGS=${MESH_ARGS:-"--min_alpha 0.3 --min_cos 0.35 --max_jump 0.05 --erode 0 --num_cluster 0 --min_comp_frac 0.02"}
 # Conditioning, filtered harder on purpose: ShapeR anchors to these points so a ragged
 # boundary is copied into the prior, and the holes that leaves are what the prior fills.
+#
+# OPEN DEFECT as of 0929, do not treat this default as settled. It was justified on ONE
+# object (gid6: unseen F@2 0.5942 -> 0.6382) and never checked for how much surface it
+# removes. Measured afterwards against each object's own side A, 45 of 54 conditioning
+# surfaces are smaller in every axis -- room0 23/25, room1 10/14, room2 12/15 -- most at
+# 20-70% of A's extent and the worst four at 4-6%, with centre shifts up to 71mm. ShapeR is
+# therefore conditioned on roughly half of each object, so every unseen gain reported so far
+# is a lower bound. Changing this string does force the cond stage to rebuild (the .cond_config
+# stamp below), but it does NOT invalidate pkl/field/fuse: rerun cond..fuse together.
 COND_ARGS=${COND_ARGS:-"--min_alpha 0.7 --min_cos 0.35 --max_jump 0.02 --erode 3 --num_cluster 0 --min_comp_frac 0.02"}
 POINTS_FROM=${POINTS_FROM:-mesh}
 FUSE_EXTRA=${FUSE_EXTRA:-}
@@ -163,7 +226,8 @@ OBJ_MIN_MASKS=${OBJ_MIN_MASKS:-5}
 # resolution) was never recorded, and guessing an argument name here would train for hours
 # and produce the wrong model. Set it once and it is captured in every manifest.
 TRAIN_SCENE_ARGS=${TRAIN_SCENE_ARGS:-}
-# Replica frame dump. Same reason: set it, or prepare data/<scene>/images yourself.
+# Frame dump for a source tree stage0 does not understand. With a scene name, stage0 does
+# this and FRAMES_CMD stays empty.
 FRAMES_CMD=${FRAMES_CMD:-}
 # convert.py runs COLMAP SfM for hours and rewrites the source tree, so it is opt-in.
 COLMAP_SFM=${COLMAP_SFM:-0}
@@ -172,7 +236,7 @@ cd "${ROOT}" || exit 1
 mkdir -p "${RUNDIR}" "${PRIOR}"
 
 # ---------------------------------------------------------------- helpers
-ORDER="colmap relabel masks labels train carve objects name mesh cond pkl field fuse"
+ORDER="stage0 colmap relabel masks labels train carve objects name mesh cond pkl field fuse"
 idx_of() { local i=0 s; for s in ${ORDER}; do i=$((i+1)); [ "$s" = "$1" ] && { echo "$i"; return; }; done; echo 0; }
 I_FROM=$(idx_of "${FROM}"); I_TO=$(idx_of "${TO}")
 [ "${I_FROM}" -gt 0 ] && [ "${I_TO}" -gt 0 ] || { echo "[abort] FROM/TO must be one of: ${ORDER}"; exit 1; }
@@ -220,6 +284,7 @@ n_files() {
   if [ -n "${2:-}" ]; then ls "$1"/*"$2" 2>/dev/null | wc -l
   else ls "$1" 2>/dev/null | wc -l; fi
 }
+n_traj() { if [ -f "$1" ]; then awk 'NF{n++} END{print n+0}' "$1"; else echo 0; fi; }
 # `ls -d dir/*/ | wc -l` reports 1 on an empty dir under nullglob, because ls falls back to
 # the working directory. Count the loop instead.
 count_dirs() {                                # count_dirs ROOT [numeric-only]
@@ -240,16 +305,21 @@ MANIFEST=${RUNDIR}/manifest.txt
   echo "run           ${RUN}            $(date '+%F %T')"
   echo "git           ${GITREV}"
   echo "scene         ${SCENE}          pipeline=${PIPELINE}  iter=${ITER}"
+  echo "scene_name    ${SCENE_NAME:-<none, paths from env>}"
+  echo "replica_src   ${REPLICA_SCENE:-<none>}   subsample=${SUBSAMPLE}"
+  echo "habitat       ${HAB:-<not resolved by name>}"
   echo "resolution    -r ${RESOLUTION}         data_device=${DATA_DEVICE}"
   echo "depth         supervision=${DEPTH_SUPERVISION}  vote_ref=${VOTE_REF}"
   echo "carve         ${CARVE_DEPTH}"
   echo "stages        ${FROM} .. ${TO}  clean=${CLEAN}  only='${ONLY}'"
   echo "colmap        ${COLMAP}         poses=$(n_poses "${COLMAP}")"
   echo "images        ${IMAGES}         n=$(n_files "${IMAGES}" "${IMG_EXT}") ${IMG_EXT} of $(n_files "${IMAGES}") files"
+  echo "traj          ${TRAJ}           n=$(n_traj "${TRAJ}")"
   echo "masks         ${MASKS}"
   echo "labels        ${LABEL_DIR}      min_views=${MIN_LABEL_VIEWS} overlap=${OVERLAP}"
   echo "gt_depth      ${GTD}"
   echo "gt_mesh       ${GT_MESH}"
+  echo "gt_info       ${GT_INFO}"
   echo "scene_model   ${SCENE_MODEL}"
   echo "objects       ${OBJ}"
   echo "prior         ${PRIOR}"
@@ -263,6 +333,7 @@ MANIFEST=${RUNDIR}/manifest.txt
   echo "extract_extra ${EXTRACT_EXTRA:-<none>}"
   echo "mesh_args     ${MESH_ARGS}"
   echo "cond_args     ${COND_ARGS}"
+  echo "cond_name     ${COND_NAME}"
   echo "fuse_extra    ${FUSE_EXTRA:-<none>}"
   echo "relabel       stride=${STRIDE} window=${WINDOW} min_area=${MIN_AREA} min_track=${MIN_TRACK}"
 } > "${MANIFEST}"
@@ -270,11 +341,26 @@ echo "+- [run ${RUN}] --------------------------------------------------"
 sed 's/^/| /' "${MANIFEST}"
 echo "+-----------------------------------------------------------------"
 
+# The five paths run_scene.sh used to check, printed whenever a scene name resolved them.
+# A missing GT mesh does not stop a training run, so it only aborts for a span that reads it.
+if [ -n "${SCENE_NAME}" ]; then
+  miss=0
+  for p in "${TRAJ}" "${GTD}" "${GT_MESH}" "${GT_INFO}"; do
+    if [ -e "${p}" ]; then echo "  ok       ${p}"; else echo "  MISSING  ${p}"; miss=1; fi
+  done
+  if [ "${miss}" -ne 0 ]; then
+    if want_any stage0 colmap objects name pkl fuse; then
+      echo "[abort] resolve the paths above before running -- this span reads them"; exit 1
+    fi
+    echo "  (not read by stages ${FROM}..${TO}; continuing)"
+  fi
+fi
+
 # Require an input only when a stage in THIS span consumes it and no stage in this span
 # produces it. Demanding a scene model for a FROM=labels TO=labels run is noise.
 fail=0
 chk() { [ -e "$1" ] || { echo "  MISSING $1${2:+   ($2)}"; fail=1; }; }
-want colmap || { want_any relabel objects cond pkl fuse && { chk "${IMAGES}"; chk "${COLMAP}"; }; }
+want_any stage0 colmap || { want_any relabel objects cond pkl fuse && { chk "${IMAGES}"; chk "${COLMAP}"; }; }
 want masks  || { want_any labels objects mesh cond pkl fuse && chk "${MASKS}"; }
 if [ "${PIPELINE}" = "scene" ] && want objects; then
   want labels || chk "${LABEL_DIR}/id_map.json" "stage: labels"
@@ -284,6 +370,8 @@ want_any objects pkl fuse && chk "${GTD}"
 want carve || { want_any objects fuse && [ ! -d "${CARVE_DEPTH}" ] \
   && echo "  note: no ${CARVE_DEPTH} -- vote and fusion will fall back to GT depth"; }
 [ "${fail}" -eq 0 ] || { echo "[abort] start earlier with FROM=, or fix the paths above"; exit 1; }
+
+[ "${DRY}" -eq 1 ] && { echo ""; echo "(dry) nothing was run. Drop --dry to execute ${FROM}..${TO}."; exit 0; }
 
 # ---------------------------------------------------------------- clean
 # CLEAN is whole-tree: this stage's outputs AND everything after, because a changed input
@@ -315,6 +403,9 @@ if [ "${CLEAN}" = "1" ]; then
     echo "  NOTE TO=${TO}, but CLEAN still retires pkl/field/fuse outputs -- they go stale"
     echo "       the moment an earlier stage is rebuilt."
   fi
+  # stage0 is deliberately NOT retired. Its outputs are the pose set and the frame links
+  # every later stage was built against; moving them aside mid-project would invalidate a
+  # trained scene model that CLEAN has no way to rebuild.
   at_or_after labels  && retire "${LABEL_DIR}"
   at_or_after objects && retire "${OBJ}"
   at_or_after mesh    && retire "${OBJ}"/*/train/ours_"${ITER}"/fuse.ply \
@@ -328,12 +419,71 @@ if [ "${CLEAN}" = "1" ]; then
   [ -d "${TRASH}" ] && echo "  -> ${TRASH}   (restore by moving back; '__' was '/')"
 fi
 
+# ---------------------------------------------------------------- stage0
+if want stage0; then
+  say "stage0: Replica dump -> ${DATA}"
+  if [ -z "${REPLICA_SCENE}" ]; then
+    echo "  [skip] no scene name given -- data/<scene> is assumed to exist already"
+  elif [ -d "${DATA}/sparse/0" ]; then
+    # Skipped once sparse/0 exists, so a resumed run never rebuilds the pose set underneath
+    # an already-trained model.
+    echo "  ${DATA}/sparse/0 exists -- conversion skipped"
+  else
+    echo "  converting ${REPLICA_SCENE}  (subsample ${SUBSAMPLE})"
+    python tools/replica_to_refinegs.py --replica_scene "${REPLICA_SCENE}" \
+      --out_dir "data/${SCENE}" --subsample "${SUBSAMPLE}" || exit 1
+  fi
+
+  # The step that was missing from every script, and the reason room2's first run reached
+  # SAM3 with 200 views and produced zero native tracks.
+  #
+  # replica_to_refinegs.py applies --subsample to the image LINKS as well as the poses (its
+  # own header says so), so a fresh scene has 200 links. make_dense_colmap.py then globs that
+  # directory and writes one pose per file it finds -- it creates no links of its own. The
+  # lift therefore produces 200 poses, the colmap stage's "poses < frames" test is false, it
+  # prints "up to date", and nothing anywhere reports that the run is using a tenth of the
+  # trajectory.
+  #
+  # room0 and room1 got their 2000 links from a command typed by hand between the conversion
+  # and the colmap stage: `ln -sfn <scene>/results/* .` inside images/. That is why their
+  # manifests read "n=2000 .jpg of 4000 files" -- results/ holds 2000 frame*.jpg AND 2000
+  # depth*.png, and the glob took both.
+  #
+  # This links results/* rather than just *${IMG_EXT} on purpose. The counters here and
+  # make_dense_colmap.py both glob only ${IMG_EXT}, so the depth PNGs change nothing there --
+  # but whether some loader downstream globs images/ more broadly has not been verified, and
+  # room0 and room1 were built and trained with those PNGs present. Reproducing the directory
+  # they actually had costs nothing; deviating from it would put an unchecked difference
+  # underneath a table that compares the three scenes to each other.
+  NT=$(n_traj "${TRAJ}"); NF=$(n_files "${IMAGES}" "${IMG_EXT}")
+  echo "  frames: linked ${NF} ${IMG_EXT} / trajectory ${NT}"
+  if [ "${NT}" -gt 0 ] && [ "${NF}" -lt "${NT}" ] && [ -d "${GTD}" ]; then
+    echo "  linking ${GTD}/* into images/  (frames and depth, as room0/room1 have)"
+    mkdir -p "${IMAGES}"
+    # -f so re-running is idempotent: the 200 links the conversion made point at the same files.
+    ln -sfn "${GTD}"/* "${IMAGES}/" || exit 1
+    NF=$(n_files "${IMAGES}" "${IMG_EXT}")
+    echo "  linked now ${NF} ${IMG_EXT}, $(n_files "${IMAGES}") files total"
+    [ "${NF}" -ge "${NT}" ] || {
+      echo "[abort] ${NF} frames for a ${NT}-frame trajectory -- names in ${GTD} may not end in ${IMG_EXT}"
+      exit 1
+    }
+  elif [ "${NT}" -gt 0 ]; then
+    echo "  up to date"
+  fi
+  # Re-resolve: the conversion may have just created the directory the top of this file
+  # looked for and did not find.
+  for sd in sparse/0 sparse_dense/0; do
+    [ -d "${DATA}/${sd}" ] && { COLMAP=${DATA}/${sd}; break; }
+  done
+fi
+
 # ---------------------------------------------------------------- colmap
 if want colmap; then
   say "colmap: a pose for every frame"
   if [ ! -d "${IMAGES}" ] || [ "$(n_files "${IMAGES}")" -eq 0 ]; then
     if [ -n "${FRAMES_CMD}" ]; then eval "${FRAMES_CMD}" || exit 1
-    else echo "  [STOP] ${IMAGES} is empty. Set FRAMES_CMD to the Replica frame dump."; exit 1; fi
+    else echo "  [STOP] ${IMAGES} is empty. Give a scene name, or set FRAMES_CMD."; exit 1; fi
   fi
   NP=$(n_poses "${COLMAP}"); NF=$(n_files "${IMAGES}" "${IMG_EXT}")
   echo "  poses ${NP} / frames ${NF} (${IMG_EXT})"
@@ -545,6 +695,11 @@ if want cond; then
   # NOT the surface we report. fuse_post.ply keeps the rough band where observation runs
   # out; it sits ON the surface, so make_shaper_input.py's free-space filter passes it and
   # ShapeR anchors to it. Filtering it out moved obj6 unseen F@2 0.5942 -> 0.6382.
+  #
+  # The stamp is one file per object, shared by every COND_NAME. A probe run with a different
+  # COND_NAME therefore leaves the stamp holding the probe's arguments, which is the safe
+  # direction: the next production run sees a mismatch and rebuilds tsdf_clean.ply rather
+  # than reusing a file whose provenance is no longer recorded.
   for MDIR in "${OBJ}"/*/; do
     gid=$(basename "${MDIR}")
     [[ "${gid}" =~ ^[0-9]+$ ]] || continue

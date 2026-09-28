@@ -136,6 +136,12 @@ def rank(paired, through):
     handles well; this lists them with the four columns that decide whether a picture will hold
     up, so the choice is made before anything is rendered.
 
+      seen%   how much of the GT surface the cameras saw at all. THE FIRST THING TO READ.
+              An object seen from 150 views around a room has almost no unobserved side, so
+              a large relative gain there is a small absolute change and a picture of it shows
+              nothing. Ranking on dR alone put a vase at the top: its numbers were excellent
+              and its figure was a smoothed copy of side A, because there was barely anything
+              left to fill. Prefer the objects the cameras could NOT get around.
       dR      how much unseen surface B recovered that A did not. The visible change.
       seenF1  B's fidelity where the cameras DID look. Below ~0.85 the object reads as broken
               whatever the unseen side does, and a reader blames the method for both.
@@ -155,21 +161,32 @@ def rank(paired, through):
         a, b = paired[t]["A"], paired[t]["B"]
         if t in set(through):
             continue
+        # The column is a share of the GT surface; some runs wrote it as a percent and some
+        # as a fraction, so normalise to a percent rather than trusting either.
+        sp = g(b, "gt_seen_pct") if "gt_seen_pct" in b else float("nan")
+        if sp == sp and sp <= 1.5:
+            sp *= 100.0
         rows.append((
             g(b, "unseen_R2.0") - g(a, "unseen_R2.0"), t,
             g(a, "unseen_F2.0"), g(b, "unseen_F2.0"),
-            g(b, "seen_F1.0"), g(b, "free_pct"), g(b, "unseen_comp"),
+            g(b, "seen_F1.0"), g(b, "free_pct"), g(b, "unseen_comp"), sp,
         ))
     if not rows:
         print("\n  --- figure ranking: every paired object was a passthrough ---")
         return
 
-    print("\n  --- figure ranking (fused objects, best first) ---")
-    hdr = f"{'obj':>8}{'dR':>9}{'unsF2 A->B':>18}{'seenF1':>9}{'free%':>8}{'comp mm':>10}  note"
+    print("\n  --- figure ranking (fused objects, most unobserved first) ---")
+    hdr = (f"{'obj':>8}{'seen%':>8}{'dR':>9}{'unsF2 A->B':>18}"
+           f"{'seenF1':>9}{'free%':>8}{'comp mm':>10}  note")
     print("  " + hdr)
     print("  " + "-" * len(hdr))
-    for dR, t, fa, fb, sf, fr, cp in sorted(rows, reverse=True):
+    # Sorted by how much was NOT observed, then by the gain. An object the cameras got all
+    # the way around cannot show completion however good its numbers are.
+    for dR, t, fa, fb, sf, fr, cp, sp in sorted(
+            rows, key=lambda r: (-(100.0 - (r[7] if r[7] == r[7] else 0.0)), -r[0])):
         note = []
+        if sp == sp and sp > 70.0:
+            note.append(f"only {100 - sp:.0f}% unobserved -- little to show")
         if sf < 0.85:
             note.append("observed side weak")
         if fr > 8.0:
@@ -179,9 +196,16 @@ def rank(paired, through):
         if fb <= fa:
             note.append("no gain")
         tick = "  <== figure candidate" if not note else "  " + "; ".join(note)
-        print(f"  {t:>8}{dR:>+9.3f}{fa:>10.3f} ->{fb:>6.3f}{sf:>9.3f}{fr:>8.2f}{cp:>10.1f}{tick}")
-    print("\n  Thin parts (chair legs, handles) are below the voxel size and are missing from "
-          "BOTH sides;\n  no ranking recovers them. Pick a candidate whose shape is solid.")
+        sps = f"{sp:>8.1f}" if sp == sp else f"{'-':>8}"
+        print(f"  {t:>8}{sps}{dR:>+9.3f}{fa:>10.3f} ->{fb:>6.3f}"
+              f"{sf:>9.3f}{fr:>8.2f}{cp:>10.1f}{tick}")
+    # The cause is the truncation distance, not the voxel size: mesh_tsdf_views.py integrates
+    # at a 4 mm voxel, which resolves a 30 mm leg seven times over, but with sdf_trunc = 20 mm
+    # the bands of two surfaces 30 mm apart overlap and the far zero crossing is washed out.
+    # TSDF holds structures thicker than roughly 2 x sdf_trunc = 40 mm. Below that a part comes
+    # out in fragments on BOTH sides, so no ranking recovers it.
+    print("\n  Thin parts (chair legs, handles) are thinner than 2 x sdf_trunc = 40 mm and come "
+          "out\n  in fragments on BOTH sides. Pick a candidate whose shape is solid.")
 
 
 if __name__ == "__main__":
