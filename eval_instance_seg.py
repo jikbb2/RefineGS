@@ -186,8 +186,18 @@ def main():
     ap.add_argument("--flush_gap", type=float, default=0.10,
                     help="...if its centroid is also within this distance (m) of the "
                          "ceiling plane")
-    ap.add_argument("--no_flush_rule", action="store_true",
-                    help="score flush ceiling fixtures like any other instance")
+    # OFF by default, and left in only so the earlier numbers can be reproduced.
+    #
+    # The rule was justified by a completion argument -- a 2 cm panel whose back face IS the
+    # ceiling has no unobserved side, so the method cannot be right or wrong about it. That
+    # argument is about the geometry axis. This is the SEGMENTATION metric, where a flush
+    # panel is an instance the segmenter should have found exactly like any other, and there
+    # is no principled line between a 2 cm panel and room2's 19 cm recessed box. Keeping it on
+    # dropped 4 lamps each in room0 and room1 and 0 in room2 -- the same failure scored three
+    # different ways, on a threshold rather than a principle.
+    ap.add_argument("--flush_rule", action="store_true",
+                    help="exclude thin fixtures lying flush against the ceiling from the "
+                         "denominator. Off by default; see the note above --flush_thick")
     # A fragment is counted by its share of the thing it fragments, not by IoU: three
     # drawers each covering a third of one cabinet have IoU ~0.33 at best, so an IoU rule
     # would call them all misses and never say "one object, three labels".
@@ -246,7 +256,7 @@ def main():
     if not args.all_gt:
         dropped = sorted(g for g in gt_ids if is_excluded_class(names.get(int(g), ""), excl))
         gt_ids = [g for g in gt_ids if g not in set(dropped)]
-        if not args.no_flush_rule:
+        if args.flush_rule:
             flush, flush_note = flush_ceiling_ids(G, GL, names, gt_ids,
                                                   args.flush_thick, args.flush_gap)
             gt_ids = [g for g in gt_ids if g not in {i for i, _, _ in flush}]
