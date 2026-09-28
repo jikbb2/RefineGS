@@ -50,6 +50,9 @@ def main():
                     help="restrict to these gids (space or comma separated), matching the "
                          "audit's ONLY list. Default: every object present in the CSV")
     ap.add_argument("--label", default="", help="name to print in the header")
+    ap.add_argument("--rank", action="store_true",
+                    help="also rank the fused objects by how well they would carry a "
+                         "qualitative figure")
     args = ap.parse_args()
 
     keep = {t.strip() for t in args.only.replace(",", " ").split() if t.strip()}
@@ -120,6 +123,65 @@ def main():
     block(all_tags, "all objects (the number for the paper)")
     block([t for t in all_tags if t not in set(through)],
           "fused only (secondary -- the denominator is chosen after the fact)")
+
+    if args.rank:
+        rank(paired, through)
+
+
+def rank(paired, through):
+    """Which objects would make an honest qualitative figure.
+
+    Picking by eye from thumbnails is how a figure ends up showing a chair with no legs and a
+    cabinet whose doors the prior sealed shut. The metrics already say which objects the method
+    handles well; this lists them with the four columns that decide whether a picture will hold
+    up, so the choice is made before anything is rendered.
+
+      dR      how much unseen surface B recovered that A did not. The visible change.
+      seenF1  B's fidelity where the cameras DID look. Below ~0.85 the object reads as broken
+              whatever the unseen side does, and a reader blames the method for both.
+      free    B's share of surface sitting in space the cameras saw through. A high value is
+              material the figure will show floating.
+      comp    B's mean distance to the unseen GT surface. Low means the fill has the right
+              shape, not merely the right amount.
+
+    A row is flagged for the figure only when all four agree. The point is not to hide the
+    failures -- they belong in the paper -- but to not spend the one hero figure on them.
+    """
+    def g(r, c):
+        return float(r[c])
+
+    rows = []
+    for t in paired:
+        a, b = paired[t]["A"], paired[t]["B"]
+        if t in set(through):
+            continue
+        rows.append((
+            g(b, "unseen_R2.0") - g(a, "unseen_R2.0"), t,
+            g(a, "unseen_F2.0"), g(b, "unseen_F2.0"),
+            g(b, "seen_F1.0"), g(b, "free_pct"), g(b, "unseen_comp"),
+        ))
+    if not rows:
+        print("\n  --- figure ranking: every paired object was a passthrough ---")
+        return
+
+    print("\n  --- figure ranking (fused objects, best first) ---")
+    hdr = f"{'obj':>8}{'dR':>9}{'unsF2 A->B':>18}{'seenF1':>9}{'free%':>8}{'comp mm':>10}  note"
+    print("  " + hdr)
+    print("  " + "-" * len(hdr))
+    for dR, t, fa, fb, sf, fr, cp in sorted(rows, reverse=True):
+        note = []
+        if sf < 0.85:
+            note.append("observed side weak")
+        if fr > 8.0:
+            note.append("fill spills into free space")
+        if cp > 200.0:
+            note.append("fill far from GT")
+        if fb <= fa:
+            note.append("no gain")
+        tick = "  <== figure candidate" if not note else "  " + "; ".join(note)
+        print(f"  {t:>8}{dR:>+9.3f}{fa:>10.3f} ->{fb:>6.3f}{sf:>9.3f}{fr:>8.2f}{cp:>10.1f}{tick}")
+    print("\n  Thin parts (chair legs, handles) are below the voxel size and are missing from "
+          "BOTH sides;\n  no ranking recovers them. Pick a candidate whose shape is solid.")
 
 
 if __name__ == "__main__":

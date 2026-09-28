@@ -196,9 +196,16 @@ def main():
 
     A, B = load_mesh(args.recon), load_mesh(args.recon2)
 
-    # One frame for both sides: the camera is placed from A and B together, so the same
-    # object does not change apparent size between panels.
-    pts = np.vstack([np.asarray(A.vertices), np.asarray(B.vertices)])
+    rows, labels = [], []
+    meshes = [("A: observation only", A), ("B: fused", B)]
+    if args.gt:
+        meshes.insert(0, ("GT", load_gt(args.gt, args.gt_ids)))
+
+    # One frame for every row. The camera must be fitted to ALL the meshes drawn, not just
+    # A and B: the GT instance is usually a little larger (it has the legs and the parts the
+    # reconstruction missed), so fitting to A and B alone crops the GT row -- which is exactly
+    # the row a reader checks the other two against.
+    pts = np.vstack([np.asarray(m.vertices) for _, m in meshes])
     ctr = 0.5 * (pts.min(0) + pts.max(0))
     radius = float(np.linalg.norm(pts.max(0) - pts.min(0))) * 0.5
     dist = max(radius * args.fit, 1e-3)
@@ -237,12 +244,6 @@ def main():
     S = args.size
     f = S * 1.1
     K = np.array([[f, 0, S / 2.0], [0, f, S / 2.0], [0, 0, 1]], float)
-
-    rows, labels = [], []
-    meshes = [("A: observation only", A), ("B: fused", B)]
-
-    if args.gt:
-        meshes.insert(0, ("GT", load_gt(args.gt, args.gt_ids)))
 
     az0 = np.arctan2(front[1], front[0])
     el = np.radians(args.elev)
