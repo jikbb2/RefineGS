@@ -1,0 +1,260 @@
+#!/usr/bin/env python3
+"""Render side A and side B of the same object from identical cameras, for the paper figure.
+
+Matching viewpoints by hand is not reproducible, and a reader cannot tell whether a
+difference between two panels came from the method or from the camera. Here both meshes are
+rendered through the same intrinsics and the same extrinsics, so every pixel difference is
+the method.
+
+Rendering is done by ray casting on the CPU (open3d's RaycastingScene), not through OpenGL:
+a headless server has no display, and an offscreen GL context is one more thing that fails
+for a reason unrelated to the figure. Shading is Lambertian on the hit normals, which is
+enough to read a shape and keeps the two panels comparable.
+
+The BACK view is the point of the figure. Every camera in the trajectory saw the front, so
+that is where A and B agree; what the fusion added is on the side no camera reached.
+
+  python render_ab.py \\
+      --recon  output/replica_room2_v2/objects_voted/6/train/ours_30000/fuse_post.ply \\
+      --recon2 output/replica_room2_v2/objects_voted/6/train/ours_30000/fused_0927_1517_post.ply \\
+      --colmap data/replica_room2_v2/sparse/0 \\
+      --out /tmp/fig_room2_obj6.png --tag "room2 obj6 (chair)"
+
+Without --colmap the front direction is the world +X axis; with it, the front is the
+trajectory camera that sees side A best, so the "front" panel matches what was actually
+observed.
+"""
+
+import argparse
+import os
+import sys
+
+import numpy as np
+
+try:
+    import open3d as o3d
+except ImportError:
+    sys.exit("[abort] open3d is required: pip install open3d")
+
+
+# ----------------------------------------------------------------- COLMAP text poses
+def read_colmap_images(path):
+    """[(name, R_wc, t_wc)] from images.txt. Binary models are not read here."""
+    f = os.path.join(os.path.expanduser(path), "images.txt")
+    if not os.path.isfile(f):
+        return []
+    out, expect_pose = [], True
+    for line in open(f):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if expect_pose:
+            t = line.split()
+            if len(t) >= 10:
+                qw, qx, qy, qz = (float(x) for x in t[1:5])
+                tx, ty, tz = (float(x) for x in t[5:8])
+                # COLMAP stores world->camera as a quaternion.
+                R = np.array([
+                    [1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qz * qw), 2 * (qx * qz + qy * qw)],
+                    [2 * (qx * qy + qz * qw), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qx * qw)],
+                    [2 * (qx * qz - qy * qw), 2 * (qy * qz + qx * qw), 1 - 2 * (qx * qx + qy * qy)],
+                ])
+                out.append((t[9], R, np.array([tx, ty, tz])))
+            expect_pose = False
+        else:
+            expect_pose = True  # the points2D line
+    return out
+
+
+# ----------------------------------------------------------------- geometry helpers
+def load_mesh(path):
+    m = o3d.io.read_triangle_mesh(os.path.expanduser(path))
+    if len(m.triangles) == 0:
+        sys.exit(f"[abort] no triangles in {path}")
+    m.compute_vertex_normals()
+    return m
+
+
+def look_at(eye, target, up=(0, 0, 1)):
+    """World->camera extrinsic (4x4) for a camera at `eye` pointing at `target`."""
+    f = np.asarray(target, float) - np.asarray(eye, float)
+    n = np.linalg.norm(f)
+    if n < 1e-9:
+        sys.exit("[abort] camera and target coincide")
+    f /= n
+    up = np.asarray(up, float)
+    if abs(float(np.dot(f, up / np.linalg.norm(up)))) > 0.999:
+        up = np.array([0.0, 1.0, 0.0])  # looking straight along up; pick another
+    s = np.cross(f, up); s /= np.linalg.norm(s)
+    u = np.cross(s, f)
+    R = np.stack([s, -u, f])          # camera looks down +z, y down (open3d convention)
+    E = np.eye(4)
+    E[:3, :3] = R
+    E[:3, 3] = -R @ np.asarray(eye, float)
+    return E
+
+
+def render(scene, K, E, w, h, up_world):
+    """Lambertian grey image of whatever the rays hit. Background stays white."""
+    rays = o3d.t.geometry.RaycastingScene.create_rays_pinhole(
+        intrinsic_matrix=o3d.core.Tensor(K, dtype=o3d.core.Dtype.Float64),
+        extrinsic_matrix=o3d.core.Tensor(E, dtype=o3d.core.Dtype.Float64),
+        width_px=w, height_px=h)
+    ans = scene.cast_rays(rays)
+    hit = ans["t_hit"].numpy()
+    nrm = ans["primitive_normals"].numpy()
+    img = np.ones((h, w, 3), np.float32)
+    m = np.isfinite(hit)
+    if m.any():
+        # Two lights so a surface facing away from the key light is shaded, not black --
+        # a single headlight makes the added back surface read as a hole.
+        L1 = np.array([0.3, 0.4, 0.85]); L1 /= np.linalg.norm(L1)
+        L2 = np.array([-0.6, -0.2, 0.4]); L2 /= np.linalg.norm(L2)
+        n = nrm[m]
+        n = n / (np.linalg.norm(n, axis=1, keepdims=True) + 1e-9)
+        lam = 0.55 * np.abs(n @ L1) + 0.30 * np.abs(n @ L2) + 0.15
+        img[m] = np.clip(lam, 0, 1)[:, None]
+    return img
+
+
+def strip(panels, pad=8):
+    """Lay images out left to right with white gutters."""
+    h = max(p.shape[0] for p in panels)
+    w = sum(p.shape[1] for p in panels) + pad * (len(panels) - 1)
+    out = np.ones((h, w, 3), np.float32)
+    x = 0
+    for p in panels:
+        out[:p.shape[0], x:x + p.shape[1]] = p
+        x += p.shape[1] + pad
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--recon", required=True, help="side A: observation only (fuse_post.ply)")
+    ap.add_argument("--recon2", required=True, help="side B: fused (fused_<RUN>_post.ply)")
+    ap.add_argument("--gt", default="", help="optional GT mesh, drawn as a third row")
+    ap.add_argument("--gt_ids", default="",
+                    help="object_id values to keep from --gt, comma separated. Without this "
+                         "the whole scene mesh is drawn, which is never what you want")
+    ap.add_argument("--colmap", default="",
+                    help="sparse/0 with images.txt; the front view is taken from the "
+                         "trajectory camera that sees A best")
+    ap.add_argument("--out", required=True, help="output PNG")
+    ap.add_argument("--tag", default="", help="printed to stdout with the numbers")
+    ap.add_argument("--size", type=int, default=640, help="pixels per panel")
+    ap.add_argument("--views", type=int, default=2,
+                    help="azimuths, evenly spaced from the front. 2 = front and back")
+    ap.add_argument("--elev", type=float, default=15.0, help="camera elevation, degrees")
+    ap.add_argument("--fit", type=float, default=1.5,
+                    help="camera distance as a multiple of the object radius")
+    args = ap.parse_args()
+
+    A, B = load_mesh(args.recon), load_mesh(args.recon2)
+
+    # One frame for both sides: the camera is placed from A and B together, so the same
+    # object does not change apparent size between panels.
+    pts = np.vstack([np.asarray(A.vertices), np.asarray(B.vertices)])
+    ctr = 0.5 * (pts.min(0) + pts.max(0))
+    radius = float(np.linalg.norm(pts.max(0) - pts.min(0))) * 0.5
+    dist = max(radius * args.fit, 1e-3)
+
+    # Up is whichever world axis the object is thinnest in... no: up is the axis the scene
+    # stands in, and for Replica that is +z. Deriving it from the object would tilt every
+    # panel differently.
+    up = np.array([0.0, 0.0, 1.0])
+
+    front = np.array([1.0, 0.0, 0.0])
+    if args.colmap:
+        cams = read_colmap_images(args.colmap)
+        if not cams:
+            print(f"[warn] no images.txt under {args.colmap}; using world +X as front")
+        else:
+            sc = o3d.t.geometry.RaycastingScene()
+            sc.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(A))
+            best, best_hits = None, -1
+            K_probe = np.array([[160, 0, 80], [0, 160, 80], [0, 0, 1]], float)
+            for name, R, t in cams[::max(1, len(cams) // 120)]:
+                E = np.eye(4); E[:3, :3] = R; E[:3, 3] = t
+                cam_pos = -R.T @ t
+                if np.linalg.norm(cam_pos - ctr) > radius * 12:
+                    continue
+                img = render(sc, K_probe, E, 160, 160, up)
+                hits = int((img[:, :, 0] < 0.999).sum())
+                if hits > best_hits:
+                    best_hits, best = hits, cam_pos
+            if best is not None and best_hits > 0:
+                d = best - ctr
+                d[2] = 0.0
+                if np.linalg.norm(d) > 1e-6:
+                    front = d / np.linalg.norm(d)
+                print(f"[view] front taken from the trajectory camera with {best_hits} hits")
+
+    S = args.size
+    f = S * 1.1
+    K = np.array([[f, 0, S / 2.0], [0, f, S / 2.0], [0, 0, 1]], float)
+
+    rows, labels = [], []
+    meshes = [("A: observation only", A), ("B: fused", B)]
+
+    if args.gt:
+        gt = load_mesh(args.gt)
+        if args.gt_ids:
+            keep = {int(x) for x in args.gt_ids.replace(",", " ").split()}
+            import plyfile
+            p = plyfile.PlyData.read(os.path.expanduser(args.gt))
+            fe = p["face"]
+            key = "vertex_indices" if "vertex_indices" in fe.data.dtype.names else "vertex_index"
+            V = np.stack([p["vertex"][k] for k in ("x", "y", "z")], 1).astype(np.float64)
+            T = []
+            for face, oid in zip(fe[key], fe["object_id"]):
+                if int(oid) in keep:
+                    for k in range(1, len(face) - 1):
+                        T.append((face[0], face[k], face[k + 1]))
+            if not T:
+                sys.exit(f"[abort] no GT faces with object_id in {sorted(keep)}")
+            gt = o3d.geometry.TriangleMesh(
+                o3d.utility.Vector3dVector(V),
+                o3d.utility.Vector3iVector(np.asarray(T, np.int32)))
+            gt.compute_vertex_normals()
+        else:
+            print("[warn] --gt without --gt_ids draws the whole scene mesh")
+        meshes.insert(0, ("GT", gt))
+
+    az0 = np.arctan2(front[1], front[0])
+    el = np.radians(args.elev)
+    for label, mesh in meshes:
+        sc = o3d.t.geometry.RaycastingScene()
+        sc.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(mesh))
+        panels = []
+        for i in range(args.views):
+            az = az0 + 2 * np.pi * i / args.views
+            eye = ctr + dist * np.array([np.cos(az) * np.cos(el),
+                                         np.sin(az) * np.cos(el),
+                                         np.sin(el)])
+            panels.append(render(sc, K, look_at(eye, ctr, up), S, S, up))
+        rows.append(strip(panels))
+        labels.append(label)
+
+    w = max(r.shape[1] for r in rows)
+    grid = np.ones((sum(r.shape[0] for r in rows) + 8 * (len(rows) - 1), w, 3), np.float32)
+    y = 0
+    for r in rows:
+        grid[y:y + r.shape[0], :r.shape[1]] = r
+        y += r.shape[0] + 8
+
+    out = os.path.expanduser(args.out)
+    os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+    o3d.io.write_image(out, o3d.geometry.Image((grid * 255).astype(np.uint8)))
+
+    print(f"[out] {out}")
+    print(f"      rows top to bottom: {', '.join(labels)}")
+    print(f"      columns: view 1 = front (observed), "
+          f"{'view 2 = back (unobserved)' if args.views == 2 else f'{args.views} azimuths'}")
+    if args.tag:
+        print(f"      {args.tag}")
+
+
+if __name__ == "__main__":
+    main()
