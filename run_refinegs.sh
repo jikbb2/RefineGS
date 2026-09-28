@@ -46,12 +46,17 @@ shopt -s nullglob
 # ---------------------------------------------------------------- arguments
 # Parsed before anything else, because a VAR=value argument must reach the ${VAR:-default}
 # lines below as if it had been exported. A bare first word is the scene name.
+#
+# CLI_SET records which names this command line set explicitly. That distinction is what
+# separates an intentional override from a value left over in the shell, and the scene-name
+# block below needs it: see the [env override] comment there.
 SCENE_NAME=""
 DRY=0
+declare -A CLI_SET=()
 for a in "$@"; do
   case "${a}" in
     --dry)        DRY=1 ;;
-    [A-Za-z_]*=*) export "${a?}" ;;
+    [A-Za-z_]*=*) export "${a?}"; CLI_SET[${a%%=*}]=1 ;;
     -*)           echo "[abort] unknown flag ${a}"; exit 1 ;;
     *)  [ -z "${SCENE_NAME}" ] || { echo "[abort] two scene names: ${SCENE_NAME} and ${a}"; exit 1; }
         SCENE_NAME=${a} ;;
@@ -78,14 +83,39 @@ if [ -n "${SCENE_NAME}" ]; then
   for cand in "${DL}/${V1_NAME}/habitat" "$HOME/${V1_NAME}/habitat" "${NICE}/${SCENE_NAME}/habitat"; do
     [ -f "${cand}/mesh_semantic.ply" ] && { HAB=${cand}; break; }
   done
-  REPLICA_SCENE=${REPLICA_SCENE:-${NICE}/${SCENE_NAME}}
-  SCENE=${SCENE:-replica_${SCENE_NAME}_v2}
-  TRAJ=${TRAJ:-${NICE}/${SCENE_NAME}/traj.txt}
-  GTD=${GTD:-${NICE}/${SCENE_NAME}/results}
-  GT_MESH=${GT_MESH:-${HAB}/mesh_semantic.ply}
-  GT_INFO=${GT_INFO:-${HAB}/info_semantic.json}
+  # A scene name is authoritative, and `${VAR:-derived}` is not: a value still exported in
+  # the shell wins over it silently. Measured 0928, that produced a run whose manifest read
+  # `scene_name room2` and `scene replica_room1_v2` at the same time -- SCENE, TRAJ, GTD,
+  # GT_MESH and GT_INFO were all left over from an earlier room1 session, every one of those
+  # paths exists, so the preflight printed four `ok` lines and the probe rebuilt room1's
+  # object 14 under room2's name. Only `habitat` disagreed, because it is the one value
+  # recomputed from the name every time.
+  #
+  # So: recompute from the name, ignore the environment, and say so. An explicit VAR=value
+  # on THIS command line is a deliberate override and still wins.
+  set_scene() {                        # set_scene VAR VALUE
+    local v=$1 val=$2 cur=${!1:-}
+    [ -n "${CLI_SET[$v]:-}" ] && return 0
+    [ -n "${cur}" ] && [ "${cur}" != "${val}" ] \
+      && echo "  [env override] ${v}=${cur}" && echo "                 -> ${val}   (shell value ignored)"
+    export "${v}=${val}"
+  }
+  set_scene REPLICA_SCENE "${NICE}/${SCENE_NAME}"
+  set_scene SCENE         "replica_${SCENE_NAME}_v2"
+  set_scene TRAJ          "${NICE}/${SCENE_NAME}/traj.txt"
+  set_scene GTD           "${NICE}/${SCENE_NAME}/results"
+  set_scene GT_MESH       "${HAB}/mesh_semantic.ply"
+  set_scene GT_INFO       "${HAB}/info_semantic.json"
+  # Everything here derives from SCENE, so an inherited value pins one room's outputs onto
+  # another room's name just as effectively. Clear them and let the defaults recompute.
+  for v in DATA IMAGES MASKS LABEL_DIR COLMAP OBJ VOTE SCENE_MODEL PRIOR PKL_SUBDIR \
+           RUNDIR CSV CARVE_DEPTH RELABEL AMODAL; do
+    [ -n "${CLI_SET[$v]:-}" ] && continue
+    [ -n "${!v:-}" ] && echo "  [env override] ${v} cleared, recomputed from ${SCENE}"
+    unset "${v}"
+  done
 else
-  HAB=""; REPLICA_SCENE=${REPLICA_SCENE:-}
+  HAB=""; V1_NAME=""; REPLICA_SCENE=${REPLICA_SCENE:-}
 fi
 
 # ---------------------------------------------------------------- identity
@@ -119,6 +149,20 @@ GTD=${GTD:-/home/elicer/nice-slam/Datasets/Replica/room0/results}
 GT_MESH=${GT_MESH:-$HOME/room_0/habitat/mesh_semantic.ply}
 GT_INFO=${GT_INFO:-$HOME/room_0/habitat/info_semantic.json}
 TRAJ=${TRAJ:-$HOME/room_0/imap/00/traj_w_c.txt}
+
+# Last line of defence on the failure above: every one of these paths existed, so checking
+# that a file is there proves nothing. Check that it NAMES the room that was asked for.
+# A deliberate override still passes as long as it names the same room.
+if [ -n "${SCENE_NAME}" ]; then
+  bad=0
+  names_it() { case "$1" in *"${SCENE_NAME}"*|*"${V1_NAME}"*) return 0 ;; *) return 1 ;; esac; }
+  names_it "${SCENE}" || { echo "[abort] SCENE=${SCENE} does not name ${SCENE_NAME}"; bad=1; }
+  for pv in TRAJ GTD GT_MESH GT_INFO; do
+    names_it "${!pv}" \
+      || { echo "[abort] ${pv}=${!pv}"; echo "        does not name ${SCENE_NAME} or ${V1_NAME}"; bad=1; }
+  done
+  [ "${bad}" -eq 0 ] || { echo "[abort] a path belongs to a different room than the one asked for."; exit 1; }
+fi
 
 # ---------------------------------------------------------------- outputs
 # PRIOR and PKL_SUBDIR are derived from the pipeline, not chosen per experiment. A field
