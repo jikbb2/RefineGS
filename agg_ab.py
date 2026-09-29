@@ -53,6 +53,21 @@ def main():
     ap.add_argument("--rank", action="store_true",
                     help="also rank the fused objects by how well they would carry a "
                          "qualitative figure")
+    # Two settings of the same pipeline get compared object by object, never by their means.
+    # A mean hides whether one object moved a long way or every object moved a little, and
+    # those are different claims. The cond-filter decision was nearly settled on a 3-object
+    # mean, and 2 of those 3 turned out to have unseen completion near a metre -- objects
+    # where nothing is measurable, contributing noise to an average as though it were
+    # evidence. This prints every object and counts wins, so that cannot happen quietly.
+    ap.add_argument("--vs", default="",
+                    help="another run's results.csv to compare against, object by object. "
+                         "Only the fused side is compared; side A is identical in both "
+                         "unless the mesh stage changed, and that is checked and reported")
+    ap.add_argument("--vs_label", default="", help="name for the --vs run in the header")
+    ap.add_argument("--vs_min_f", type=float, default=0.0,
+                    help="in the --vs table, mark objects whose unseen F@2 is below this in "
+                         "BOTH runs as uninformative and leave them out of the win count. "
+                         "0.10 excludes the runs that never got near the GT surface")
     args = ap.parse_args()
 
     keep = {t.strip() for t in args.only.replace(",", " ").split() if t.strip()}
@@ -124,8 +139,96 @@ def main():
     block([t for t in all_tags if t not in set(through)],
           "fused only (secondary -- the denominator is chosen after the fact)")
 
+    if args.vs:
+        compare(paired, args)
+
     if args.rank:
         rank(paired, through)
+
+
+def read_pairs(path, keep):
+    """The same A/B pairing as main(), reusable for a second CSV."""
+    rows = defaultdict(dict)
+    with open(os.path.expanduser(path)) as fh:
+        for r in csv.DictReader(fh):
+            s = side_of(r.get("mesh", ""))
+            if s is None:
+                continue
+            tag = (r.get("tag") or "").strip()
+            gid = tag[3:] if tag.startswith("obj") else tag
+            if keep and gid not in keep:
+                continue
+            rows[tag][s] = r
+    return {t: v for t, v in rows.items() if "A" in v and "B" in v}
+
+
+def compare(paired, args):
+    """This run's fused side against another run's, one line per object.
+
+    Side A is printed as the floor. An object whose B barely moves off A in either run had
+    nothing to gain from the prior, and an object whose B is far from the GT in both runs was
+    never measurable -- neither says anything about the setting being tested, so both are
+    visible here rather than averaged away.
+    """
+    keep = {t.strip() for t in args.only.replace(",", " ").split() if t.strip()}
+    other = read_pairs(args.vs, keep)
+    if not other:
+        print(f"\n  [vs] no paired objects in {args.vs}")
+        return
+
+    this_name = args.label or os.path.basename(os.path.dirname(args.csv_path))
+    that_name = args.vs_label or os.path.basename(os.path.dirname(args.vs))
+    shared = sorted(set(paired) & set(other), key=lambda t: (len(t), t))
+    if not shared:
+        print(f"\n  [vs] no object appears in both runs")
+        return
+
+    # Side A must be the same mesh in both, or the comparison is measuring the mesh stage.
+    drift = [t for t in shared
+             if abs(float(paired[t]["A"]["unseen_F2.0"]) - float(other[t]["A"]["unseen_F2.0"])) > 1e-9]
+    print(f"\n  === {that_name}  ->  {this_name}   ({len(shared)} objects) ===")
+    if drift:
+        print(f"      WARNING side A differs on {len(drift)} objects "
+              f"({', '.join(drift[:5])}{'...' if len(drift) > 5 else ''}).")
+        print(f"              The two runs do not share an observed surface, so this is not "
+              f"a comparison of the fused side alone.")
+
+    hdr = (f"{'obj':>7}{'A':>9}{that_name[:9]:>11}{this_name[:9]:>11}{'delta':>9}"
+           f"{'comp mm':>10}{'free%':>8}   note")
+    print("  " + hdr)
+    print("  " + "-" * len(hdr))
+    wins = losses = ties = 0
+    skipped = []
+    dsum = 0.0
+    for t in shared:
+        a = float(paired[t]["A"]["unseen_F2.0"])
+        x = float(other[t]["B"]["unseen_F2.0"])
+        y = float(paired[t]["B"]["unseen_F2.0"])
+        cy = float(paired[t]["B"]["unseen_comp"]) - float(other[t]["B"]["unseen_comp"])
+        fy = float(paired[t]["B"]["free_pct"]) - float(other[t]["B"]["free_pct"])
+        note = []
+        if max(x, y) < args.vs_min_f:
+            note.append(f"both below F@2 {args.vs_min_f:g} -- not measurable")
+            skipped.append(t)
+        elif abs(x - a) < 1e-9 and abs(y - a) < 1e-9:
+            note.append("passthrough in both")
+            skipped.append(t)
+        else:
+            dsum += y - x
+            if y > x: wins += 1
+            elif y < x: losses += 1
+            else: ties += 1
+        print(f"  {t:>7}{a:>9.4f}{x:>11.4f}{y:>11.4f}{y - x:>+9.4f}"
+              f"{cy:>+10.1f}{fy:>+8.2f}   {'; '.join(note)}")
+
+    counted = wins + ties + losses
+    print(f"\n      unseen F@2 win/tie/loss over the {counted} measurable objects: "
+          f"{wins}/{ties}/{losses}")
+    if counted:
+        print(f"      mean change on those: {dsum / counted:+.4f}   "
+              f"(comp and free columns are this run minus {that_name}; negative is better)")
+    if skipped:
+        print(f"      left out: {len(skipped)} ({', '.join(skipped)})")
 
 
 def rank(paired, through):

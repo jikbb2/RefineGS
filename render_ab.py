@@ -118,6 +118,81 @@ def load_gt(path, ids):
     return gt
 
 
+def gt_ids_near(path, mesh, tol=0.05, min_frac=0.05, top=10):
+    """Which GT instances this reconstruction actually covers, by nearest-point vote.
+
+    A figure needs the GT instance the object corresponds to, and nothing in the output tree
+    records it: the voted gid is an index into OUR labels, not into Replica's object_id. The
+    numbers were read off by hand for the two objects that got figures, which does not scale
+    and cannot be checked. Here every vertex of `mesh` votes for the GT instance whose
+    surface is nearest, votes further than `tol` are discarded, and the instances above
+    `min_frac` of the surviving vote are returned.
+
+    A reconstruction that spans two GT instances -- a merged label, which this pipeline
+    produces -- shows up as two ids with substantial shares rather than as one id silently
+    chosen, so the vote is printed and not only used.
+    """
+    from plyfile import PlyData
+    p = PlyData.read(os.path.expanduser(path))
+    fe = p["face"]
+    key = "vertex_indices" if "vertex_indices" in fe.data.dtype.names else "vertex_index"
+    V = np.stack([p["vertex"][k] for k in ("x", "y", "z")], 1).astype(np.float64)
+
+    q = np.asarray(mesh.vertices)
+    if len(q) > 20000:                       # the vote is a proportion; 20k resolves it
+        q = q[np.random.default_rng(0).choice(len(q), 20000, replace=False)]
+    pad = tol * 4.0
+    lo, hi = q.min(0) - pad, q.max(0) + pad
+
+    # Distance to the GT SURFACE, not to its vertices. Replica's instance meshes have large
+    # flat triangles -- a tabletop is a handful of them -- so a point sitting in the middle of
+    # one is far from every corner: the vertex version of this test reported "no GT instance
+    # within 50 mm" for a reconstruction lying exactly on the surface.
+    tris, tri_oid = [], []
+    for face, oid in zip(fe[key], fe["object_id"]):
+        idx = np.asarray(face, np.int64)
+        c = V[idx]
+        if (c.max(0) < lo).any() or (c.min(0) > hi).any():
+            continue                          # instance is nowhere near this object
+        for k in range(1, len(idx) - 1):
+            tris.append((idx[0], idx[k], idx[k + 1]))
+            tri_oid.append(int(oid))
+    if not tris:
+        print(f"[gt-auto] no GT face within {pad:.2f} m of the reconstruction")
+        return []
+    tri_oid = np.asarray(tri_oid, np.int64)
+    near = o3d.geometry.TriangleMesh(
+        o3d.utility.Vector3dVector(V),
+        o3d.utility.Vector3iVector(np.asarray(tris, np.int32)))
+    sc = o3d.t.geometry.RaycastingScene()
+    sc.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(near))
+    res = sc.compute_closest_points(o3d.core.Tensor(q.astype(np.float32)))
+    hit = res["points"].numpy().astype(np.float64)
+    prim = res["primitive_ids"].numpy().astype(np.int64)
+    d = np.linalg.norm(hit - q, axis=1)
+
+    ok = d <= tol
+    if not ok.any():
+        print(f"[gt-auto] no vertex within {tol:.3f} m of any GT surface "
+              f"(nearest {d.min() * 1000:.0f} mm) -- the object may be misplaced entirely")
+        return []
+    votes, dist = {}, {}
+    for oid, dd in zip(tri_oid[prim[ok]], d[ok]):
+        votes[int(oid)] = votes.get(int(oid), 0) + 1
+        dist[int(oid)] = dist.get(int(oid), 0.0) + float(dd)
+    n = int(ok.sum())
+    order = sorted(votes, key=lambda o: -votes[o])
+    print(f"[gt-auto] {n}/{len(q)} vertices within {tol * 1000:.0f} mm of a GT instance")
+    for oid in order[:top]:
+        share = votes[oid] / n
+        print(f"          object_id {oid:>5}  {share * 100:5.1f}%  "
+              f"mean {dist[oid] / votes[oid] * 1000:5.1f} mm"
+              f"{'   <== used' if share >= min_frac else ''}")
+    chosen = [oid for oid in order if votes[oid] / n >= min_frac]
+    print(f"          --gt_ids {','.join(str(o) for o in chosen)}")
+    return chosen
+
+
 def look_at(eye, target, up=(0, 0, 1)):
     """World->camera extrinsic (4x4) for a camera at `eye` pointing at `target`."""
     f = np.asarray(target, float) - np.asarray(eye, float)
@@ -189,6 +264,12 @@ def main():
     ap.add_argument("--gt_ids", default="",
                     help="object_id values to keep from --gt, comma separated. Without this "
                          "the whole scene mesh is drawn, which is never what you want")
+    ap.add_argument("--gt_auto", action="store_true",
+                    help="work out --gt_ids from the first mesh by nearest-point vote, and "
+                         "print the vote. Use when the GT id is not written down anywhere")
+    ap.add_argument("--gt_tol", type=float, default=0.05,
+                    help="--gt_auto: a vertex further than this from every GT instance casts "
+                         "no vote (metres)")
     ap.add_argument("--colmap", default="",
                     help="sparse/0 with images.txt; the front view is taken from the "
                          "trajectory camera that sees A best")
@@ -226,7 +307,14 @@ def main():
 
     rows, labels = [], []
     if args.gt:
-        meshes.insert(0, ("GT", load_gt(args.gt, args.gt_ids)))
+        ids = args.gt_ids
+        if args.gt_auto and not ids:
+            found = gt_ids_near(args.gt, A, tol=args.gt_tol)
+            if not found:
+                sys.exit("[abort] --gt_auto found no GT instance under this reconstruction. "
+                         "Raise --gt_tol, or pass --gt_ids by hand.")
+            ids = ",".join(str(o) for o in found)
+        meshes.insert(0, ("GT", load_gt(args.gt, ids)))
     if args.labels:
         given = [s.strip() for s in args.labels.split(",")]
         if len(given) != len(meshes):
