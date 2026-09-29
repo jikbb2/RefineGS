@@ -175,8 +175,16 @@ def strip(panels, pad=8):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--recon", required=True, help="side A: observation only (fuse_post.ply)")
-    ap.add_argument("--recon2", required=True, help="side B: fused (fused_<RUN>_post.ply)")
+    ap.add_argument("--recon", default="", help="side A: observation only (fuse_post.ply)")
+    ap.add_argument("--recon2", default="", help="side B: fused (fused_<RUN>_post.ply)")
+    # Comparing more than two settings by running this twice does not work: the camera is
+    # fitted to the meshes of ONE call, so two output images have different framing and the
+    # reader cannot tell a real difference from a different distance. Every mesh that will be
+    # compared has to be drawn in the same call, through the same camera.
+    ap.add_argument("--recons", default="",
+                    help="two or more meshes to draw as rows, comma or space separated, "
+                         "in place of --recon/--recon2. The FIRST one defines the front view "
+                         "and should be side A. Row labels default to the file names")
     ap.add_argument("--gt", default="", help="optional GT mesh, drawn as a third row")
     ap.add_argument("--gt_ids", default="",
                     help="object_id values to keep from --gt, comma separated. Without this "
@@ -201,10 +209,22 @@ def main():
                     help="camera distance as a multiple of the object radius")
     args = ap.parse_args()
 
-    A, B = load_mesh(args.recon), load_mesh(args.recon2)
+    if args.recons:
+        paths = [s.strip() for s in args.recons.replace(",", " ").split() if s.strip()]
+        if len(paths) < 2:
+            sys.exit("[abort] --recons needs at least two meshes")
+        meshes = [(os.path.basename(p), load_mesh(p)) for p in paths]
+    else:
+        if not (args.recon and args.recon2):
+            sys.exit("[abort] pass --recon and --recon2, or --recons with a list of meshes")
+        meshes = [("A: observation only", load_mesh(args.recon)),
+                  ("B: fused", load_mesh(args.recon2))]
+
+    # The front view is chosen from whatever the first row is, which is why --recons asks for
+    # side A first: "front" has to mean the direction the cameras actually observed.
+    A = meshes[0][1]
 
     rows, labels = [], []
-    meshes = [("A: observation only", A), ("B: fused", B)]
     if args.gt:
         meshes.insert(0, ("GT", load_gt(args.gt, args.gt_ids)))
     if args.labels:
