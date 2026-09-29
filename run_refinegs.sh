@@ -736,6 +736,17 @@ fi
 # ---------------------------------------------------------------- cond
 if want cond; then
   say "cond: conditioning surface (${COND_NAME})"
+  # Side A is evidence: it is the observed surface every reported number is measured against,
+  # and this stage would rebuild it under COND_ARGS. If the conditioning surface is meant to
+  # BE side A, say so with COND_ARGS="${MESH_ARGS}" and leave COND_NAME alone -- the two files
+  # then hold the same geometry and A stays recoverable on its own terms.
+  case "${COND_NAME}" in
+    fuse_post.ply|fuse.ply)
+      echo "[abort] COND_NAME=${COND_NAME} would overwrite side A with COND_ARGS."
+      echo "        For a conditioning surface identical to A, use:"
+      echo "          COND_NAME=tsdf_clean.ply COND_ARGS=\"\${MESH_ARGS}\""
+      exit 1 ;;
+  esac
   # NOT the surface we report. fuse_post.ply keeps the rough band where observation runs
   # out; it sits ON the surface, so make_shaper_input.py's free-space filter passes it and
   # ShapeR anchors to it. Filtering it out moved obj6 unseen F@2 0.5942 -> 0.6382.
