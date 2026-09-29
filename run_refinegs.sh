@@ -29,6 +29,7 @@
 #   pkl      ShapeR input                                run_field_fusion_batch.sh
 #   field    ShapeR signed SDF grid                      run_field_fusion_batch.sh [shaper env]
 #   fuse     grid fusion + evaluation           (side B) run_field_fusion_batch.sh
+#   eval     re-evaluate the fused meshes, nothing else run_field_fusion_batch.sh
 #
 # Why this file exists: the same run used to be three drivers and three manual steps, and
 # each boundary lost something -- the conditioning surface, the RUN tag, the pose set, the
@@ -298,7 +299,7 @@ cd "${ROOT}" || exit 1
 mkdir -p "${RUNDIR}" "${PRIOR}"
 
 # ---------------------------------------------------------------- helpers
-ORDER="stage0 colmap relabel masks labels train carve objects name mesh cond pkl field fuse"
+ORDER="stage0 colmap relabel masks labels train carve objects name mesh cond pkl field fuse eval"
 idx_of() { local i=0 s; for s in ${ORDER}; do i=$((i+1)); [ "$s" = "$1" ] && { echo "$i"; return; }; done; echo 0; }
 I_FROM=$(idx_of "${FROM}"); I_TO=$(idx_of "${TO}")
 [ "${I_FROM}" -gt 0 ] && [ "${I_TO}" -gt 0 ] || { echo "[abort] FROM/TO must be one of: ${ORDER}"; exit 1; }
@@ -478,6 +479,7 @@ if [ "${CLEAN}" = "1" ]; then
   # Fused meshes and the CSV carry ${RUN}: CLEAN removes inputs to redo, never evidence
   # for numbers already reported.
   at_or_after fuse    && retire "${OBJ}"/*/train/ours_"${ITER}"/fused_"${RUN}"*.ply
+  # eval produces only the CSV, which carries ${RUN} and is evidence: never retired.
   [ -d "${TRASH}" ] && echo "  -> ${TRASH}   (restore by moving back; '__' was '/')"
 fi
 
@@ -791,7 +793,10 @@ if want cond; then
 fi
 
 # ---------------------------------------------------------------- pkl / field / fuse
-for ph in pkl field fuse; do
+# eval is a phase of its own, not part of fuse, because the GT-instance matching changed
+# twice in one day and each change meant re-reading numbers off meshes that were already
+# correct. PHASE=eval reuses the fused mesh and rewrites only the CSV.
+for ph in pkl field fuse eval; do
   want "${ph}" || continue
   say "${ph}"
   # RECON_NAME is what makes the cond stage count: without it the batch script falls back

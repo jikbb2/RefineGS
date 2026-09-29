@@ -7,7 +7,11 @@
 #   fuse  : sdf_distill_depth.py --prior_field + eval_seen_unseen.py  (env: split_and_splat)
 #
 # The two envs are why this runs in phases:
-#   PHASE=pkl|field|fuse|all  bash run_field_fusion_batch.sh
+#   PHASE=pkl|field|fuse|eval|all  bash run_field_fusion_batch.sh
+#
+#   PHASE=eval re-runs ONLY eval_seen_unseen.py on the fused meshes already on disk. The
+#   ShapeR field and the fusion are the expensive parts and neither depends on how the GT
+#   instance is matched, so a change to the matching costs minutes per scene, not hours.
 # SHAPER_DIRECT=1 runs the field phase in the current env instead of via conda.
 #
 # Fusion parameters are NOT set here. They are defaults in sdf_distill_depth.py and are
@@ -93,7 +97,12 @@ FUSE_NAME=${FUSE_NAME:-fused_${RUN}}
 # object spans several (obj1: id9 81% plus four ids at ~5%). At the old 0.10 threshold the
 # 5% ones all dropped out, under-matching the GT and inflating baseline seen acc from
 # 4.64mm to 26mm.
-MATCH_MIN_SHARE=${MATCH_MIN_SHARE:-0.03}
+# 0.10, which is what eval_seen_unseen.py documents as its own default. It was overridden
+# to 0.03 here with no note, and that is half of how the GT ended up containing neighbouring
+# instances: a label holding 3% of the vote was unioned in, and the bbox-gap guard meant to
+# catch that reports 0mm for anything the object touches. The other half is fixed in
+# eval_seen_unseen.py, which now also requires that we reconstructed most of the instance.
+MATCH_MIN_SHARE=${MATCH_MIN_SHARE:-0.10}
 
 # The fuse phase resets the CSV, so an ONLY= run would replace the full-batch results
 # with its handful of rows. Subsets get their own file.
@@ -275,8 +284,10 @@ if [ "${PHASE}" = "field" ] || [ "${PHASE}" = "all" ]; then
 fi
 
 # ---------------- fuse + eval ----------------
-if [ "${PHASE}" = "fuse" ] || [ "${PHASE}" = "all" ]; then
-  echo "=== [3/3] fusion + seen/unseen evaluation ==="
+if [ "${PHASE}" = "fuse" ] || [ "${PHASE}" = "eval" ] || [ "${PHASE}" = "all" ]; then
+  EVAL_ONLY=0; [ "${PHASE}" = "eval" ] && EVAL_ONLY=1
+  echo "=== [3/3] $([ "${EVAL_ONLY}" = 1 ] && echo "re-evaluation only (fused meshes reused)" \
+                                          || echo "fusion + seen/unseen evaluation") ==="
   # One reference, named in the log. sdf_distill_depth.py also auto-fills a default GT
   # depth dir when none is given, so the GT flag has to be absent, not merely unused.
   if [ -n "${CARVE_DEPTH}" ]; then
@@ -292,15 +303,24 @@ if [ "${PHASE}" = "fuse" ] || [ "${PHASE}" = "all" ]; then
     MDIR=${OUT}/${gid}; OUTD=${MDIR}/train/ours_${ITER}
     NPZ=${PRIOR}/obj${gid}_field.npz
     STEMS=${STEMS_DIR}/${gid}.txt
-    [ -f "${NPZ}" ] || { echo "  [${gid}] no field"; note_fail "${gid}" fuse "no field";
-                         ng=$((ng+1)); continue; }
-    run_progress "${LOGDIR}/fuse_${gid}.log" "[${gid}] $(name_of "${gid}")" \
-      python sdf_distill_depth.py -m "${MDIR}" --iteration ${ITER} \
-      --prior_field "${NPZ}" ${DEPTH_ARGS} \
-      --passthrough_mesh "${OUTD}/fuse_post.ply" \
-      --out "${OUTD}/${FUSE_NAME}.ply" ${FUSE_EXTRA} \
-      || { note_fail "${gid}" fuse "sdf_distill";
-           show_tail "${LOGDIR}/fuse_${gid}.log" 20; ng=$((ng+1)); continue; }
+    if [ "${EVAL_ONLY}" = 1 ]; then
+      # No field and no fusion: the mesh being evaluated is the one already written under
+      # this RUN, so the numbers change only because the evaluation changed.
+      [ -f "${OUTD}/${FUSE_NAME}_post.ply" ] \
+        || { echo "  [${gid}] no ${FUSE_NAME}_post.ply -- run PHASE=fuse for this RUN first";
+             note_fail "${gid}" eval "no fused mesh"; ng=$((ng+1)); continue; }
+      echo "  [${gid}] $(name_of "${gid}") -- re-evaluating"
+    else
+      [ -f "${NPZ}" ] || { echo "  [${gid}] no field"; note_fail "${gid}" fuse "no field";
+                           ng=$((ng+1)); continue; }
+      run_progress "${LOGDIR}/fuse_${gid}.log" "[${gid}] $(name_of "${gid}")" \
+        python sdf_distill_depth.py -m "${MDIR}" --iteration ${ITER} \
+        --prior_field "${NPZ}" ${DEPTH_ARGS} \
+        --passthrough_mesh "${OUTD}/fuse_post.ply" \
+        --out "${OUTD}/${FUSE_NAME}.ply" ${FUSE_EXTRA} \
+        || { note_fail "${gid}" fuse "sdf_distill";
+             show_tail "${LOGDIR}/fuse_${gid}.log" 20; ng=$((ng+1)); continue; }
+    fi
     python eval_seen_unseen.py --gt_mesh "${GT_MESH}" \
       --recon "${OUTD}/fuse_post.ply" --recon2 "${OUTD}/${FUSE_NAME}_post.ply" \
       --colmap "${COLMAP}" --gid "${gid}" --masks_root "${MASKS}" --use_mask \
@@ -328,7 +348,7 @@ if [ -f "${CSV}" ]; then
   echo ""
   # In a phase that did not fuse, this table is the PREVIOUS run's CSV. We once ran
   # PHASE=pkl three times and read identical numbers before noticing.
-  if [ "${PHASE}" != "fuse" ] && [ "${PHASE}" != "all" ]; then
+  if [ "${PHASE}" != "fuse" ] && [ "${PHASE}" != "eval" ] && [ "${PHASE}" != "all" ]; then
     echo "WARN PHASE=${PHASE} did not fuse or evaluate."
     echo "     The table below is the previous run ($(date -r "${CSV}" '+%m-%d %H:%M'))."
   fi

@@ -130,7 +130,7 @@ def _aabb_gap(a, b):
 
 
 def auto_match_labels(V, T, L, ref_pts, min_share=0.10, n=300000, max_dist=0.05,
-                      max_gap=0.15):
+                      max_gap=0.15, min_cover=0.30):
     """recon 과 겹치는 object_id 집합을 투표로 선택.
 
     SAM3 인스턴스는 데이터셋 semantic id 와 1:1 이 아니다(한 인스턴스가 여러 GT 객체를
@@ -168,17 +168,43 @@ def auto_match_labels(V, T, L, ref_pts, min_share=0.10, n=300000, max_dist=0.05,
     # So a non-dominant label is accepted only if its own box touches the reconstruction's.
     # Unobserved parts of the SAME object stay inside that box, so this does not penalise
     # the very geometry the method is meant to complete.
+    # The bbox test cannot do its job for objects that TOUCH. Measured 0929 on room0: every
+    # non-dominant label on every object reported a 0mm gap, because a cushion sits on a sofa
+    # and a lamp sits on a table -- so a label our reconstruction merely leaked 5% of its
+    # points onto was unioned into the GT exactly like a genuine part. The consequence is not
+    # subtle: unseen completion tracked the number of unioned labels almost perfectly --
+    # obj6 [11] 25mm, obj18 [71,9] 1040mm, obj15 [5,13,77] 790mm, obj20 [27,7,60,20,25]
+    # 2634mm. GT->recon was reporting the distance from a NEIGHBOUR's surface to our object.
+    #
+    # Coverage is the test the gap was standing in for, and it runs the other way round. The
+    # vote asks "where do OUR points land"; this asks "how much of THAT instance did we
+    # reconstruct". A GT part we genuinely recovered is mostly covered by us; a neighbour we
+    # brushed against is not, however firmly the two boxes touch. An unobserved part of the
+    # same object is NOT penalised: coverage is measured against the reconstruction we are
+    # about to evaluate, and side A already spans the object's observed extent.
+    rtree = cKDTree(ref_pts)
     rb = _aabb(ref_pts)
     sel, dropped, cov = [], [], 0.0
-    print(f"{'  label':>8}{'share':>8}{'bbox gap':>10}   verdict")
+    print(f"{'  label':>8}{'share':>8}{'bbox gap':>10}{'covered':>10}   verdict")
     for i in order:
         if share[i] < min_share:
             continue
         lid = int(vals[i])
-        gap = _aabb_gap(_aabb(P[lab == lid]), rb)
-        take = (not sel) or gap <= max_gap            # the top label is always kept
-        print(f"  id{lid:<5}{share[i]*100:7.1f}%{gap*1000:9.0f}mm   "
-              + ("accept" if take else f"DROP (> {max_gap*1000:.0f}mm away)"))
+        lp = P[lab == lid]
+        gap = _aabb_gap(_aabb(lp), rb)
+        dc, _ = rtree.query(lp, workers=-1)
+        cover = float((dc <= max_dist).mean())
+        why = ""
+        if not sel:
+            take = True                               # the top label is always kept
+        elif gap > max_gap:
+            take, why = False, f"DROP (> {max_gap*1000:.0f}mm away)"
+        elif cover < min_cover:
+            take, why = False, f"DROP (only {cover*100:.0f}% of it reconstructed)"
+        else:
+            take = True
+        print(f"  id{lid:<5}{share[i]*100:7.1f}%{gap*1000:9.0f}mm{cover*100:9.1f}%   "
+              + (why or "accept"))
         (sel if take else dropped).append(lid)
         if take:
             cov += float(share[i])
@@ -519,6 +545,12 @@ def main():
                          "득표가 나온다(obj21 실측). 판정에 쓰지 말고 경고로만 본다")
     ap.add_argument("--match_min_share", type=float, default=0.10,
                     help="자동 매칭 시 채택할 라벨의 최소 득표 비율")
+    ap.add_argument("--match_min_cover", type=float, default=0.30,
+                    help="비1순위 라벨을 받아들이려면 그 GT 인스턴스 표면의 이 비율 이상이 "
+                         "재구성에서 --match_max_dist 안에 있어야 한다. bbox 간격만으로는 "
+                         "맞닿은 이웃(소파 위 쿠션)을 걸러낼 수 없다 — 실측 0929, room0 의 "
+                         "모든 비1순위 라벨이 간격 0mm 로 채택되어 GT 가 이웃까지 포함했고 "
+                         "unseen completion 이 라벨 개수를 따라 25/790/1040/2634mm 로 커졌다")
     ap.add_argument("--match_max_gap", type=float, default=0.15,
                     help="비1순위 라벨을 받아들일 최대 bbox 간격(m). 득표율만으로는 'GT가 "
                          "여러 id로 쪼개진 것'과 '우리 인스턴스가 옆 물체로 샌 것'을 "
@@ -597,7 +629,8 @@ def main():
             ref, _ = sample(args.recon, min(args.n_sample, 100000), args.seed)
             labs = auto_match_labels(V, T, L, ref, args.match_min_share,
                                      max_dist=args.match_max_dist,
-                                     max_gap=args.match_max_gap)
+                                     max_gap=args.match_max_gap,
+                                     min_cover=args.match_min_cover)
         sel = np.isin(L, labs)
         assert sel.any(), f"object_id={labs} 인 면이 없음"
         T = T[sel]
