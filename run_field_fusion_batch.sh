@@ -297,7 +297,14 @@ if [ "${PHASE}" = "fuse" ] || [ "${PHASE}" = "eval" ] || [ "${PHASE}" = "all" ];
     DEPTH_ARGS="--gt_depth_dir ${GTD}"
   fi
   echo "  free-space reference: ${DEPTH_ARGS}"
-  rm -f "${CSV}"
+  # Retire, do not delete. PHASE=eval rewrites this file from meshes that did not change,
+  # so the previous CSV is the only record of what the previous evaluation said -- and the
+  # evaluation is exactly the thing that has been changing. Deleting it makes "the numbers
+  # moved" unverifiable after the fact.
+  if [ -f "${CSV}" ]; then
+    _old=${CSV%.csv}_$(date +%m%d_%H%M%S).csv
+    mv "${CSV}" "${_old}" && echo "  previous results kept at $(basename "${_old}")"
+  fi
   ok=0; ng=0
   for gid in "${gids[@]}"; do
     MDIR=${OUT}/${gid}; OUTD=${MDIR}/train/ours_${ITER}
