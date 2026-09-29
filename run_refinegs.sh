@@ -364,6 +364,14 @@ say() { echo ""; echo "=== $* ==="; }
 # ---------------------------------------------------------------- preflight
 GITREV=$(git -C "${ROOT}" rev-parse --short HEAD 2>/dev/null || echo "no-git")
 MANIFEST=${RUNDIR}/manifest.txt
+# Re-entering an existing RUN (a FROM=eval pass over meshes already produced) would otherwise
+# overwrite that run's manifest with this pass's, erasing the stage span, the date and the
+# ONLY list -- which is exactly the record used to decide the run was a valid baseline in the
+# first place. Keep it, the way the batch script keeps a superseded results.csv.
+if [ -f "${MANIFEST}" ]; then
+  _oldman=${MANIFEST%.txt}_$(date +%m%d_%H%M%S).txt
+  cp "${MANIFEST}" "${_oldman}" && echo "  previous manifest kept at $(basename "${_oldman}")"
+fi
 {
   echo "run           ${RUN}            $(date '+%F %T')"
   echo "git           ${GITREV}"
