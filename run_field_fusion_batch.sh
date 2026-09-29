@@ -187,9 +187,17 @@ if [ "${PHASE}" = "pkl" ] || [ "${PHASE}" = "all" ]; then
     RECON=${OUT}/${gid}/train/ours_${ITER}/${RECON_NAME}
     STEMS=${STEMS_DIR}/${gid}.txt
     # Rebuilding the pkl makes it newer than the npz, and the stale guard then regenerates
-    # the field -- the most expensive stage. Rebuild only when the generator has changed.
+    # the field -- the most expensive stage. Rebuild only when the generator has changed,
+    # OR when the conditioning surface it reads has.
+    #
+    # That second test was missing until 0929, and the gap is not theoretical: the driver's
+    # COND_ARGS decides what ${RECON_NAME} contains, changing it correctly rebuilt that mesh,
+    # and this guard then reused a pkl built from the PREVIOUS conditioning surface, so the
+    # field, the fusion and every reported number still answered the old question. Nothing
+    # printed a warning -- "pkl up to date" was the only sign.
     if [ "${PKL_FORCE}" = "0" ] && [ -f "${PKL_DIR}/obj${gid}.pkl" ] \
-       && [ "${PKL_DIR}/obj${gid}.pkl" -nt make_shaper_input.py ]; then
+       && [ "${PKL_DIR}/obj${gid}.pkl" -nt make_shaper_input.py ] \
+       && [ -f "${RECON}" ] && [ "${PKL_DIR}/obj${gid}.pkl" -nt "${RECON}" ]; then
       echo "  [${gid}] pkl up to date (PKL_FORCE=1 to rebuild)"; continue
     fi
     # These stems come from the per-object pipeline. If its gid numbering differs from

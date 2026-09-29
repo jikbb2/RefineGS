@@ -244,18 +244,36 @@ COND_NAME=${COND_NAME:-tsdf_clean.ply}
 # seen accuracy 3.60 -> 4.07mm and free 1.2 -> 3.6%. Holes are the worse error here: they
 # move observed surface into the unseen bucket and flatter B's improvement.
 MESH_ARGS=${MESH_ARGS:-"--min_alpha 0.3 --min_cos 0.35 --max_jump 0.05 --erode 0 --num_cluster 0 --min_comp_frac 0.02"}
-# Conditioning, filtered harder on purpose: ShapeR anchors to these points so a ragged
-# boundary is copied into the prior, and the holes that leaves are what the prior fills.
+# Conditioning. Identical to side A since 0929: the conditioning surface IS the observed
+# surface, and this stage writes a second copy of it under COND_NAME (about 15s per object)
+# so that re-enabling a filter later is one string, not a code change.
 #
-# OPEN DEFECT as of 0929, do not treat this default as settled. It was justified on ONE
-# object (gid6: unseen F@2 0.5942 -> 0.6382) and never checked for how much surface it
-# removes. Measured afterwards against each object's own side A, 45 of 54 conditioning
-# surfaces are smaller in every axis -- room0 23/25, room1 10/14, room2 12/15 -- most at
-# 20-70% of A's extent and the worst four at 4-6%, with centre shifts up to 71mm. ShapeR is
-# therefore conditioned on roughly half of each object, so every unseen gain reported so far
-# is a lower bound. Changing this string does force the cond stage to rebuild (the .cond_config
-# stamp below), but it does NOT invalidate pkl/field/fuse: rerun cond..fuse together.
-COND_ARGS=${COND_ARGS:-"--min_alpha 0.7 --min_cos 0.35 --max_jump 0.02 --erode 3 --num_cluster 0 --min_comp_frac 0.02"}
+# It used to be filtered harder, on the theory that ShapeR anchors to these points so a
+# ragged boundary is copied into the prior. That theory was justified on ONE object (gid6:
+# unseen F@2 0.5942 -> 0.6382) and never checked for what it removed. Measured 0929 against
+# each object's own side A, 45 of 54 conditioning surfaces were smaller in every axis --
+# room0 23/25, room1 10/14, room2 12/15 -- most at 20-70% of A's extent, the worst four at
+# 4-6%, with centre shifts of 130-511mm, i.e. a FRAGMENT of the object rather than a
+# shrunken copy. Object size does not predict it (corr = +0.10 over 54 objects).
+#
+# Decomposed on room2 gid14, as a share of side A's extent:
+#   --erode 3 -> 0      34.7% -> 70.2%      the largest single cause
+#   --max_jump 0.02 -> 0.05                 +14.3 points
+#   --min_alpha 0.7 -> 0.3                  the remaining 16.7
+#   --min_comp_frac                         innocent (4669 -> 4702 verts)
+# The three are near-additive, so there is no single bad constant to fix: the filter's cost
+# and its supposed benefit are the same knob.
+#
+# Settled by running cond..fuse on room0 with four settings (RUN=cond_base/erode0/e0j05/asA,
+# gids 6 15 18 20). Per-object unseen F@2 on the fused side, best setting per object:
+#   gid6   base .6489  erode0 .6209  e0j05 .6275  asA .6618
+#   gid15  base .0343  erode0 .0442  e0j05 .0855  asA .0820
+#   gid18  base .0253  erode0 .0298  e0j05 .0328  asA .0333
+# The old default is LAST on two of the three and loses on gid6 as well -- the object its
+# own justification rests on. Unfiltered wins or ties everywhere and needs no constants.
+# Keep the old string here, as the ablation the paper reports:
+#   "--min_alpha 0.7 --min_cos 0.35 --max_jump 0.02 --erode 3 --num_cluster 0 --min_comp_frac 0.02"
+COND_ARGS=${COND_ARGS:-${MESH_ARGS}}
 POINTS_FROM=${POINTS_FROM:-mesh}
 FUSE_EXTRA=${FUSE_EXTRA:-}
 # One resolution for BOTH pipelines, which is what removes the r1/r2 confound from the
