@@ -340,8 +340,11 @@ if [ "${PHASE}" = "fuse" ] || [ "${PHASE}" = "eval" ] || [ "${PHASE}" = "all" ];
     # A bad GT match makes the metrics meaningless, so keep that line visible.
     # [gt-check] is the line that says whether the carve reference is registered at all,
     # and grid-fuse prints two lines ahead of it -- head -3 used to cut it off.
-    grep -hE "^\[carve-src\]|^\[grid-fuse\] free|^\[gt-check\]" "${LOGDIR}/fuse_${gid}.log" \
-      | head -4 | sed "s/^/    [${gid}] /"
+    # PHASE=eval runs no fusion, so there is no fuse log to quote -- reading it anyway
+    # printed a "No such file" line per object into the log the user actually reads.
+    [ -f "${LOGDIR}/fuse_${gid}.log" ] \
+      && grep -hE "^\[carve-src\]|^\[grid-fuse\] free|^\[gt-check\]" "${LOGDIR}/fuse_${gid}.log" \
+         | head -4 | sed "s/^/    [${gid}] /"
     # the absolute distance matters more than the vote share: a recon 3 m from every GT
     # object still gets a confident-looking 95% match
     grep -hE "auto-match" "${LOGDIR}/eval_${gid}.log" | head -3 | sed "s/^/    [${gid}] /"
