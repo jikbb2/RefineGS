@@ -22,7 +22,8 @@ set -uo pipefail
 shopt -s nullglob
 
 ROOT=${ROOT:-$HOME/RefineGS}
-SCENE=${SCENE:-replica_room0_v2}
+SCENE=${SCENE:-}
+[ -n "${SCENE}" ] || { echo "[abort] SCENE is empty -- set SCENE=<name>"; exit 1; }
 OUT=${OUT:-${ROOT}/output/${SCENE}/refinegs_full}
 ITER=${ITER:-7000}
 PRIOR=${PRIOR:-$HOME/prior}
@@ -45,15 +46,14 @@ MASKS=${MASKS:-${ROOT}/data/${SCENE}/masks}
 # depth and GT mesh. Nothing downstream checks that, and the numbers still look plausible
 # -- the same failure run_scene.sh was written to prevent. Derive both from SCENE and
 # abort when they are missing, instead of falling back to another room's data.
-REPLICA_ROOT=${REPLICA_ROOT:-$HOME/nice-slam/Datasets/Replica}
-REPLICA_DL=${REPLICA_DL:-$HOME/replica_dl}
-_scene=$(echo "${SCENE}" | sed -E 's/^replica_//; s/_v[0-9]+$//')              # room0
-_scene_v1=$(echo "${_scene}" | sed -E 's/^(room|office)([0-9]+)$/\1_\2/')      # room_0
-GTD=${GTD:-${REPLICA_ROOT}/${_scene}/results}
+REPLICA_ROOT=${REPLICA_ROOT:-}
+REPLICA_SEMANTIC=${REPLICA_SEMANTIC:-}
+_scene=$(echo "${SCENE}" | sed -E 's/^replica_//')                            # room0
+_scene_v1=$(echo "${_scene}" | sed -E 's/^(room|office)([0-9]+)$/\1_\2/')     # room_0
+GTD=${GTD:-${REPLICA_ROOT:+${REPLICA_ROOT}/${_scene}/results}}
 GT_MESH=${GT_MESH:-}
-if [ -z "${GT_MESH}" ]; then
-  for _c in "${REPLICA_DL}/${_scene_v1}/habitat" "$HOME/${_scene_v1}/habitat" \
-            "${REPLICA_ROOT}/${_scene}/habitat"; do
+if [ -z "${GT_MESH}" ] && [ -n "${REPLICA_SEMANTIC}" ]; then
+  for _c in "${REPLICA_SEMANTIC}/${_scene_v1}/habitat" "${REPLICA_SEMANTIC}/${_scene}/habitat"; do
     [ -f "${_c}/mesh_semantic.ply" ] && { GT_MESH=${_c}/mesh_semantic.ply; break; }
   done
 fi

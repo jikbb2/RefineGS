@@ -77,17 +77,19 @@ REPLICA_HABITAT=${REPLICA_HABITAT:-}
 
 if [ -n "${SCENE_NAME}" ]; then
   [ -n "${REPLICA_ROOT}" ] || {
-    echo "[abort] a scene name needs REPLICA_ROOT=<path to the Replica dataset>"
-    echo "        e.g. REPLICA_ROOT=~/Replica bash run_refinegs.sh ${SCENE_NAME}"
+    echo "[abort] a scene name needs REPLICA_ROOT=<nice-slam Replica dump>"
+    echo "        e.g. REPLICA_ROOT=\$HOME/nice-slam/Datasets/Replica bash $0 ${SCENE_NAME}"
     exit 1; }
-  # The nice-slam dump names a scene room2; the Replica v1 tarball names it room_2.
-  # Both are checked because they are two real layouts of the same dataset.
+  # nice-slam names a scene room2; the original Replica tarball names it room_2.
   V1_NAME=$(echo "${SCENE_NAME}" | sed -E 's/^(room|office)([0-9]+)$/\1_\2/')
-  HAB=${REPLICA_HABITAT}
-  if [ -z "${HAB}" ]; then
-    for cand in "${REPLICA_ROOT}/${V1_NAME}/habitat" "${REPLICA_ROOT}/${SCENE_NAME}/habitat"; do
+  HAB=""
+  if [ -n "${REPLICA_SEMANTIC}" ]; then
+    for cand in "${REPLICA_SEMANTIC}/${V1_NAME}/habitat" "${REPLICA_SEMANTIC}/${SCENE_NAME}/habitat"; do
       [ -f "${cand}/mesh_semantic.ply" ] && { HAB=${cand}; break; }
     done
+    [ -n "${HAB}" ] || echo "  WARN no habitat/ for ${SCENE_NAME} under ${REPLICA_SEMANTIC}"
+  else
+    echo "  note: REPLICA_SEMANTIC unset -- the name and eval stages will be unavailable"
   fi
   # A scene name is authoritative, and `${VAR:-derived}` is not: a value still exported in
   # the shell wins over it silently. Measured 0928, that produced a run whose manifest read
@@ -106,12 +108,14 @@ if [ -n "${SCENE_NAME}" ]; then
       && echo "  [env override] ${v}=${cur}" && echo "                 -> ${val}   (shell value ignored)"
     export "${v}=${val}"
   }
-  set_scene REPLICA_SCENE "${REPLICA_ROOT}/${SCENE_NAME}"
+    set_scene REPLICA_SCENE "${REPLICA_ROOT}/${SCENE_NAME}"
   set_scene SCENE         "replica_${SCENE_NAME}"
   set_scene TRAJ          "${REPLICA_ROOT}/${SCENE_NAME}/traj.txt"
   set_scene GTD           "${REPLICA_ROOT}/${SCENE_NAME}/results"
-  set_scene GT_MESH       "${HAB}/mesh_semantic.ply"
-  set_scene GT_INFO       "${HAB}/info_semantic.json"
+  # ${HAB:+...} keeps these EMPTY when there is no semantic dataset, instead of building
+  # the string "/mesh_semantic.ply" and failing the room-name check on it.
+  set_scene GT_MESH       "${HAB:+${HAB}/mesh_semantic.ply}"
+  set_scene GT_INFO       "${HAB:+${HAB}/info_semantic.json}"
   # Everything here derives from SCENE, so an inherited value pins one room's outputs onto
   # another room's name just as effectively. Clear them and let the defaults recompute.
   for v in DATA IMAGES MASKS LABEL_DIR COLMAP OBJ VOTE SCENE_MODEL PRIOR PKL_SUBDIR \
@@ -125,7 +129,8 @@ else
 fi
 
 # ---------------------------------------------------------------- identity
-SCENE=${SCENE:-replica_room0_v2}
+SCENE=${SCENE:-}
+[ -n "${SCENE}" ] || { echo "[abort] SCENE is empty -- pass a scene name or set SCENE="; exit 1; }
 PIPELINE=${PIPELINE:-scene}            # scene = slice one trained model | perobj = train each
 # One tag for the whole run. Every result file carries it, so a number that was reported
 # can always be traced back to the inputs that produced it.
@@ -164,6 +169,7 @@ if [ -n "${SCENE_NAME}" ]; then
   names_it() { case "$1" in *"${SCENE_NAME}"*|*"${V1_NAME}"*) return 0 ;; *) return 1 ;; esac; }
   names_it "${SCENE}" || { echo "[abort] SCENE=${SCENE} does not name ${SCENE_NAME}"; bad=1; }
   for pv in TRAJ GTD GT_MESH GT_INFO; do
+    [ -n "${!pv}" ] || continue        # empty = not supplied; the preflight decides
     names_it "${!pv}" \
       || { echo "[abort] ${pv}=${!pv}"; echo "        does not name ${SCENE_NAME} or ${V1_NAME}"; bad=1; }
   done
@@ -422,8 +428,11 @@ echo "+-----------------------------------------------------------------"
 # A missing GT mesh does not stop a training run, so it only aborts for a span that reads it.
 if [ -n "${SCENE_NAME}" ]; then
   miss=0
-  for p in "${TRAJ}" "${GTD}" "${GT_MESH}" "${GT_INFO}"; do
-    if [ -e "${p}" ]; then echo "  ok       ${p}"; else echo "  MISSING  ${p}"; miss=1; fi
+  for pv in TRAJ GTD GT_MESH GT_INFO; do
+    p=${!pv}
+    if   [ -z "${p}" ];  then echo "  unset    ${pv}"; miss=1
+    elif [ -e "${p}" ];  then echo "  ok       ${p}"
+    else                      echo "  MISSING  ${p}"; miss=1; fi
   done
   if [ "${miss}" -ne 0 ]; then
     if want_any stage0 colmap objects name pkl fuse; then
