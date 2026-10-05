@@ -1,34 +1,41 @@
 #!/usr/bin/env python3
-"""seen / unseen 분리 평가 — prior 가 '관측을 지키면서 미관측만 채웠는가'를 정량화.
+"""Seen / unseen split evaluation -- does the prior fill the unobserved WITHOUT
+disturbing the observed?
 
-단일 chamfer/F-score 는 "관측이 오염된 것"과 "생성이 부정확한 것"을 구분하지 못한다.
-가시성 oracle 로 GT 점과 recon 점에 '동일한 규칙'으로 라벨을 붙이고 지표를 영역별로 쪼갠다.
-oracle 은 3D 위치만의 함수(입력 카메라에서 보이는가)라 어떤 점 집합에도 같게 적용되고,
-GT 라벨이 방법과 무관하게 고정되므로 baseline/ours 비교가 성립한다.
+A single chamfer or F-score cannot separate "the observation was corrupted" from
+"the generated part is inaccurate". A visibility oracle labels GT points and recon
+points by the SAME rule, and the metrics are then split by region. The oracle is a
+function of 3-D position alone (is this point visible from an input camera), so it
+applies identically to any point set, and the GT labels are fixed independently of
+the method -- which is what makes a baseline/ours comparison valid.
 
-  기본 oracle = GT 씬 메쉬 raycasting(--vis_source gt_mesh):
-    depth 파일 포맷·스케일 규약에 의존하지 않고 "입력 카메라 포즈에서 GT 씬이 보이는가"
-    로만 정의 → 데이터셋 무관, 논문 프로토콜로 기술하기 좋다.
-    (--vis_source gt_depth 로 depth 맵 oracle 도 선택 가능)
+  Default oracle = ray casting against the GT scene mesh (--vis_source gt_mesh):
+    visibility is defined purely as "is the GT scene visible from this input camera
+    pose", with no dependence on a depth-file format or scale convention. That makes
+    it dataset independent and easy to state as a paper protocol.
+    (--vis_source gt_depth selects a depth-map oracle instead.)
 
-  라벨 (뷰별 판정 후 min_views 합의):
-    seen      |z - d_gt| < margin   → 그 뷰에서 첫 표면 = 실제로 관측됨
-    free      z < d_gt - margin     → 관측된 빈 공간 (recon 점만 해당; 확실한 오류)
-    unseen    그 외(가려짐/FOV 밖)  → 정보 없음 = 생성이 채워야 할 영역
+  Labels (decided per view, then combined by min_views consensus):
+    seen      |z - d_gt| < margin   -> first surface in that view = genuinely observed
+    free      z < d_gt - margin     -> observed empty space (recon points only; a
+                                       definite error)
+    unseen    neither (occluded / outside the frustum) -> no information = the region
+                                       generation is supposed to fill
 
-  지표:
-    accuracy   (recon→GT)  : seen 영역은 baseline 과 같아야 함(관측 보존)
-    completion (GT→recon)  : unseen 영역이 개선돼야 함(prior 기여)
-    F@thr                  : precision=recon 점 기준, recall=GT 점 기준, 영역별
+  Metrics:
+    accuracy   (recon->GT)  : the seen region should match the baseline (observation
+                              preserved)
+    completion (GT->recon)  : the unseen region should improve (the prior's contribution)
+    F@thr                   : precision over recon points, recall over GT points, per region
 
-논문 주장 형태: "seen accuracy 유지 + unseen completion 개선".
+Claim form for the paper: "seen accuracy preserved + unseen completion improved".
 
   python eval_seen_unseen.py --gt_mesh gt_obj1.ply \
-    --gt_scene_mesh /home/elicer/room_0/habitat/mesh_semantic.ply \
+    --gt_scene_mesh "${REPLICA_ROOT}"/room_0/habitat/mesh_semantic.ply \
     --recon output/.../1/train/ours_7000/fuse_post.ply \
     --recon2 output/.../1/train/ours_7000/fused_prior.ply \
     --colmap data/replica_room0_v2/sparse/0 --gid 1 \
-    --stems ~/See3D/dataset/stage6/clean_stems/1.txt
+    --stems "${STEMS_DIR}"/1.txt
 """
 import os
 import glob
@@ -40,7 +47,7 @@ from PIL import Image
 
 try:
     from warp_gt_to_pose import read_colmap, cam_center
-except Exception:                                    # repo 밖에서 실행 시
+except Exception:                                    # running from outside the repo
     read_colmap = None
 
     def cam_center(R, t):
@@ -49,7 +56,7 @@ except Exception:                                    # repo 밖에서 실행 시
 
 # --------------------------------------------------------------------------
 def load_gt_depth(depth_dir, stem, scale):
-    """GT depth 로드(sdf_distill_depth.load_gt_depth 와 동일 규약)."""
+    """Load a GT depth map (same convention as sdf_distill_depth.load_gt_depth)."""
     for c in (stem.replace("frame", "depth"), stem, stem + "_depth"):
         for ext in (".png", ".npy"):
             p = os.path.join(os.path.expanduser(depth_dir), c + ext)
@@ -62,17 +69,18 @@ def load_gt_depth(depth_dir, stem, scale):
 
 
 def load_mesh_labeled(path):
-    """PLY → (V, T, L). L=면별 object_id(없으면 None).
+    """PLY -> (V, T, L). L = per-face object_id, or None when absent.
 
-    Replica mesh_semantic.ply 는 face 에 object_id 속성 + 다각형(quad) 면이라
-    Open3D RPly 가 헤더 파싱에 실패한다 → plyfile 로 직접 읽고 fan-triangulate.
+    Replica's mesh_semantic.ply carries an object_id face property AND polygon (quad)
+    faces, which makes Open3D's RPly reader fail on the header. Read it with plyfile
+    instead and fan-triangulate.
     """
     path = os.path.expanduser(path)
     try:
         from plyfile import PlyData
     except ImportError:
         PlyData = None
-        print("[mesh] plyfile 미설치 — object_id 추출 불가. pip install plyfile")
+        print("[mesh] plyfile not installed -- cannot extract object_id. pip install plyfile")
     if PlyData is not None:
         try:
             p = PlyData.read(path)
@@ -85,7 +93,7 @@ def load_mesh_labeled(path):
             oid = fe["object_id"].astype(np.int64) if "object_id" in names else None
             lens = np.fromiter((len(x) for x in polys), int, len(polys))
             tris, labs = [], []
-            for L_ in np.unique(lens):                 # 면 크기별 벡터화 fan 삼각분할
+            for L_ in np.unique(lens):                 # vectorised fan triangulation, per face size
                 sel = np.where(lens == L_)[0]
                 arr = np.stack([np.asarray(polys[i]) for i in sel]).astype(np.int64)
                 for k in range(1, int(L_) - 1):
@@ -95,22 +103,25 @@ def load_mesh_labeled(path):
             T = np.vstack(tris)
             Lb = np.concatenate(labs) if oid is not None else None
             print(f"[mesh] {os.path.basename(path)}: verts {len(V)}, tris {len(T)}"
-                  + (f", object_id {len(np.unique(Lb))}종" if Lb is not None else ""))
+                  + (f", {len(np.unique(Lb))} distinct object_id" if Lb is not None else ""))
             return V, T, Lb
         except Exception as e:
-            print(f"[mesh] plyfile 로드 실패({e}) — Open3D 폴백")
+            print(f"[mesh] plyfile load failed ({e}) -- falling back to Open3D")
     m = o3d.io.read_triangle_mesh(path)
-    assert len(m.triangles), f"메쉬 로드 실패(삼각형 없음): {path}"
+    assert len(m.triangles), f"mesh load failed (no triangles): {path}"
     return (np.asarray(m.vertices), np.asarray(m.triangles).astype(np.int64), None)
 
 
 def sample_tris(V, T, n, seed=0):
-    """면적 가중 균등 샘플 → (점, 소속 삼각형 인덱스). 라벨을 함께 끌고 가려고 자체 구현."""
+    """Area-weighted uniform sample -> (points, owning triangle index).
+
+    Implemented here rather than via Open3D so the per-face labels can be carried along.
+    """
     rng = np.random.default_rng(seed)
     e1 = V[T[:, 1]] - V[T[:, 0]]; e2 = V[T[:, 2]] - V[T[:, 0]]
     area = 0.5 * np.linalg.norm(np.cross(e1, e2), axis=1)
     tot = area.sum()
-    assert tot > 0, "면적 0 메쉬"
+    assert tot > 0, "mesh has zero area"
     idx = rng.choice(len(T), n, p=area / tot)
     r1 = np.sqrt(rng.random(n)); r2 = rng.random(n)
     P = ((1 - r1)[:, None] * V[T[idx, 0]]
@@ -131,34 +142,38 @@ def _aabb_gap(a, b):
 
 def auto_match_labels(V, T, L, ref_pts, min_share=0.10, n=300000, max_dist=0.05,
                       max_gap=0.15, min_cover=0.30):
-    """recon 과 겹치는 object_id 집합을 투표로 선택.
+    """Pick, by voting, the set of object_ids that overlap the reconstruction.
 
-    SAM3 인스턴스는 데이터셋 semantic id 와 1:1 이 아니다(한 인스턴스가 여러 GT 객체를
-    아우르거나 그 반대). 단일 라벨을 고르면 GT 가 과소/과대 잡히므로, 득표 비율이
-    min_share 이상인 라벨을 '모두' 채택하고 구성을 출력해 사람이 검증하게 한다.
+    A SAM3 instance is not 1:1 with a dataset semantic id -- one instance may span
+    several GT objects, or the reverse. Choosing a single label makes GT too small or
+    too large, so every label holding at least min_share of the vote is accepted, and
+    the composition is printed so a human can check it.
 
-    ⚠ 투표 컷오프(80% 분위)는 '상대' 기준이라, recon 이 어떤 GT 객체와도 겹치지 않아도
-      가장 가까운 라벨에 몰표가 나온다. 실측: obj21 은 id25 95.3% 로 확신에 찬 매칭인데
-      unseen completion 이 3278mm(=GT 가 3.3m 밖)였다. 그래서 절대 거리를 함께 보고한다.
-      이 값이 크면 그 행의 지표는 해석하면 안 된다 — 매칭이 아니라 recon 이 문제다.
+    WARNING: the vote cutoff (80th percentile) is RELATIVE, so even a reconstruction
+      that overlaps no GT object at all produces a landslide for whichever label is
+      nearest. Measured: obj21 matched id25 with 95.3% of the vote, yet its unseen
+      completion was 3278 mm (i.e. GT was 3.3 m away). The absolute distance is
+      therefore reported alongside. When it is large, do not interpret that row --
+      the problem is the reconstruction, not the matching.
     """
     P, idx = sample_tris(V, T, min(n, 20 * len(T) + 1000))
     lab = L[idx]
     d, j = cKDTree(P).query(ref_pts, workers=-1)
     med = float(np.median(d))
-    print(f"[auto-match] recon→GT 거리 중앙값 {med*1000:.1f}mm "
-          f"(80% {np.percentile(d, 80)*1000:.1f}mm, 임계 {max_dist*1000:.0f}mm)")
+    print(f"[auto-match] recon->GT median distance {med*1000:.1f}mm "
+          f"(80th pct {np.percentile(d, 80)*1000:.1f}mm, threshold {max_dist*1000:.0f}mm)")
     if med > max_dist:
-        print(f"[auto-match] ⚠⚠ recon 이 어느 GT 객체와도 겹치지 않습니다 "
-              f"({med*1000:.0f}mm 떨어짐). 아래 득표는 '가장 가까운' 라벨일 뿐이며 "
-              f"이 객체의 지표는 해석하지 마십시오.")
-        print(f"[auto-match]    원인은 매칭이 아니라 재구성 쪽입니다 — 마스크가 다른 "
-              f"물체를 가리키는지, per-object 학습이 실패했는지 확인하세요.")
-    keep = d < max(np.percentile(d, 80), 1e-6)        # 먼 점(floater) 제외
+        print(f"[auto-match] !! this reconstruction overlaps NO GT object "
+              f"({med*1000:.0f}mm away). The vote below is merely the NEAREST label; "
+              f"do not interpret this object's metrics.")
+        print(f"[auto-match]    the cause is the reconstruction, not the matching -- "
+              f"check whether the mask points at a different object, or whether "
+              f"per-object training failed.")
+    keep = d < max(np.percentile(d, 80), 1e-6)        # drop far points (floaters)
     vals, cnt = np.unique(lab[j][keep], return_counts=True)
     share = cnt / max(keep.sum(), 1)
     order = np.argsort(-share)
-    print("[auto-match] 득표 구성: " + ", ".join(
+    print("[auto-match] vote composition: " + ", ".join(
         f"id{int(vals[i])} {share[i]*100:.1f}%" for i in order[:6]))
     # A share threshold alone cannot tell "one object split across several ids" from "our
     # instance leaked onto the neighbour": both look like a second label holding ~20% of
@@ -210,23 +225,27 @@ def auto_match_labels(V, T, L, ref_pts, min_share=0.10, n=300000, max_dist=0.05,
             cov += float(share[i])
     if not sel:
         sel = [int(vals[order[0]])]
-    print(f"  → 채택 라벨 {sel} (합계 {cov*100:.1f}%)"
-          + (f"   제외 {dropped}" if dropped else ""))
+    print(f"  -> accepted labels {sel} (total {cov*100:.1f}%)"
+          + (f"   dropped {dropped}" if dropped else ""))
     if dropped:
-        print("  (제외된 라벨은 재구성과 떨어진 별개 객체입니다 — 합치면 unseen "
-              "completion 이 객체 사이 거리를 재게 됩니다. --match_max_gap 으로 조정)")
+        print("  (a dropped label is a separate object away from the reconstruction -- "
+              "unioning it makes unseen completion measure the distance between two "
+              "objects. Tune with --match_max_gap)")
     if cov < 0.7 and not dropped:
-        print("  ⚠ 커버리지 낮음 — --gt_labels 로 직접 지정하거나 min_share 조정 권장")
+        print("  ! low coverage -- set --gt_labels explicitly or adjust min_share")
     return sel
 
 
 def raycast_depth(scene, cam, ds):
-    """GT 씬 메쉬를 카메라 포즈에서 ray casting → z-depth (권장 가시성 oracle).
+    """Ray cast the GT scene mesh from a camera pose -> z-depth (the recommended oracle).
 
-    depth 맵 파일·스케일 규약에 의존하지 않고 '입력 카메라 포즈에서 GT 씬이 보이는가'
-    만으로 가시성을 정의하므로 데이터셋 무관하게 성립 — 논문 프로토콜로 기술하기 좋다.
-    방향벡터를 정규화하지 않으면(z성분=1) t_hit 이 곧 카메라 z-depth 라 규약이 일치한다.
-    ※ occlusion 은 '씬 전체'가 결정하므로 scene 은 객체가 아닌 전체 GT 메쉬여야 한다.
+    Visibility is defined only as "is the GT scene visible from this input camera pose",
+    with no dependence on depth-file format or scale conventions, so it holds for any
+    dataset -- which makes it easy to state as a paper protocol.
+    Leaving the direction vectors unnormalised (z component = 1) makes t_hit equal the
+    camera z-depth, so the convention matches the rest of the pipeline.
+    NOTE: occlusion is decided by the WHOLE scene, so `scene` must be the full GT mesh,
+    not the object mesh.
     """
     W = int(np.ceil(cam["W"] / ds)); H = int(np.ceil(cam["H"] / ds))
     fx, fy = cam["fx"] / ds, cam["fy"] / ds
@@ -235,7 +254,7 @@ def raycast_depth(scene, cam, ds):
     uu, vv = np.meshgrid(np.arange(W), np.arange(H))
     dcam = np.stack([(uu - cx) / fx, (vv - cy) / fy,
                      np.ones_like(uu, float)], -1).reshape(-1, 3)
-    dwn = (R.T @ dcam.T).T                             # world 방향(비정규화)
+    dwn = (R.T @ dcam.T).T                             # world directions (unnormalised)
     C = cam_center(R, t)
     rays = np.concatenate([np.broadcast_to(C.astype(np.float32), dwn.shape),
                            dwn.astype(np.float32)], 1)
@@ -255,33 +274,36 @@ def load_mask(masks_root, gid, stem):
     if a.max() <= 1:
         return a > 0
     if (a == 188).any():
-        return a == 188                              # amodal 규약: 188=visible
+        return a == 188                              # amodal convention: 188 = visible
     return a > 127
 
 
 def build_views(args, scene_mesh=None):
-    """카메라 + 가시성 depth(+마스크) 뷰 버퍼. 다운스케일로 메모리/속도 확보.
-    scene_mesh: gt_mesh 오라클용 '씬 전체' o3d 메쉬."""
-    assert read_colmap is not None, "warp_gt_to_pose 임포트 실패 — repo 루트에서 실행하세요"
+    """Camera + visibility depth (+ mask) view buffers. Downscaled for memory and speed.
+
+    scene_mesh: the WHOLE-scene Open3D mesh, for the gt_mesh oracle.
+    """
+    assert read_colmap is not None, \
+        "failed to import warp_gt_to_pose -- run this from the repository root"
     cams = {c["stem"]: c for c in read_colmap(args.colmap)}
     if args.stems and os.path.exists(os.path.expanduser(args.stems)):
         stems = [l.strip() for l in open(os.path.expanduser(args.stems)) if l.strip()]
     else:
         stems = sorted(cams)
     stems = [s for s in stems if s in cams]
-    if args.n_views > 0 and len(stems) > args.n_views:      # 균등 간격 서브샘플
+    if args.n_views > 0 and len(stems) > args.n_views:      # uniform-interval subsample
         idx = np.linspace(0, len(stems) - 1, args.n_views).round().astype(int)
         stems = [stems[i] for i in np.unique(idx)]
 
     ds = max(1, args.ds)
     rc_scene = None
     if args.vis_source == "gt_mesh":
-        assert scene_mesh is not None, "gt_mesh 오라클에는 씬 메쉬가 필요합니다"
+        assert scene_mesh is not None, "the gt_mesh oracle needs a scene mesh"
         rc_scene = o3d.t.geometry.RaycastingScene()
         rc_scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(scene_mesh))
-        print(f"[oracle] GT 씬 메쉬 raycasting (tri {len(scene_mesh.triangles)})")
+        print(f"[oracle] GT scene mesh ray casting (tri {len(scene_mesh.triangles)})")
     else:
-        print("[oracle] GT depth 맵 (--vis_source gt_depth)")
+        print("[oracle] GT depth maps (--vis_source gt_depth)")
 
     views, n_mask = [], 0
     for s in stems:
@@ -307,14 +329,17 @@ def build_views(args, scene_mesh=None):
             v["mask"] = m if m.shape == dg.shape else m[::ds, ::ds]
             n_mask += 1
         views.append(v)
-    print(f"[views] {len(views)}뷰, 마스크 {n_mask}뷰, ds={ds}")
-    assert views, "가시성 뷰 0개 — --vis_source / 경로·파일명 규약 확인"
+    print(f"[views] {len(views)} views, {n_mask} with masks, ds={ds}")
+    assert views, "0 visibility views -- check --vis_source and the path / filename convention"
     return views
 
 
 def classify(P, views, margin, min_views, use_mask):
-    """점 라벨: seen(첫 표면 일치) / free(관측된 빈 공간) / unseen(정보 없음).
-    반환 (seen: bool, free: bool) — free 는 seen 이 아닌 점에만 True."""
+    """Point labels: seen (matches the first surface) / free (observed empty space) /
+    unseen (no information).
+
+    Returns (seen: bool, free: bool) -- free is True only on points that are not seen.
+    """
     n_seen = np.zeros(len(P), np.int32)
     n_free = np.zeros(len(P), np.int32)
     for v in views:
@@ -338,36 +363,40 @@ def classify(P, views, margin, min_views, use_mask):
 
 
 def sample(mesh_path, n, seed=0):
-    """메쉬 균등 샘플. 설정 비교는 반드시 같은 시드로.
+    """Uniform mesh sampling. Settings must be compared under the SAME seed.
 
-    노이즈원이 둘이며, 해석 임계는 '평가 샘플링'이 지배한다.
+    There are two sources of noise, and the interpretation threshold is dominated by
+    evaluation sampling.
 
-    (1) 평가 샘플링 — 메쉬 고정, 시드만 변경 (eval_noise.sh, obj6 5회)
-        seen F@1cm  ±0.0001    seen acc      ±0.022mm
-        seen P@1cm  ±0.0003    unseen acc    ±0.26mm
-        seen R@1cm  ±0.0004    unseen P@2cm  ±0.0033
-        free 위반   ±0.085%p   unseen R@2cm  ±0.0005
+    (1) Evaluation sampling -- mesh fixed, seed varied (eval_noise.sh, obj6, 5 runs)
+        seen F@1cm  +/-0.0001    seen acc      +/-0.022mm
+        seen P@1cm  +/-0.0003    unseen acc    +/-0.26mm
+        seen R@1cm  +/-0.0004    unseen P@2cm  +/-0.0033
+        free viol.  +/-0.085%p   unseen R@2cm  +/-0.0005
 
-    (2) 융합 — 같은 설정 2회, 평가 시드 고정 (verify_gpu_fuse.sh 산출물로 측정)
-        unseen F@2cm ±0.0002   free ±0.1%p   seen 구성비 ±0.1%p
-        메쉬끼리는 Chamfer 0.0497mm 차이(2DGS 렌더가 비결정적)인데, 지표는 20만 점
-        평균이라 국소 차이가 상쇄되어 (1)보다 16배 작다.
+    (2) Fusion -- same settings run twice, evaluation seed fixed (measured on the
+        outputs of verify_gpu_fuse.sh)
+        unseen F@2cm +/-0.0002   free +/-0.1%p   seen composition +/-0.1%p
+        The two meshes differ by 0.0497mm Chamfer (2DGS rendering is non-deterministic),
+        but the metrics average over 200,000 points, so local differences cancel and
+        this source is 16x smaller than (1).
 
-    → 해석 임계: unseen F@2cm 은 0.007(2σ) 미만, free 는 0.2%p 미만 차이를
-      해석하지 말 것. 실제로 wcap 8/16/32 의 unseen F@2 차이(0.005~0.006)와
-      gt_edge_thr 의 obj22 차이(0.0033)가 이 범위였고, 두 결정 모두 노이즈보다
-      훨씬 큰 다른 축(seen accuracy, free 위반)으로 내렸다.
+    -> Interpretation threshold: do not interpret a difference below 0.007 (2 sigma) in
+      unseen F@2cm, or below 0.2%p in free violation. In practice the unseen F@2 spread
+      across wcap 8/16/32 (0.005-0.006) and the obj22 gt_edge_thr difference (0.0033)
+      both fell inside that band, and both decisions were made on other axes (seen
+      accuracy, free violation) where the differences were far larger than the noise.
     """
     m = o3d.io.read_triangle_mesh(os.path.expanduser(mesh_path))
-    assert len(m.vertices), f"메쉬 로드 실패: {mesh_path}"
+    assert len(m.vertices), f"mesh load failed: {mesh_path}"
     if len(m.triangles) == 0:
         return np.asarray(m.vertices), None
-    try:                                    # o3d >= 0.16 전역 RNG
+    try:                                    # global RNG, Open3D >= 0.16
         o3d.utility.random.seed(int(seed))
     except Exception:
         pass
-    m.compute_vertex_normals()              # NC 용 — 샘플 점에 법선이 실린다
-    try:                                    # 일부 버전은 seed 인자를 받는다
+    m.compute_vertex_normals()              # for NC -- normals ride along on the samples
+    try:                                    # some versions accept a seed argument
         pc = m.sample_points_uniformly(number_of_points=n, seed=int(seed))
     except TypeError:
         pc = m.sample_points_uniformly(number_of_points=n)
@@ -446,24 +475,27 @@ def _stat(d):
 
 def report(name, RN, G, gs, gf, thresholds, views, args, GN=None,
            mesh_path="", gt_VT=None):
-    """recon (점,법선) RN, GT 점군 G, GT 라벨(gs=seen) 로 영역별 지표 출력 + dict 반환."""
+    """Print and return per-region metrics for recon (points, normals) RN against GT
+    point cloud G with GT labels gs (seen)."""
     R, RNn = RN if isinstance(RN, tuple) else (RN, None)
     rs, rf = classify(R, views, args.margin, args.min_views, args.use_mask)
-    dR, jR = cKDTree(G).query(R, workers=-1)         # accuracy 용 (recon→GT)
-    dG, jG = cKDTree(R).query(G, workers=-1)         # completion 용 (GT→recon)
+    dR, jR = cKDTree(G).query(R, workers=-1)         # for accuracy (recon->GT)
+    dG, jG = cKDTree(R).query(G, workers=-1)         # for completion (GT->recon)
 
-    # [NC] Normal Consistency — 대응점 법선의 |cos| 평균(0~1, 높을수록 좋음).
-    #   CD 는 '위치'만 본다. 표면이 울퉁불퉁하거나 방향이 뒤집혀도 위치가 맞으면 통과한다.
-    #   DP-Recon 등이 함께 보고하는 지표이므로 같은 축을 갖춘다.
-    #   부호는 무시한다(|cos|) — 메쉬 방향(winding)이 파이프라인마다 다르기 때문.
+    # [NC] Normal Consistency -- mean |cos| between corresponding normals (0-1, higher
+    #   is better). Chamfer distance sees POSITION only: a bumpy or flipped surface
+    #   passes as long as the positions line up. DP-Recon and others report it, so the
+    #   same axis is provided here.
+    #   The sign is ignored (|cos|) because mesh winding differs between pipelines.
     ncR = ncG = None
     if RNn is not None and GN is not None and len(RNn) == len(R):
-        ncR = np.abs((RNn * GN[jR]).sum(1))          # recon 점 기준
-        ncG = np.abs((GN * RNn[jG]).sum(1))          # GT 점 기준
+        ncR = np.abs((RNn * GN[jR]).sum(1))          # per recon point
+        ncG = np.abs((GN * RNn[jG]).sum(1))          # per GT point
 
     print(f"\n===== {name} =====")
-    print(f"  점 구성  recon: seen {rs.mean()*100:5.1f}%  free위반 {rf.mean()*100:5.1f}%  "
-          f"unseen {(~rs & ~rf).mean()*100:5.1f}%   |  GT: seen {gs.mean()*100:.1f}%")
+    print(f"  composition  recon: seen {rs.mean()*100:5.1f}%  free-violation "
+          f"{rf.mean()*100:5.1f}%  unseen {(~rs & ~rf).mean()*100:5.1f}%   |  "
+          f"GT: seen {gs.mean()*100:.1f}%")
     M = {"mesh": os.path.basename(name.split(": ")[-1]),
          "free_pct": float(rf.mean() * 100),
          "recon_seen_pct": float(rs.mean() * 100),
@@ -492,8 +524,8 @@ def report(name, RN, G, gs, gf, thresholds, views, args, GN=None,
             print(f"        F@{tn}cm {f:.4f} (P {p:.4f} / R {r:.4f})")
     if rf.any():
         am, _ = _stat(dR[rf])
-        print(f"  [FREE 위반] {int(rf.sum())}점 ({rf.mean()*100:.1f}%) — "
-              f"관측된 빈 공간의 표면, accuracy {am:.2f}mm  ※ 명백한 오류")
+        print(f"  [FREE violation] {int(rf.sum())} points ({rf.mean()*100:.1f}%) -- "
+              f"surface in observed empty space, accuracy {am:.2f}mm  NOTE: a definite error")
     if mesh_path and not args.no_extra_metrics:
         n_open, wt = mesh_watertight(mesh_path)
         M["open_edges"] = n_open
@@ -508,7 +540,7 @@ def report(name, RN, G, gs, gf, thresholds, views, args, GN=None,
 
 
 def write_csv(path, rows, tag):
-    """스윕 비교용 CSV 누적(헤더 자동, 파일 없으면 생성)."""
+    """Append rows for sweep comparison (header written automatically on a new file)."""
     import csv
     cols = ["tag", "mesh", "gt_seen_pct", "recon_seen_pct", "recon_unseen_pct", "free_pct",
             "seen_acc", "seen_acc_med", "seen_comp", "seen_comp_med",
@@ -527,67 +559,81 @@ def write_csv(path, rows, tag):
         for r in rows:
             w.writerow([tag] + [f"{r[c]:.4f}" if isinstance(r.get(c), float) else r.get(c, "")
                                 for c in cols[1:]])
-    print(f"[csv] → {path}")
+    print(f"[csv] -> {path}")
 
 
 def main():
-    ap = argparse.ArgumentParser(description="seen/unseen 분리 평가")
+    ap = argparse.ArgumentParser(description="seen / unseen split evaluation")
     ap.add_argument("--gt_mesh", required=True,
-                    help="GT 메쉬. Replica mesh_semantic.ply 를 그대로 주면 object_id 로 "
-                         "대상 객체를 자동 추출(--gt_label 로 직접 지정 가능)")
+                    help="GT mesh. Pass Replica's mesh_semantic.ply directly and the "
+                         "target object is extracted by object_id (or name it with "
+                         "--gt_labels)")
     ap.add_argument("--gt_labels", default="",
-                    help="추출할 object_id 목록(쉼표). 비우면 recon 겹침 투표로 자동 매칭 "
-                         "— SAM3 인스턴스가 여러 GT 객체를 아우르는 경우까지 커버. "
-                         "'all' 이면 라벨 선택 없이 씬 전체와 비교(씬 단위 평가)")
+                    help="comma-separated object_ids to extract. Leave empty to match "
+                         "automatically by overlap voting -- this also covers a SAM3 "
+                         "instance that spans several GT objects. 'all' skips label "
+                         "selection and compares against the whole scene (scene-level "
+                         "evaluation)")
     ap.add_argument("--match_max_dist", type=float, default=0.05,
-                    help="recon→GT 거리 중앙값이 이 값(m)을 넘으면 '매칭 무의미' 경고. "
-                         "투표 컷오프가 상대 기준이라 recon 이 3m 떨어져 있어도 95%% "
-                         "득표가 나온다(obj21 실측). 판정에 쓰지 말고 경고로만 본다")
+                    help="warn that the match is meaningless when the median recon->GT "
+                         "distance exceeds this (m). The vote cutoff is relative, so a "
+                         "reconstruction 3 m away still draws 95%% of the vote (measured "
+                         "on obj21). Use it as a warning, never as a decision")
     ap.add_argument("--match_min_share", type=float, default=0.10,
-                    help="자동 매칭 시 채택할 라벨의 최소 득표 비율")
+                    help="minimum vote share for a label to be accepted during automatic "
+                         "matching")
     ap.add_argument("--match_min_cover", type=float, default=0.30,
-                    help="비1순위 라벨을 받아들이려면 그 GT 인스턴스 표면의 이 비율 이상이 "
-                         "재구성에서 --match_max_dist 안에 있어야 한다. bbox 간격만으로는 "
-                         "맞닿은 이웃(소파 위 쿠션)을 걸러낼 수 없다 — 실측 0929, room0 의 "
-                         "모든 비1순위 라벨이 간격 0mm 로 채택되어 GT 가 이웃까지 포함했고 "
-                         "unseen completion 이 라벨 개수를 따라 25/790/1040/2634mm 로 커졌다")
+                    help="to accept a non-dominant label, at least this share of that GT "
+                         "instance's surface must lie within --match_max_dist of the "
+                         "reconstruction. A bbox gap alone cannot reject a TOUCHING "
+                         "neighbour such as a cushion on a sofa -- measured 0929 on room0, "
+                         "every non-dominant label was accepted at a 0mm gap, GT then "
+                         "included the neighbour, and unseen completion grew with the "
+                         "number of unioned labels to 25/790/1040/2634mm")
     ap.add_argument("--match_max_gap", type=float, default=0.15,
-                    help="비1순위 라벨을 받아들일 최대 bbox 간격(m). 득표율만으로는 'GT가 "
-                         "여러 id로 쪼개진 것'과 '우리 인스턴스가 옆 물체로 샌 것'을 "
-                         "구분할 수 없다. 전자는 재구성에 붙어 있고 후자는 떨어져 있다")
-    ap.add_argument("--recon", required=True, help="비교 A (보통 fuse_post.ply)")
-    ap.add_argument("--recon2", default="", help="비교 B (보통 fused_prior.ply)")
+                    help="maximum bbox gap (m) for accepting a non-dominant label. Vote "
+                         "share alone cannot separate 'GT split across several ids' from "
+                         "'our instance leaked onto the neighbour'. The former sits on the "
+                         "reconstruction; the latter sits away from it")
+    ap.add_argument("--recon", required=True, help="side A (usually fuse_post.ply)")
+    ap.add_argument("--recon2", default="", help="side B (usually fused_prior.ply)")
     ap.add_argument("--colmap", required=True)
     ap.add_argument("--gid", default="",
-                    help="객체 id. 마스크(--masks_root/--use_mask)를 쓸 때만 필요하다. "
-                         "씬 단위 평가(--gt_labels all)에는 지정하지 않는다")
+                    help="object id. Needed only when masks are used "
+                         "(--masks_root / --use_mask). Leave unset for scene-level "
+                         "evaluation")
     ap.add_argument("--masks_root", default="")
     ap.add_argument("--stems", default="")
     ap.add_argument("--vis_source", default="gt_mesh", choices=["gt_mesh", "gt_depth"],
-                    help="가시성 oracle. gt_mesh=GT 씬 메쉬 raycasting(권장, depth 파일 불요) "
-                         "/ gt_depth=depth 맵 파일")
+                    help="visibility oracle. gt_mesh = ray cast the GT scene mesh "
+                         "(recommended, needs no depth files) / gt_depth = depth map files")
     ap.add_argument("--gt_scene_mesh", default="",
-                    help="[gt_mesh] occlusion 판정용 '씬 전체' GT 메쉬. --gt_mesh 가 이미 "
-                         "씬 메쉬(mesh_semantic.ply)면 불필요")
-    ap.add_argument("--gt_depth_dir", default="", help="[gt_depth] depth 맵 폴더")
+                    help="[gt_mesh] the WHOLE-scene GT mesh, for occlusion. Not needed when "
+                         "--gt_mesh is already the scene mesh (mesh_semantic.ply)")
+    ap.add_argument("--gt_depth_dir", default="", help="[gt_depth] depth map directory")
     ap.add_argument("--gt_depth_scale", type=float, default=6553.5)
-    ap.add_argument("--n_views", type=int, default=120, help="사용할 뷰 수(균등 서브샘플, 0=전체)")
-    ap.add_argument("--ds", type=int, default=2, help="depth/mask 다운스케일")
+    ap.add_argument("--n_views", type=int, default=120,
+                    help="number of views to use (uniform subsample, 0 = all)")
+    ap.add_argument("--ds", type=int, default=2, help="depth / mask downscale factor")
     ap.add_argument("--n_sample", type=int, default=200000)
     ap.add_argument("--seed", type=int, default=0,
-                    help="메쉬 샘플링 시드. 설정 비교는 반드시 같은 시드로. "
-                         "시드를 0..4 로 바꿔가며 같은 메쉬를 재평가하면 이 평가 자체의 "
-                         "노이즈 폭을 알 수 있다(그보다 작은 차이는 해석하지 말 것)")
+                    help="mesh sampling seed. Settings must be compared under the same "
+                         "seed. Re-evaluating one mesh with seeds 0..4 reveals this "
+                         "evaluation's own noise band (do not interpret differences "
+                         "smaller than that)")
     ap.add_argument("--margin", type=float, default=0.015,
-                    help="가시 판정 허용오차(m) — GT depth 노이즈+이산화 여유")
+                    help="visibility tolerance (m) -- headroom for GT depth noise and "
+                         "discretisation")
     ap.add_argument("--min_views", type=int, default=1,
-                    help="seen 판정 최소 뷰 수(1=한 뷰라도 봤으면 관측)")
+                    help="minimum views for a seen verdict (1 = observed if any view saw it)")
     ap.add_argument("--use_mask", action="store_true",
-                    help="객체 마스크도 가시 조건에 포함(인접 객체 depth 혼입 방지)")
+                    help="include the object mask in the visibility test (keeps a "
+                         "neighbouring object's depth out)")
     ap.add_argument("--thresholds", default="0.005,0.01,0.02")
-    ap.add_argument("--csv", default="", help="스윕 비교용 CSV 누적 경로")
-    ap.add_argument("--tag", default="", help="CSV 행 태그(예: d0.010)")
-    ap.add_argument("--csv_all", action="store_true", help="A 행도 CSV 에 기록(기본 B만)")
+    ap.add_argument("--csv", default="", help="path to append sweep-comparison rows to")
+    ap.add_argument("--tag", default="", help="tag for the CSV row (e.g. d0.010)")
+    ap.add_argument("--csv_all", action="store_true",
+                    help="also write the A row to the CSV (B only by default)")
     # Completion-side metrics. Surface distances cannot separate "filled the hole"
     # from "left it open", nor "solid" from "inflated shell".
     ap.add_argument("--iou_voxel", type=float, default=0.01,
@@ -604,24 +650,25 @@ def main():
 
     thr = [float(x) for x in args.thresholds.split(",")]
     if args.vis_source == "gt_depth" and not args.gt_depth_dir:
-        ap.error("--vis_source gt_depth 에는 --gt_depth_dir 가 필요합니다")
-    # 씬 단위 평가에는 gid 가 없다. 마스크를 쓰려면 반드시 gid 가 있어야 하므로
-    # 조용히 마스크 없이 도는 대신 명시적으로 막는다.
+        ap.error("--vis_source gt_depth requires --gt_depth_dir")
+    # Scene-level evaluation has no gid. Masks require one, so refuse explicitly rather
+    # than silently running without masks.
     if args.use_mask and not args.gid:
-        ap.error("--use_mask 는 --gid 가 필요합니다 — 씬 단위 평가라면 --use_mask 를 빼세요")
+        ap.error("--use_mask requires --gid -- drop --use_mask for scene-level evaluation")
     if args.gt_labels.strip().lower() == "all" and args.gid:
-        print("[경고] --gt_labels all 인데 --gid 가 지정됐습니다 — gid 는 무시됩니다")
+        print("[warn] --gt_labels all was given together with --gid -- gid is ignored")
 
-    # --- GT 로드 + 대상 객체 추출 ---
+    # --- load GT and extract the target object ---
     V, T, L = load_mesh_labeled(args.gt_mesh)
     Vs, Ts = (V, T)
-    if args.gt_scene_mesh:                            # 씬 메쉬를 따로 준 경우
+    if args.gt_scene_mesh:                            # a separate scene mesh was supplied
         Vs, Ts, _ = load_mesh_labeled(args.gt_scene_mesh)
     if L is not None and args.gt_labels.strip().lower() == "all":
-        # [씬 평가] 라벨 선택 없이 GT 전체를 쓴다. per-object 평가가 성립하지 않는
-        # 경우(SAM3 인스턴스가 GT 객체 여럿에 걸침, 생성 prior 가 인스턴스 밖으로
-        # 물체를 완성함)를 위한 경로 — 씬 단위에서는 그 기하가 오답이 아니다.
-        print(f"[GT] 전체 씬 사용: tri {len(T)}  (라벨 선택 없음)")
+        # [scene evaluation] Use the whole GT with no label selection. This path exists
+        # for cases where per-object evaluation does not hold (a SAM3 instance spanning
+        # several GT objects, or a generative prior completing an object beyond the
+        # instance boundary) -- at scene level that geometry is not an error.
+        print(f"[GT] using the whole scene: tri {len(T)}  (no label selection)")
     elif L is not None:
         if args.gt_labels:
             labs = [int(x) for x in args.gt_labels.split(",")]
@@ -632,12 +679,12 @@ def main():
                                      max_gap=args.match_max_gap,
                                      min_cover=args.match_min_cover)
         sel = np.isin(L, labs)
-        assert sel.any(), f"object_id={labs} 인 면이 없음"
+        assert sel.any(), f"no face has object_id={labs}"
         T = T[sel]
-        print(f"[GT] object_id={labs} 추출: tri {int(sel.sum())}")
+        print(f"[GT] extracted object_id={labs}: tri {int(sel.sum())}")
     elif not args.gt_scene_mesh:
-        print("  ⚠ object_id 없음 — --gt_mesh 를 객체 메쉬로 간주. 타 객체 가림 반영을 위해 "
-              "--gt_scene_mesh 지정 권장")
+        print("  ! no object_id -- treating --gt_mesh as an object mesh. Supply "
+              "--gt_scene_mesh so occlusion by other objects is accounted for")
 
     scene_mesh = None
     if args.vis_source == "gt_mesh":
@@ -647,14 +694,17 @@ def main():
     views = build_views(args, scene_mesh)
 
     G, gidx = sample_tris(V, T, args.n_sample)
-    # [NC] GT 점의 면 법선 — 위치는 맞는데 표면이 울퉁불퉁한 경우를 CD 는 못 잡는다
+    # [NC] Face normals for the GT points -- Chamfer cannot catch a surface that is in
+    # the right place but bumpy.
     _e1 = V[T[gidx, 1]] - V[T[gidx, 0]]; _e2 = V[T[gidx, 2]] - V[T[gidx, 0]]
     GN = np.cross(_e1, _e2)
     GN /= np.maximum(np.linalg.norm(GN, axis=1, keepdims=True), 1e-12)
     gs, _ = classify(G, views, args.margin, args.min_views, args.use_mask)
-    print(f"[GT] {len(G)}점 — seen {gs.mean()*100:.1f}% / unseen {(~gs).mean()*100:.1f}%")
+    print(f"[GT] {len(G)} points -- seen {gs.mean()*100:.1f}% / "
+          f"unseen {(~gs).mean()*100:.1f}%")
     if gs.mean() > 0.98:
-        print("  ⚠ unseen 이 거의 없음 — margin 과다 또는 뷰/depth 매칭 확인")
+        print("  ! almost nothing is unseen -- margin may be too large, or check the "
+              "view / depth correspondence")
 
     rows = []
     gt_VT = (V, T)
@@ -671,26 +721,27 @@ def main():
             b["preservation"] = preservation(SA[0], SB[0], args.preserve_thr)
             a["preservation"] = 1.0
         rows.append(b)
-        print("\n===== A → B 변화 (원하는 방향: seen acc 유지, unseen comp 감소) =====")
-        print(f"  seen accuracy      {a['seen_acc']:7.2f} → {b['seen_acc']:7.2f} mm  "
-              f"({b['seen_acc']-a['seen_acc']:+.2f}, 0 에 가까울수록 관측 보존)")
-        print(f"  unseen completion  {a['unseen_comp']:7.2f} → {b['unseen_comp']:7.2f} mm  "
-              f"({b['unseen_comp']-a['unseen_comp']:+.2f}, 음수가 prior 기여)")
-        print(f"  unseen F@2cm       {a['unseen_F2.0']:7.4f} → {b['unseen_F2.0']:7.4f}  "
-              f"(P {a['unseen_P2.0']:.3f}→{b['unseen_P2.0']:.3f}, "
-              f"R {a['unseen_R2.0']:.3f}→{b['unseen_R2.0']:.3f})")
-        print(f"  free 위반 비율     {a['free_pct']:6.2f}% → {b['free_pct']:6.2f}%  "
-              f"({b['free_pct']-a['free_pct']:+.2f}%p, 낮을수록 좋음)")
+        print("\n===== A -> B change (desired: seen acc held, unseen comp down) =====")
+        print(f"  seen accuracy      {a['seen_acc']:7.2f} -> {b['seen_acc']:7.2f} mm  "
+              f"({b['seen_acc']-a['seen_acc']:+.2f}; closer to 0 = observation preserved)")
+        print(f"  unseen completion  {a['unseen_comp']:7.2f} -> {b['unseen_comp']:7.2f} mm  "
+              f"({b['unseen_comp']-a['unseen_comp']:+.2f}; negative = the prior contributed)")
+        print(f"  unseen F@2cm       {a['unseen_F2.0']:7.4f} -> {b['unseen_F2.0']:7.4f}  "
+              f"(P {a['unseen_P2.0']:.3f}->{b['unseen_P2.0']:.3f}, "
+              f"R {a['unseen_R2.0']:.3f}->{b['unseen_R2.0']:.3f})")
+        print(f"  free violation     {a['free_pct']:6.2f}% -> {b['free_pct']:6.2f}%  "
+              f"({b['free_pct']-a['free_pct']:+.2f}%p, lower is better)")
         if not args.no_extra_metrics:
-            print(f"  관측 보존율        {b.get('preservation', float('nan')):7.4f}        "
-                  f"(A 표면 중 {args.preserve_thr*100:.0f}cm 내 남은 비율, 1 에 가까울수록 무손상)")
+            print(f"  observation kept   {b.get('preservation', float('nan')):7.4f}        "
+                  f"(share of A's surface still within {args.preserve_thr*100:.0f}cm; "
+                  f"1 = untouched)")
             if "open_edges" in a and "open_edges" in b:
-                print(f"  열린 경계 엣지     {a['open_edges']:7d} → {b['open_edges']:7d}  "
-                      f"(완성될수록 감소)")
+                print(f"  open boundary edges{a['open_edges']:7d} -> {b['open_edges']:7d}  "
+                      f"(falls as the mesh closes)")
             if a.get("vol_iou", float("nan")) == a.get("vol_iou", float("nan")):
-                print(f"  volumetric IoU     {a['vol_iou']:7.4f} → {b['vol_iou']:7.4f}  "
-                      f"(부피 기준, 팽창/속빔을 잡음)")
-            print(f"  생성 기여 영역     recon 중 unseen {a['recon_unseen_pct']:.1f}% → "
+                print(f"  volumetric IoU     {a['vol_iou']:7.4f} -> {b['vol_iou']:7.4f}  "
+                      f"(by volume; catches inflation and hollowness)")
+            print(f"  generated region   recon unseen {a['recon_unseen_pct']:.1f}% -> "
                   f"{b['recon_unseen_pct']:.1f}%   |  GT unseen {100-a['gt_seen_pct']:.1f}%")
     if args.csv:
         write_csv(args.csv, rows if args.csv_all else rows[-1:], args.tag or "")

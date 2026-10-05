@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""전체 씬 모델의 뷰별 depth를 npz로 덤프 — per-object SDF의 free-space carving 증거용.
+"""Dump per-view depth from the whole-scene model as npz -- the evidence used for
+free-space carving in the per-object SDF.
 
-scene_mono_reg 같은 '정규화 잘 된 whole-scene 모델'의 depth를 200뷰 전부 저장하면,
-sdf_distill_depth.py --carve_depth_dir 로 읽어 "카메라→표면 사이 = 빈 공간" 제약을
-객체 bbox 안에 적용할 수 있다 (8개 객체 뷰로는 못 보는 테이블 옆/아래 공간 carve).
+Saving the depth of a well-regularised whole-scene model (e.g. scene_mono_reg) for all
+200 views lets sdf_distill_depth.py read it back with --carve_depth_dir and apply the
+"between the camera and the surface = empty space" constraint inside the object bbox.
+That carves the space beside and under a table, which the 8 object views alone never
+see.
 
   python dump_scene_depth.py -m output/replica_room0_v2/scene_mono_reg -s data/replica_room0_v2 \
     --iteration 30000 --depth_ratio 1 --out_dir ~/carve_depth_mono
@@ -37,7 +40,8 @@ def main():
     model = ModelParams(parser, sentinel=True)
     pipeline = PipelineParams(parser)
     parser.add_argument("--iteration", default=-1, type=int)
-    parser.add_argument("--alpha_thr", default=0.5, type=float, help="이하 alpha 픽셀 depth=0(무효)")
+    parser.add_argument("--alpha_thr", default=0.5, type=float,
+                        help="pixels at or below this alpha get depth=0 (invalid)")
     # A ray that hits nothing renders as inf. float16 casts that to inf, and every consumer
     # treats "depth > 0.01" as a valid reading, so one inf pixel votes the whole ray empty
     # and carves straight through the scene. Clamp before the cast, not after.
@@ -86,7 +90,7 @@ def main():
             print(f"{i}/{len(views)} ...")
     print(f"[clamp] dropped {n_bad:,}/{n_px:,} px ({n_bad / max(n_px, 1) * 100:.3f}%) "
           f"as non-finite or > {args.max_depth}m")
-    print(f"done: {len(views)}뷰 → {out_dir}")
+    print(f"done: {len(views)} views -> {out_dir}")
 
 
 if __name__ == "__main__":

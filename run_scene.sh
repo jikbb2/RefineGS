@@ -75,12 +75,11 @@ fi
 # The step that was missing from every script, and the reason room2's first run reached SAM3
 # with 200 views and produced zero native tracks.
 #
-# replica_to_refinegs.py applies --subsample to the image links as well as the poses (its own
-# header says so: "images/frameXXXXXX.jpg (심볼릭 링크, subsample 적용)"), so a fresh scene has
-# 200 links. make_dense_colmap.py then globs that directory and writes one pose per file it
-# finds -- it creates no links of its own. The lift therefore produces 200 poses, the colmap
-# stage's "poses < frames" test is false, it prints "up to date", and nothing anywhere reports
-# that the run is using a tenth of the trajectory.
+# replica_to_refinegs.py applies --subsample to the image symlinks as well as the poses (its
+# own header says so), so a fresh scene has 200 links. make_dense_colmap.py then globs that
+# directory and writes one pose per file it finds -- it creates no links of its own. The lift
+# therefore produces 200 poses, the colmap stage's "poses < frames" test is false, it prints
+# "up to date", and nothing anywhere reports that the run is using a tenth of the trajectory.
 #
 # room0 and room1 got their 2000 links from a command typed by hand between stage 0 and the
 # colmap stage: `ln -sfn <scene>/results/* .` inside images/. That is why their manifests read
