@@ -68,7 +68,6 @@ done
 # This run needs five paths to agree (SCENE, TRAJ, GTD, GT_MESH, GT_INFO), and they come from
 # two directory trees with different naming -- nice-slam writes `room1`, the Replica v1
 # tarball writes `room_1`. room0 sits in a third place again (~/room_0), because it was
-# extracted before ~/replica_dl existed. Typing those five by hand per scene is how a run ends
 # up evaluating one room's reconstruction against another room's GT mesh: nothing downstream
 # checks, and the numbers look plausible.
 ROOT=${ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}
@@ -94,7 +93,6 @@ if [ -n "${SCENE_NAME}" ]; then
   # A scene name is authoritative, and `${VAR:-derived}` is not: a value still exported in
   # the shell wins over it silently. Measured 0928, that produced a run whose manifest read
   # `scene_name room2` and `scene replica_room1_v2` at the same time -- SCENE, TRAJ, GTD,
-  # GT_MESH and GT_INFO were all left over from an earlier room1 session, every one of those
   # paths exists, so the preflight printed four `ok` lines and the probe rebuilt room1's
   # object 14 under room2's name. Only `habitat` disagreed, because it is the one value
   # recomputed from the name every time.
@@ -356,8 +354,14 @@ n_poses() { grep -cE '\.(jpg|jpeg|png|JPG|PNG)[[:space:]]*$' "$1/images.txt" 2>/
 # --colmap_in pointing at the lifted poses so make_dense_colmap validated them against
 # themselves. Counting only IMG_EXT makes the stage idempotent and keeps that check honest.
 n_files() {
-  if [ -n "${2:-}" ]; then ls "$1"/*"$2" 2>/dev/null | wc -l
-  else ls "$1" 2>/dev/null | wc -l; fi
+  local d=$1 sfx=${2:-} f n=0
+  [ -d "${d}" ] || { echo 0; return; }
+  if [ -n "${sfx}" ]; then
+    for f in "${d}"/*"${sfx}"; do { [ -e "${f}" ] || [ -L "${f}" ]; } && n=$((n + 1)); done
+  else
+    for f in "${d}"/*; do { [ -e "${f}" ] || [ -L "${f}" ]; } && n=$((n + 1)); done
+  fi
+  echo "${n}"
 }
 n_traj() { if [ -f "$1" ]; then awk 'NF{n++} END{print n+0}' "$1"; else echo 0; fi; }
 # `ls -d dir/*/ | wc -l` reports 1 on an empty dir under nullglob, because ls falls back to

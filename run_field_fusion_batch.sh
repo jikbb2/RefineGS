@@ -23,7 +23,9 @@ shopt -s nullglob
 
 ROOT=${ROOT:-$HOME/RefineGS}
 SCENE=${SCENE:-}
-[ -n "${SCENE}" ] || { echo "[abort] SCENE is empty -- set SCENE=<name>"; exit 1; }
+echo "[abort] no GT mesh for SCENE=${SCENE} (looked for ${_scene_v1}/habitat and"
+echo "        ${_scene}/habitat under REPLICA_SEMANTIC='${REPLICA_SEMANTIC}')."
+echo "        Set REPLICA_SEMANTIC, or set GT_MESH explicitly."
 OUT=${OUT:-${ROOT}/output/${SCENE}/refinegs_full}
 ITER=${ITER:-7000}
 PRIOR=${PRIOR:-$HOME/prior}
