@@ -1,0 +1,7 @@
+NVIDIA A100 80GB PCIe, 535.183.06
+Cuda compilation tools, release 12.8, V12.8.93
+Build cuda_12.8.r12.8/compiler.35583870_0
+
+refinegs   torch 2.5.1 cuda 12.4 | py 3.12.7
+sam3       torch 2.10.0+cu128 cuda 12.8 | py 3.12.13
+shaper     torch 2.7.1+cu128 cuda 12.8 | py 3.10.20

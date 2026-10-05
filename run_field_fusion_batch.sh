@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # ShapeR field fusion over every object.
 #
-#   pkl   : make_shaper_input.py                                  (env: split_and_splat)
+#   pkl   : make_shaper_input.py                                  (env: refinegs)
 #   field : shaper_field.py                     (env: shaper; LD_LIBRARY_PATH cleared to
 #                                                avoid a cuDNN clash)
-#   fuse  : sdf_distill_depth.py --prior_field + eval_seen_unseen.py  (env: split_and_splat)
+#   fuse  : sdf_distill_depth.py --prior_field + eval_seen_unseen.py  (env: refinegs)
 #
 # The two envs are why this runs in phases:
 #   PHASE=pkl|field|fuse|eval|all  bash run_field_fusion_batch.sh
@@ -37,14 +37,37 @@ SHAPER_DIRECT=${SHAPER_DIRECT:-0}
 COLMAP=${COLMAP:-${ROOT}/data/${SCENE}/sparse/0}
 IMAGES=${IMAGES:-${ROOT}/data/${SCENE}/images}
 MASKS=${MASKS:-${ROOT}/data/${SCENE}/masks}
-STEMS_DIR=${STEMS_DIR:-$HOME/See3D/dataset/stage6/clean_stems}
-GTD=${GTD:-/home/elicer/nice-slam/Datasets/Replica/room0/results}
+
+# Dataset-dependent defaults, derived from SCENE rather than hard-coded.
+#
+# GTD and GT_MESH used to default to room0's absolute paths whatever SCENE said, so a
+# standalone run on room2 silently evaluated room2's reconstruction against room0's GT
+# depth and GT mesh. Nothing downstream checks that, and the numbers still look plausible
+# -- the same failure run_scene.sh was written to prevent. Derive both from SCENE and
+# abort when they are missing, instead of falling back to another room's data.
+REPLICA_ROOT=${REPLICA_ROOT:-$HOME/nice-slam/Datasets/Replica}
+REPLICA_DL=${REPLICA_DL:-$HOME/replica_dl}
+_scene=$(echo "${SCENE}" | sed -E 's/^replica_//; s/_v[0-9]+$//')              # room0
+_scene_v1=$(echo "${_scene}" | sed -E 's/^(room|office)([0-9]+)$/\1_\2/')      # room_0
+GTD=${GTD:-${REPLICA_ROOT}/${_scene}/results}
+GT_MESH=${GT_MESH:-}
+if [ -z "${GT_MESH}" ]; then
+  for _c in "${REPLICA_DL}/${_scene_v1}/habitat" "$HOME/${_scene_v1}/habitat" \
+            "${REPLICA_ROOT}/${_scene}/habitat"; do
+    [ -f "${_c}/mesh_semantic.ply" ] && { GT_MESH=${_c}/mesh_semantic.ply; break; }
+  done
+fi
+
+# Per-object view lists produced by the per-object pipeline. When this directory is
+# absent, --stems is simply not passed and the evaluation falls back to EVERY colmap view
+# -- which changes the numbers without saying so. Warn loudly instead.
+STEMS_DIR=${STEMS_DIR:-${ROOT}/data/${SCENE}/clean_stems}
+
 # Free-space reference for the fusion. When set, the scene model's own rendered depth
 # (dump_scene_depth.py) replaces GT depth, and the fuse phase passes no GT depth at all --
 # that is the whole point, so it is all or nothing rather than a per-view fallback.
 # The pkl phase still reads GTD for its seen/unseen test (make_shaper_input --depth_dir).
 CARVE_DEPTH=${CARVE_DEPTH:-}
-GT_MESH=${GT_MESH:-$HOME/room_0/habitat/mesh_semantic.ply}
 # ShapeR is text conditioned, so the caption changes the completion. name_objects.py
 # writes <OUT>/names.tsv as "gid<TAB>class", which is exactly this format; falling back to
 # "a 3D object in a room" asks the model to complete a generic blob.
@@ -114,6 +137,20 @@ PKL_REL=data${PKL_SUBDIR:+/${PKL_SUBDIR}}
 mkdir -p "${PRIOR}" "${LOGDIR}" "${PKL_DIR}"
 cd "${ROOT}" || exit 1
 
+# Fail on a missing GT path rather than evaluating against whatever happens to be there.
+[ -n "${GT_MESH}" ] && [ -f "${GT_MESH}" ] || {
+  echo "[abort] no GT mesh for SCENE=${SCENE} (looked for ${_scene_v1}/habitat under"
+  echo "        ${REPLICA_DL}, \$HOME and ${REPLICA_ROOT}). Set GT_MESH explicitly."
+  exit 1; }
+[ -d "${GTD}" ] || [ -n "${CARVE_DEPTH}" ] || {
+  echo "[abort] no GT depth directory for SCENE=${SCENE}: ${GTD}"
+  echo "        Set GTD explicitly, or set CARVE_DEPTH to use rendered scene depth."
+  exit 1; }
+# A missing stems directory is not fatal, but it silently switches the evaluation to every
+# colmap view, which moves the numbers. Say so once, up front.
+[ -d "${STEMS_DIR}" ] || echo "  WARN no stems dir (${STEMS_DIR}) -- evaluation will use" \
+                              "ALL colmap views, not the per-object view list"
+
 gids=()
 for MDIR in ${OUT}/*/; do
   gid=$(basename "${MDIR}")
@@ -126,6 +163,7 @@ done
 [ ${#gids[@]} -gt 0 ] || { echo "no target object under ${OUT}"; exit 1; }
 echo "targets (${#gids[@]}): ${gids[*]}   run=${RUN}"
 echo "  out=${OUT} iter=${ITER} prior=${PRIOR} pkl=${PKL_DIR}"
+echo "  scene=${SCENE} -> gt_mesh=${GT_MESH}"
 echo "  carve=$([ -n "${CARVE_DEPTH}" ] && echo "rendered scene depth ${CARVE_DEPTH}" || echo "GT depth ${GTD}")"
 echo "  recon=${RECON_NAME} -> ${FUSE_NAME}_post.ply   grid=${GRID} cfg=${CFG} ensemble=${ENSEMBLE}/${COMBINE}${FUSE_EXTRA:+   ${FUSE_EXTRA}}"
 [ -f "${CAPTIONS}" ] || echo "  WARN no caption file (${CAPTIONS}); generating from generic text"

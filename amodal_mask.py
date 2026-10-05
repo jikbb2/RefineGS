@@ -10,7 +10,7 @@
 경계에 연결된 배경은 절대 채워지지 않는다. max_hole_frac으로 비정상적으로
 큰 구멍은 메우지 않아 폭주를 막고, 처리 후 객체 비율을 로그로 출력해 검증.
 
-deps: numpy, Pillow, scipy (split_and_splat env).
+deps: numpy, Pillow, scipy (refinegs env).
 """
 import argparse
 import glob

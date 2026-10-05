@@ -326,7 +326,7 @@ stamp() {                                  # stamp FILE VALUE -- true when uncha
 }
 mark() { mkdir -p "$(dirname "$1")"; printf '%s' "$2" > "$1"; }
 
-# sam3 and split_and_splat cannot share a process (cuDNN), and `conda run` breaks on the
+# sam3 and refinegs cannot share a process (cuDNN), and `conda run` breaks on the
 # cross-compiler activate hook, so the env is entered the way the field phase already does.
 in_env() {
   local env=$1; shift

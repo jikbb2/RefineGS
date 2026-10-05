@@ -1,14 +1,25 @@
 #!/usr/bin/env python3
-"""gid별 3D-일관 프레임 목록 생성 (재학습 없이 포즈/ref 정화용).
+"""Build a per-gid list of 3-D consistent frames (cleans the pose / reference set
+without retraining).
 
-audit_masks 와 동일 원리(마스크 back-project 중심의 지배 클러스터)를 전 프레임에 적용,
-반복 median 으로 수렴한 중심에서 --keep_dist 이내 프레임의 stem 만 <out>/<gid>.txt 로 저장.
+Applies the same principle as audit_masks -- the dominant cluster of back-projected
+mask centres -- to every frame, converges that centre by iterated median, and writes
+the stems of the frames within --keep_dist of it to <out>/<gid>.txt.
+
+Why this exists: a mask that drifts onto a neighbouring object, or a grazing view whose
+back-projection lands metres away, pulls the per-object reference set off the object.
+Those frames are removed here rather than at training time, so the conditioning points,
+the fusion and the evaluation all see the same view list.
+
+The output directory is what run_field_fusion_batch.sh reads as STEMS_DIR. Without it,
+--stems is never passed and the evaluation falls back to every COLMAP view, which moves
+the reported numbers.
 
   python clean_stems.py --masks_root data/replica_room0_v2/masks \
-    --gt_depth /home/elicer/nice-slam/Datasets/Replica/room0/results \
+    --gt_depth "$HOME"/nice-slam/Datasets/Replica/room0/results \
     --colmap data/replica_room0_v2/sparse/0 \
-    --gids 0,1,10,11,12,14,15,16,17,18,19,2,20,22,23,24,27,28,3,31,32,34,35,36,37,38,4,5,6,7,8 \
-    --out ~/See3D/dataset/stage6/clean_stems
+    --gids all \
+    --out data/replica_room0_v2/clean_stems
 """
 import os
 import glob
@@ -28,14 +39,34 @@ def load_mask(p):
     return (a > 0) if a.max() <= 1 else (a > 127)
 
 
+def resolve_gids(spec, masks_root):
+    """'all' discovers every numeric object directory under masks_root.
+
+    Typing the list by hand is how a run silently covers a subset: the gid set differs
+    per scene, and a missing id produces no error, only a shorter output.
+    """
+    if spec.strip().lower() != "all":
+        return [g.strip() for g in spec.split(",") if g.strip()]
+    gids = sorted((d for d in os.listdir(masks_root)
+                   if d.isdigit() and os.path.isdir(os.path.join(masks_root, d, "masks"))),
+                  key=int)
+    print(f"[gids] discovered {len(gids)} object directories under {masks_root}")
+    return gids
+
+
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(
+        description="per-object 3-D consistent frame lists (stems) for evaluation")
     ap.add_argument("--masks_root", required=True)
     ap.add_argument("--gt_depth", required=True)
     ap.add_argument("--colmap", required=True)
-    ap.add_argument("--gids", required=True)
+    ap.add_argument("--gids", required=True,
+                    help="comma-separated object ids, or 'all' to discover them from "
+                         "--masks_root")
     ap.add_argument("--depth_scale", type=float, default=6553.5)
-    ap.add_argument("--keep_dist", type=float, default=0.5)
+    ap.add_argument("--keep_dist", type=float, default=0.5,
+                    help="keep a frame when its back-projected mask centre lies within "
+                         "this distance (m) of the converged cluster centre")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -44,8 +75,7 @@ def main():
     os.makedirs(out, exist_ok=True)
     centers = {}
 
-    for gid in args.gids.split(","):
-        gid = gid.strip()
+    for gid in resolve_gids(args.gids, args.masks_root):
         mps = sorted(glob.glob(os.path.join(args.masks_root, gid, "masks", "*.png")))
         stems, cents = [], []
         for mp in mps:
@@ -75,10 +105,10 @@ def main():
             stems.append(stem)
             cents.append(np.median(Xw, axis=0))
         if len(cents) < 5:
-            print(f"gid {gid}: 유효 프레임 부족 — skip"); continue
+            print(f"gid {gid}: too few valid frames -- skipped"); continue
         C = np.stack(cents)
         keep = np.ones(len(C), bool)
-        for _ in range(5):                      # 반복 median → 지배 클러스터 수렴
+        for _ in range(5):              # iterated median -> converge on the dominant cluster
             med = np.median(C[keep], axis=0)
             new = np.linalg.norm(C - med, axis=1) <= args.keep_dist
             if (new == keep).all():
@@ -87,15 +117,15 @@ def main():
         kept = [s for s, k in zip(stems, keep) if k]
         with open(os.path.join(out, f"{gid}.txt"), "w") as f:
             f.write("\n".join(kept))
-        med = np.median(C[keep], axis=0)                 # 지배 클러스터 3D 중심 (실측 기하)
+        med = np.median(C[keep], axis=0)      # 3-D centre of the dominant cluster (measured)
         spread = float(np.percentile(np.linalg.norm(C[keep] - med, axis=1), 90))
         centers[gid] = dict(center=med.tolist(), radius=max(spread, 0.15))
-        print(f"gid {gid:>3}: {len(kept)}/{len(stems)} 유지 (제거 {len(stems)-len(kept)})  "
+        print(f"gid {gid:>3}: kept {len(kept)}/{len(stems)} (dropped {len(stems)-len(kept)})  "
               f"center {np.round(med,2).tolist()}  r90 {spread:.2f}")
     import json
     with open(os.path.join(out, "centers.json"), "w") as f:
         json.dump(centers, f, indent=1)
-    print(f"→ {out}/<gid>.txt + centers.json")
+    print(f"-> {out}/<gid>.txt + centers.json")
 
 
 if __name__ == "__main__":
