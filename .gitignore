@@ -4,6 +4,7 @@
 data/
 output/
 *.ply
+*.pkl
 *.pth
 *.ckpt
 *.npz
@@ -14,6 +15,7 @@ submodules/
 **/tmp
 build/
 *.png
+carve_depth/
 
 # relabel / amodal scratch outputs (if produced inside repo)
 relabel_*/
