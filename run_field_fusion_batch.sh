@@ -132,8 +132,8 @@ MATCH_MIN_SHARE=${MATCH_MIN_SHARE:-0.10}
 CSV=${CSV:-${OUT}/_field_${RUN}.csv}
 FAILCSV=${FAILCSV:-${OUT}/_field_${RUN}_failures.csv}
 LOGDIR=${LOGDIR:-${PRIOR}/logs/${RUN}}
-PKL_DIR=${SHAPER_DIR}/data${PKL_SUBDIR:+/${PKL_SUBDIR}}
-PKL_REL=data${PKL_SUBDIR:+/${PKL_SUBDIR}}
+PKL_DIR=${PKL_DIR:-${SHAPER_DIR}/data${PKL_SUBDIR:+/${PKL_SUBDIR}}}
+PKL_REL=${PKL_DIR}
 mkdir -p "${PRIOR}" "${LOGDIR}" "${PKL_DIR}"
 cd "${ROOT}" || exit 1
 

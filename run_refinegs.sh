@@ -71,19 +71,24 @@ done
 # extracted before ~/replica_dl existed. Typing those five by hand per scene is how a run ends
 # up evaluating one room's reconstruction against another room's GT mesh: nothing downstream
 # checks, and the numbers look plausible.
-ROOT=${ROOT:-$HOME/RefineGS}
-NICE=${NICE:-$HOME/nice-slam/Datasets/Replica}
-DL=${DL:-$HOME/replica_dl}
+ROOT=${ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}
+REPLICA_ROOT=${REPLICA_ROOT:-}
+REPLICA_HABITAT=${REPLICA_HABITAT:-}
 
 if [ -n "${SCENE_NAME}" ]; then
-  # nice-slam name -> Replica v1 directory name: room2 -> room_2, office0 -> office_0.
+  [ -n "${REPLICA_ROOT}" ] || {
+    echo "[abort] a scene name needs REPLICA_ROOT=<path to the Replica dataset>"
+    echo "        e.g. REPLICA_ROOT=~/Replica bash run_refinegs.sh ${SCENE_NAME}"
+    exit 1; }
+  # The nice-slam dump names a scene room2; the Replica v1 tarball names it room_2.
+  # Both are checked because they are two real layouts of the same dataset.
   V1_NAME=$(echo "${SCENE_NAME}" | sed -E 's/^(room|office)([0-9]+)$/\1_\2/')
-  # The habitat/ tree moved twice. Take the first one that actually exists rather than
-  # encoding a rule that only holds for the scenes already run.
-  HAB=""
-  for cand in "${DL}/${V1_NAME}/habitat" "$HOME/${V1_NAME}/habitat" "${NICE}/${SCENE_NAME}/habitat"; do
-    [ -f "${cand}/mesh_semantic.ply" ] && { HAB=${cand}; break; }
-  done
+  HAB=${REPLICA_HABITAT}
+  if [ -z "${HAB}" ]; then
+    for cand in "${REPLICA_ROOT}/${V1_NAME}/habitat" "${REPLICA_ROOT}/${SCENE_NAME}/habitat"; do
+      [ -f "${cand}/mesh_semantic.ply" ] && { HAB=${cand}; break; }
+    done
+  fi
   # A scene name is authoritative, and `${VAR:-derived}` is not: a value still exported in
   # the shell wins over it silently. Measured 0928, that produced a run whose manifest read
   # `scene_name room2` and `scene replica_room1_v2` at the same time -- SCENE, TRAJ, GTD,
@@ -101,10 +106,10 @@ if [ -n "${SCENE_NAME}" ]; then
       && echo "  [env override] ${v}=${cur}" && echo "                 -> ${val}   (shell value ignored)"
     export "${v}=${val}"
   }
-  set_scene REPLICA_SCENE "${NICE}/${SCENE_NAME}"
-  set_scene SCENE         "replica_${SCENE_NAME}_v2"
-  set_scene TRAJ          "${NICE}/${SCENE_NAME}/traj.txt"
-  set_scene GTD           "${NICE}/${SCENE_NAME}/results"
+  set_scene REPLICA_SCENE "${REPLICA_ROOT}/${SCENE_NAME}"
+  set_scene SCENE         "replica_${SCENE_NAME}"
+  set_scene TRAJ          "${REPLICA_ROOT}/${SCENE_NAME}/traj.txt"
+  set_scene GTD           "${REPLICA_ROOT}/${SCENE_NAME}/results"
   set_scene GT_MESH       "${HAB}/mesh_semantic.ply"
   set_scene GT_INFO       "${HAB}/info_semantic.json"
   # Everything here derives from SCENE, so an inherited value pins one room's outputs onto
@@ -146,10 +151,10 @@ if [ -z "${COLMAP:-}" ]; then
 fi
 COLMAP=${COLMAP:-${DATA}/sparse/0}
 # Fallbacks for a run with no scene name, i.e. the room0 layout this driver was written on.
-GTD=${GTD:-/home/elicer/nice-slam/Datasets/Replica/room0/results}
-GT_MESH=${GT_MESH:-$HOME/room_0/habitat/mesh_semantic.ply}
-GT_INFO=${GT_INFO:-$HOME/room_0/habitat/info_semantic.json}
-TRAJ=${TRAJ:-$HOME/room_0/imap/00/traj_w_c.txt}
+GTD=${GTD:-}
+GT_MESH=${GT_MESH:-}
+GT_INFO=${GT_INFO:-}
+TRAJ=${TRAJ:-}
 
 # Last line of defence on the failure above: every one of these paths existed, so checking
 # that a file is there proves nothing. Check that it NAMES the room that was asked for.
@@ -183,8 +188,9 @@ PKL_SUBDIR=${PKL_SUBDIR:-${SCENE}_${PIPELINE}}
 RUNDIR=${RUNDIR:-${ROOT}/output/${SCENE}/runs/${RUN}}
 CSV=${CSV:-${RUNDIR}/results.csv}
 SHAPER_DIR=${SHAPER_DIR:-$HOME/ShapeR}
-RELABEL=${RELABEL:-$HOME/relabel_${SCENE}}
-AMODAL=${AMODAL:-$HOME/amodal_${SCENE}}
+PKL_DIR=${PKL_DIR:-${ROOT}/output/${SCENE}/prior/pkl}
+RELABEL=${RELABEL:-${ROOT}/output/${SCENE}/relabel}
+AMODAL=${AMODAL:-${ROOT}/output/${SCENE}/amodal}
 # The scene model's own rendered depth, used wherever the pipeline needs to know what a
 # camera saw past: the vote's first-surface test and the fusion's free-space carve. GT
 # depth answers the same question, but then the hard constraint is oracle-derived and the
@@ -394,7 +400,7 @@ fi
   echo "scene_model   ${SCENE_MODEL}"
   echo "objects       ${OBJ}"
   echo "prior         ${PRIOR}"
-  echo "pkl           ${SHAPER_DIR}/data/${PKL_SUBDIR}"
+  echo "pkl           ${PKL_DIR}"
   # The room0 scene model was trained with --gt_depth_dir and lambda_gtdepth's default 0.5,
   # while DEPTH_SUPERVISION=none says otherwise: the line above described the driver's switch,
   # not the flags that actually reached train.py. A model carries no record of its own
@@ -812,7 +818,7 @@ for ph in pkl field fuse eval; do
   # in one log dir; FAILCSV is per phase because the batch script truncates it on entry.
   PRIOR="${PRIOR}" ITER="${ITER}" OUT="${OBJ}" CSV="${CSV}" PHASE="${ph}" \
     RUN="${RUN}" FAILCSV="${RUNDIR}/failures_${ph}.csv" LOGDIR="${RUNDIR}/logs" \
-    PKL_SUBDIR="${PKL_SUBDIR}" CAPTIONS="${OBJ}/names.tsv" COLMAP="${COLMAP}" \
+    PKL_SUBDIR="${PKL_SUBDIR}" PKL_DIR="${PKL_DIR}" CAPTIONS="${OBJ}/names.tsv" COLMAP="${COLMAP}" \
     MASKS="${MASKS}" IMAGES="${IMAGES}" GT_MESH="${GT_MESH}" GTD="${GTD}" ONLY="${ONLY}" \
     CARVE_DEPTH="$([ -d "${CARVE_DEPTH}" ] && echo "${CARVE_DEPTH}")" \
     POINTS_FROM="${POINTS_FROM}" RECON_NAME="${COND_NAME}" FUSE_EXTRA="${FUSE_EXTRA}" \
