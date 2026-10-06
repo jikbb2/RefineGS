@@ -517,7 +517,15 @@ if want relabel; then
   # Probe the first frame, the same way the tool does: substitute on the STEM only, never on
   # the directory, and stay quiet when there are no frames yet -- the IMAGES check above owns
   # that case, and a FROM=stage0 span has not created them at this point.
-  _f1=$(ls "${IMAGES}"/*"${IMG_EXT}" 2>/dev/null | head -1)
+  # NOT `ls "${IMAGES}"/*"${IMG_EXT}"`: nullglob is on, so with no match the glob vanishes,
+  # ls runs with no arguments and lists the WORKING DIRECTORY instead. That turned a
+  # not-yet-created images/ into a probe for "images/agg_ab.py.png" -- the repository's
+  # alphabetically first file -- and aborted a FROM=stage0 run before stage0 could create the
+  # directory. Same trap as n_files() above; take the first match from the glob directly.
+  _f1=""
+  for _g in "${IMAGES}"/*"${IMG_EXT}"; do
+    { [ -e "${_g}" ] || [ -L "${_g}" ]; } && { _f1=${_g}; break; }
+  done
   if [ -n "${_f1}" ]; then
     _st=$(basename "${_f1}" "${IMG_EXT}")
     _dprobe="${DEPTH_DIR}/${_st/${DEPTH_FROM}/${DEPTH_TO}}${DEPTH_EXT}"
@@ -766,7 +774,7 @@ if want carve; then
   if [ ! -f "${PLY}" ]; then
     echo "  [skip] no scene model -- the carve reference needs one (stage: train)"
   elif fresh "${CARVE_DEPTH}/.done" dump_scene_depth.py "${PLY}"; then
-    echo "  up to date ($(ls "${CARVE_DEPTH}"/*.npz 2>/dev/null | wc -l) views)"
+    echo "  up to date ($(n_files "${CARVE_DEPTH}" .npz) views)"
   else
     # --depth_ratio 1 explicitly: it is a PipelineParams value whose default is not
     # render.py's, and a mismatch makes this a different quantity from the meshes.
