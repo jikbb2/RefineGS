@@ -221,6 +221,24 @@ VOTE_REF=${VOTE_REF:-gt}
 # none = no depth loss in scene training (the reconstruction claim stops resting on GT).
 # gt   = the earlier setting, kept so the two can be compared.
 DEPTH_SUPERVISION=${DEPTH_SUPERVISION:-none}
+# The same choice for the PER-OBJECT models, which had no switch at all: the objects stage
+# passed --gt_depth_dir unconditionally, so a dataset without GT depth failed inside train.py
+# instead of at a flag. Default gt, because every recorded number was produced that way --
+# flipping the default would silently change results.
+OBJ_DEPTH_SUPERVISION=${OBJ_DEPTH_SUPERVISION:-gt}
+# Depth for the relabel stage's 3-D signature. sam3_relabel_video.py back-projects the mask
+# pixels through this, so without it every track falls below --min_sig and the stage produces
+# zero objects. Its own default is --frames, which worked only because the Replica depth PNGs
+# are symlinked into images/ beside the frames; passing it explicitly is what makes that an
+# input of this pipeline rather than an accident of how one directory was built.
+DEPTH_DIR=${DEPTH_DIR:-${IMAGES}}
+DEPTH_SCALE=${DEPTH_SCALE:-6553.5}
+DEPTH_FROM=${DEPTH_FROM:-frame}
+DEPTH_TO=${DEPTH_TO:-depth}
+DEPTH_EXT=${DEPTH_EXT:-.png}
+# Generating 25 objects from "a 3D object in a room" is a quiet 25-object regression, so a
+# missing caption file aborts. Set this to 1 to run without captions on purpose.
+ALLOW_GENERIC_CAPTIONS=${ALLOW_GENERIC_CAPTIONS:-0}
 
 # ---------------------------------------------------------------- knobs
 # Settled values live in the tools' own defaults; only what this driver must choose is here.
@@ -418,6 +436,8 @@ fi
   echo "resolution    -r ${RESOLUTION}         data_device=${DATA_DEVICE}"
   echo "depth         supervision=${DEPTH_SUPERVISION}  vote_ref=${VOTE_REF}"
   echo "carve         ${CARVE_DEPTH}"
+  echo "relabel_depth ${DEPTH_DIR}   scale=${DEPTH_SCALE} ${DEPTH_FROM}->${DEPTH_TO}${DEPTH_EXT}"
+  echo "obj_depth     supervision=${OBJ_DEPTH_SUPERVISION}"
   echo "stages        ${FROM} .. ${TO}  clean=${CLEAN}  only='${ONLY}'"
   echo "colmap        ${COLMAP}         poses=$(n_poses "${COLMAP}")"
   echo "images        ${IMAGES}         n=$(n_files "${IMAGES}" "${IMG_EXT}") ${IMG_EXT} of $(n_files "${IMAGES}") files"
@@ -448,35 +468,68 @@ echo "+- [run ${RUN}] --------------------------------------------------"
 sed 's/^/| /' "${MANIFEST}"
 echo "+-----------------------------------------------------------------"
 
-# The five paths run_scene.sh used to check, printed whenever a scene name resolved them.
-# A missing GT mesh does not stop a training run, so it only aborts for a span that reads it.
+# The four paths run_scene.sh used to check, printed whenever a scene name resolved them.
 if [ -n "${SCENE_NAME}" ]; then
-  miss=0
   for pv in TRAJ GTD GT_MESH GT_INFO; do
     p=${!pv}
-    if   [ -z "${p}" ];  then echo "  unset    ${pv}"; miss=1
+    if   [ -z "${p}" ];  then echo "  unset    ${pv}"
     elif [ -e "${p}" ];  then echo "  ok       ${p}"
-    else                      echo "  MISSING  ${p}"; miss=1; fi
+    else                      echo "  MISSING  ${pv}=${p}"; fi
   done
-  if [ "${miss}" -ne 0 ]; then
-    if want_any stage0 colmap objects name pkl fuse; then
-      echo "[abort] resolve the paths above before running -- this span reads them"; exit 1
-    fi
-    echo "  (not read by stages ${FROM}..${TO}; continuing)"
-  fi
 fi
 
 # Require an input only when a stage in THIS span consumes it and no stage in this span
 # produces it. Demanding a scene model for a FROM=labels TO=labels run is noise.
 fail=0
 chk() { [ -e "$1" ] || { echo "  MISSING $1${2:+   ($2)}"; fail=1; }; }
+# need VAR stage... -- demand VAR only for the stages that actually open it. The four GT paths
+# used to be checked as one bundle, so a FROM=pkl run aborted for want of a semantic mesh that
+# pkl never reads, and the only way past it was to point GT_MESH at some other scene's file.
+need() {
+  local pv=$1; shift
+  want_any "$@" || return 0
+  local p=${!pv}
+  [ -n "${p}" ] && [ -e "${p}" ] && return 0
+  echo "  MISSING ${pv}${p:+=${p}}   (read by: $*)"; fail=1
+}
 want_any stage0 colmap || { want_any relabel objects cond pkl fuse && { chk "${IMAGES}"; chk "${COLMAP}"; }; }
 want masks  || { want_any labels objects mesh cond pkl fuse && chk "${MASKS}"; }
 if [ "${PIPELINE}" = "scene" ] && want objects; then
   want labels || chk "${LABEL_DIR}/id_map.json" "stage: labels"
   want train  || chk "${SCENE_MODEL}/point_cloud/iteration_${ITER}/point_cloud.ply" "stage: train"
 fi
-want_any objects pkl fuse && chk "${GTD}"
+# --traj is what the colmap stage lifts the dense poses from.
+need TRAJ colmap
+# GT depth. The batch script accepts rendered scene depth instead (it checks GTD or
+# CARVE_DEPTH), and the vote and the per-object training each have their own switch, so this is
+# required only where no substitute exists.
+if want_any pkl fuse eval && [ ! -d "${CARVE_DEPTH}" ]; then need GTD pkl fuse eval; fi
+if want objects && { [ "${VOTE_REF}" = "gt" ] || [ "${OBJ_DEPTH_SUPERVISION}" = "gt" ]; }; then
+  need GTD objects
+fi
+# The semantic mesh is Replica-only and genuinely unavoidable for the evaluation -- it is what
+# supplies the per-face object_id and the visibility oracle. The name stage no longer needs it
+# (it falls back to the SAM 3 concepts), so it is not demanded here.
+need GT_MESH eval
+# relabel back-projects through depth; without it every track is dropped and the stage reports
+# zero objects while exiting 0.
+if want relabel; then
+  # Probe the first frame, the same way the tool does: substitute on the STEM only, never on
+  # the directory, and stay quiet when there are no frames yet -- the IMAGES check above owns
+  # that case, and a FROM=stage0 span has not created them at this point.
+  _f1=$(ls "${IMAGES}"/*"${IMG_EXT}" 2>/dev/null | head -1)
+  if [ -n "${_f1}" ]; then
+    _st=$(basename "${_f1}" "${IMG_EXT}")
+    _dprobe="${DEPTH_DIR}/${_st/${DEPTH_FROM}/${DEPTH_TO}}${DEPTH_EXT}"
+    [ -f "${_dprobe}" ] || {
+      echo "  MISSING depth for the relabel 3-D signature: ${_dprobe}"
+      echo "          relabel back-projects the masks through this; without it every track is"
+      echo "          dropped below --min_sig and the stage yields zero objects."
+      echo "          Set DEPTH_DIR / DEPTH_FROM / DEPTH_TO / DEPTH_EXT."
+      fail=1
+    }
+  fi
+fi
 # mesh, cond, pkl, field and fuse all iterate ${OBJ}/<gid>/. When that tree is absent or holds
 # no numeric directory, every loop body is skipped: the stage prints its header, the script
 # exits 0, and the only hint anywhere is the trailing "objects 0 extracted". That is how a
@@ -630,16 +683,26 @@ fi
 # ---------------------------------------------------------------- relabel
 if want relabel; then
   say "relabel: SAM3 video instances  [${CONDA_SAM3} env]"
-  if [ -d "${RELABEL}" ] && [ "$(count_dirs "${RELABEL}")" -gt 0 ]; then
-    echo "  ${RELABEL} has $(count_dirs "${RELABEL}") objects, reusing (CLEAN or rm to redo)"
+  # numeric: a hand-merged tree keeps 13.merged_bak / 30.merged_bak beside the gids, and
+  # without the filter those are counted as objects. make_label_maps.py skips them.
+  if [ -d "${RELABEL}" ] && [ "$(count_dirs "${RELABEL}" numeric)" -gt 0 ]; then
+    echo "  ${RELABEL} has $(count_dirs "${RELABEL}" numeric) objects, reusing (CLEAN or rm to redo)"
+    [ -f "${RELABEL}/concepts.json" ] \
+      || echo "  note: no concepts.json here -- this tree predates it, so the name stage needs GT_MESH"
   else
+    # --depth_* passed explicitly: the tool's default depth_dir is --frames, which happens to
+    # work when the GT depth PNGs sit in images/ and silently yields zero objects otherwise.
     in_env "${CONDA_SAM3}" "LD_LIBRARY_PATH= python sam3_relabel_video.py \
       --frames '${IMAGES}' --img_ext '${IMG_EXT}' --colmap_dir '${COLMAP}' \
+      --depth_dir '${DEPTH_DIR}' --depth_scale ${DEPTH_SCALE} \
+      --depth_from '${DEPTH_FROM}' --depth_to '${DEPTH_TO}' --depth_ext '${DEPTH_EXT}' \
       --vocab_json '${VOCAB}' --bpe '${BPE}' --stride ${STRIDE} --window ${WINDOW} \
       --prompt_frame ${PROMPT_FRAME} --min_area ${MIN_AREA} --min_track ${MIN_TRACK} \
       --reid_th ${REID} --iou_th ${IOU} --cand_th ${CAND} \
       --exclude_concepts '${EXCLUDE}' --out_root '${RELABEL}'" || exit 1
-    echo "  ${RELABEL}: $(count_dirs "${RELABEL}") objects"
+    _nrl=$(count_dirs "${RELABEL}" numeric)
+    echo "  ${RELABEL}: ${_nrl} objects"
+    [ "${_nrl}" -gt 0 ] || { echo "[abort] relabel produced no objects -- nothing downstream can run"; exit 1; }
   fi
 fi
 
@@ -762,10 +825,12 @@ if want objects; then
       [ "${NM}" -lt 8 ] && echo "  [warn ${gid}] ${NM} views < grid_wcap 8"
       [ -f "${OBJ}/${gid}/point_cloud/iteration_${IT}/point_cloud.ply" ] && continue
       echo "  [train ${gid}] views=${NM} iters=${IT}"
+      _odsup=""
+      [ "${OBJ_DEPTH_SUPERVISION}" = "gt" ] && _odsup="--gt_depth_dir ${GTD} --lambda_gtdepth 0.5"
       python train.py -s "${D}" -m "${OBJ}/${gid}" --iterations "${IT}" --is_instance \
         -r "${RESOLUTION}" --data_device "${DATA_DEVICE}" \
         --disable_viewer --lambda_dist "${LDIST}" --lambda_normal "${LNORM}" \
-        --gt_depth_dir "${GTD}" --lambda_gtdepth 0.5 --front_mult 3.0 \
+        ${_odsup} --front_mult 3.0 \
         || { echo "    FAILED"; continue; }
     done
     [ "${ITER}" = "${OBJ_ITERS}" ] || echo "  [note] ITER=${ITER} but objects trained to ${OBJ_ITERS}+"
@@ -774,15 +839,74 @@ fi
 
 # ---------------------------------------------------------------- name
 if want name; then
-  say "name: GT class per object"
+  say "name: object captions"
   # Captions change the completion: without names.tsv every object is generated from
   # "a 3D object in a room". Not optional, even though name_objects.py may fail on some.
   if fresh "${OBJ}/names.tsv" name_objects.py "${GT_MESH}"; then echo "  up to date"
   elif [ -f "${GT_MESH}" ] && [ -d "${OBJ}" ]; then
+    echo "  source: GT semantic mesh"
     python name_objects.py --gt_mesh "${GT_MESH}" --gt_info "${GT_INFO}" \
       --root "${OBJ}" --iter "${ITER}" || true
   fi
-  [ -f "${OBJ}/names.tsv" ] || echo "  WARN no names.tsv -- generation falls back to generic text"
+  # GT-free fallback: the vocabulary concept each object was segmented from. The names were
+  # always there -- SAM 3 is prompted with them -- but they only reached this pipeline's stdout,
+  # so the ShapeR captions depended on a Replica-only semantic mesh and not merely the
+  # evaluation did. sam3_relabel_video.py now writes concepts.json; a relabel tree produced
+  # before that has none, and this falls through to the abort below.
+  if [ ! -f "${OBJ}/names.tsv" ] && [ -f "${RELABEL}/concepts.json" ] && [ -d "${OBJ}" ]; then
+    echo "  source: SAM 3 concepts (${RELABEL}/concepts.json)"
+    python - "${RELABEL}/concepts.json" "${OBJ}" <<'PY' || true
+import json, os, sys
+cj, root = sys.argv[1], sys.argv[2]
+src = json.load(open(cj))
+gids = sorted((g for g in os.listdir(root) if g.isdigit()), key=int)
+GENERIC = "a 3D object in a room"
+
+def article(nm):
+    # Plain vowel-letter test. The vocabulary is concrete object nouns, where it is right
+    # ("an armchair", "an ottoman") far more often than not; name_objects.py always writes
+    # "a", which never showed because every Replica class it emits starts with a consonant.
+    return ("an " if nm[:1].lower() in "aeiou" else "a ") + nm
+
+rows = []
+for g in gids:
+    # The gid is the relabel gid throughout: make_label_maps drops the rare ones but renames
+    # nothing, so a gid absent here was merged or filtered, not renumbered.
+    r = src.get(g)
+    nm = str((r or {}).get("concept", "")).replace("_", " ").strip()
+    tot = float((r or {}).get("votes_total") or 0)
+    share = (float((r or {}).get("votes", 0)) / tot) if tot else 0.0
+    rows.append((g, article(nm) if nm else GENERIC, share, nm))
+out = os.path.join(root, "names.tsv")
+with open(out, "w") as f:
+    for g, cap, share, concept in rows:
+        f.write(f"{g}\t{cap}\t{share:.2f}\t{concept}\n")
+for g, cap, share, concept in rows:
+    flag = ""
+    if not concept:    flag = "   <- no concept for this gid"
+    elif share < 0.6:  flag = "   <- concept disputed between tracks"
+    print(f"{g:>5}  {cap:<24}{share:>7.2f}{flag}")
+miss = [g for g, _, _, c in rows if not c]
+print(f"\n[names] {len(rows) - len(miss)}/{len(rows)} objects captioned -> {out}")
+if miss:
+    print(f"[names] no concept for gid {','.join(miss)} -- those generate from generic text.")
+    if len(miss) * 2 >= len(rows):
+        print("[names] over half the objects are unnamed: concepts.json is probably from a "
+              "different relabel run than this object tree.")
+PY
+  fi
+  if [ ! -f "${OBJ}/names.tsv" ]; then
+    if [ "${ALLOW_GENERIC_CAPTIONS}" = "1" ]; then
+      echo "  WARN no names.tsv -- every object generates from generic text (ALLOW_GENERIC_CAPTIONS=1)"
+    else
+      echo "[abort] no captions for ${OBJ}: neither a GT semantic mesh (GT_MESH) nor"
+      echo "        ${RELABEL}/concepts.json. Generating every object from \"a 3D object in a"
+      echo "        room\" is a silent regression across the whole scene, so this stops here."
+      echo "        Re-run the relabel stage with the current sam3_relabel_video.py to get"
+      echo "        concepts.json, or set ALLOW_GENERIC_CAPTIONS=1 to do it on purpose."
+      exit 1
+    fi
+  fi
 fi
 
 # ---------------------------------------------------------------- mesh (side A)

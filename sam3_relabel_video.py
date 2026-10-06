@@ -1,60 +1,74 @@
 #!/usr/bin/env python3
-"""
-축1 ❶❷ (video) — SAM3 video predictor 기반 instance re-labeling (재설계 v2: depth-dense sig).
+"""Axis 1, steps 1-2 (video) -- instance re-labeling with the SAM 3 video predictor.
 
-설계 원리 (probe로 검증: SAM3 concept-video는 streaming detection):
-  1) concept당 single-prompt(frame 0) + propagate → SAM3가 비디오 전체에서 인스턴스를
-     자동 검출·추적(out_obj_ids). multi-keyframe 재프롬프트 제거(중복 생성 원인 제거).
-  2) 3D signature(sig) = ★GT-depth dense back-projection★:
-     - 마스크 픽셀을 GT depth로 역투영 → 객체 *앞면 실제 표면점*만 → 배경(벽/바닥) 원천 제거.
-     - voxel 해시 + multi-view consistency(여러 프레임에서 일관되게 찍힌 voxel만) → 노이즈 제거.
-  3) instance unification = '비디오 고유 신호' 기반(임계 의존 최소):
-     - 같은 concept: 두 track이 *같은 프레임에 공존(co-occur)*하면 mask IoU로 synonym/distinct 판별.
-       *시간적으로 배타적*이고 3D footprint(voxel)가 겹치면 → re-identification 병합.
-  4) 구조물 concept 제외 + min_track 필터.
+Design, as verified by probing: SAM 3's concept-video mode is a streaming detector.
+  1) One prompt per concept at frame 0, then propagate. SAM 3 finds and tracks the
+     instances itself (out_obj_ids). Re-prompting at several keyframes was removed: it
+     was the source of duplicate instances.
+  2) 3-D signature (sig) = dense back-projection through GT depth.
+     - Mask pixels are back-projected with the depth map, so only points on the object's
+       front surface enter the signature and wall / floor background never does.
+     - A voxel hash plus a multi-view consistency test keeps only voxels seen in a
+       consistent fraction of frames, which removes the noise.
+  3) Instance unification works off signals intrinsic to the video, so it depends on
+     thresholds as little as possible:
+     - Same concept, two tracks that CO-OCCUR in a frame: mask IoU decides synonym /
+       duplicate versus two objects in contact.
+     - Temporally exclusive tracks whose 3-D footprints (voxels) overlap: re-identified
+       and merged.
+  4) Structural concepts are excluded and a min_track filter is applied.
 
-★ v2.1: --window N — 프레임을 window로 잘라 세션별 처리(GPU 상한 고정), --win_overlap 로 경계 보호.
-★ v2.2: pose-coverage — compute_sig 분모=유효 프레임만, cam coverage 진단, --posed_only(기본 ON),
-        concept별 empty_cache.
-★ v2.3: CPU RAM — 마스크 bit-pack(8×↓), propagate 스트리밍 즉시 압축, dcache window별 해제, RSS 로그.
+v2.1: --window N splits the frames into windows processed as separate sessions, which
+      caps GPU memory; --win_overlap protects the boundaries.
+v2.2: pose coverage -- compute_sig's denominator counts only usable frames, camera
+      coverage is reported, --posed_only (on by default), per-concept empty_cache.
+v2.3: CPU RAM -- masks are bit-packed (8x smaller), compressed as propagate streams,
+      the depth cache is released per window, RSS is logged.
 
-★ v2.4 패치 (checkpoint/resume) ★
-    1. window 완료마다 tracks 를 <out_root>/tracks_ckpt.pkl 에 저장. 재실행 시 자동으로
-       완료된 window 를 건너뛰고 이어감(★같은 --stride/--window/--win_overlap 필수★, 자동 검증).
-       정상 완료 시 ckpt 자동 삭제. --no_resume 으로 무시 가능.
-    2. 시작 시 PYTORCH_CUDA_ALLOC_CONF=expandable_segments 감지 경고.
-    3. 최종 저장 전 out_root 의 기존 숫자 폴더 제거 — 크래시 후 이전 런 잔재가 "N objects 성공"
-       으로 위장하는 사고 방지 (run_full_pipeline.sh 는 exit code 를 확인하지 않고 폴더 수만 센다).
+v2.4 (checkpoint / resume)
+    1. tracks are written to <out_root>/tracks_ckpt.pkl after each window. A re-run skips
+       the completed windows and continues (the SAME --stride / --window / --win_overlap
+       are required, and this is checked). The checkpoint is deleted on normal completion.
+       --no_resume ignores it.
+    2. PYTORCH_CUDA_ALLOC_CONF=expandable_segments is detected and warned about at start.
+    3. Existing numeric directories under out_root are removed before the final save, so
+       leftovers from a crashed run cannot masquerade as "N objects succeeded" (the caller
+       counts directories and does not check the exit code).
 
-★ v2.5 패치 (concept 단위 resume — in-process 복구 폐기) ★
-  실측: NVML assert 후 empty_cache freed 0 bytes / reserved 20.6GB 유지 → predictor 재빌드해도
-  첫 .to(device) 에서 재발. 한 번 assert 가 나면 그 프로세스의 allocator 는 회생 불가.
-  수정:
-    1. RuntimeError 발생 시 in-process 재시도 대신, 완료된 concept 까지의 tracks 를
-       ckpt(partial: window wi, concept ci)에 저장하고 exit code 3 으로 종료.
-    2. 재실행 시 같은 window 의 죽은 concept 부터 이어감 (window 재시작 불필요).
-    3. 외부 wrapper 로 무인 완주:
+v2.5 (per-concept resume -- in-process recovery abandoned)
+  Measured: after an NVML assert, empty_cache frees 0 bytes and 20.6 GB stays reserved, so
+  rebuilding the predictor hits the same failure on its first .to(device). Once that assert
+  fires, the process's allocator cannot be recovered.
+    1. On RuntimeError, instead of retrying in-process, the tracks completed so far are
+       written to the checkpoint (partial: window wi, concept ci) and the process exits 3.
+    2. A re-run resumes from the concept that died, without restarting the window.
+    3. To run unattended, wrap it:
        until bash run_full_pipeline.sh relabel; do echo "=== restart ==="; sleep 5; done
 
-★ v2.6 패치 (concept 단위 window 분할 — 결정론적 per-concept OOM 대응) ★
-  실측: fresh 프로세스 + window 9 단독에서도 [cushion] 이 매번 frame 182/200 에서 NVML assert.
-  → 인스턴스가 많은 concept 은 다수 객체 동시 tracking 으로 window 200프레임의 피크가 GPU 를
-  결정론적으로 초과. 재시작해도 같은 자리에서 죽어 무한 반복.
-  수정: 같은 (window, concept) 이 실패하면 ckpt 에 split_lv 를 올려 저장 → 재시작 시 그 concept
-  만 window 를 2^lv 조각(2→4)으로 분할해 세션별 처리(피크 1/2, 1/4). 조각 track 은 시간 배타라
-  기존 3D re-id 가 재결합. 4조각에서도 실패하면 skipped_concepts.txt 기록 후 다음 concept 진행.
+v2.6 (per-concept window splitting -- for deterministic per-concept OOM)
+  Measured: in a fresh process running window 9 alone, [cushion] still hit the NVML assert
+  at frame 182/200 every time. A concept with many instances tracks many objects at once,
+  so the peak over a 200-frame window exceeds the GPU deterministically and a restart dies
+  in the same place forever.
+  Fix: when the same (window, concept) fails again, split_lv is raised in the checkpoint, so
+  the re-run processes THAT concept in 2^lv pieces (2, then 4) as separate sessions, cutting
+  the peak to 1/2 and 1/4. The pieces are temporally exclusive, so the existing 3-D re-id
+  puts them back together. If four pieces still fail, the concept is recorded in
+  skipped_concepts.txt and the run moves to the next one.
 
-출력: <out_root>/<gid>/<stem>.png (마스크) + points3d.ply (depth voxel 센터, init) → prepare_folder 입력.
+Output: <out_root>/<gid>/<stem>.png (masks) + points3d.ply (depth voxel centres, used as
+init) -> input to prepare_folder, and <out_root>/concepts.json, the vocabulary term each
+object came from.
 
-실행 (sam3 env):
+Run (sam3 env):
     unset PYTORCH_CUDA_ALLOC_CONF
     LD_LIBRARY_PATH= \
     python sam3_relabel_video.py \
-        --frames data/replica_room0_v2/images --img_ext .jpg \
-        --colmap_dir data/replica_room0_v2/sparse_dense/0 \
-        --depth_dir data/replica_room0_v2/images --depth_scale 6553.5 \
-        --vocab_json /home/elicer/sam3/vocab.json \
-        --bpe /home/elicer/sam3/sam3/assets/bpe_simple_vocab_16e6.txt.gz \
+        --frames data/replica_room0/images --img_ext .jpg \
+        --colmap_dir data/replica_room0/sparse_dense/0 \
+        --depth_dir data/replica_room0/images --depth_scale 6553.5 \
+        --vocab_json "$HOME"/sam3/vocab.json \
+        --bpe "$HOME"/sam3/sam3/assets/bpe_simple_vocab_16e6.txt.gz \
         --stride 2 --window 200 --min_area 0.0008 --min_track 2 \
         --vox 0.03 --sig_frac 0.25 --reid_th 0.3 \
         --exclude_concepts "door,blind,vent,window,wall,floor,ceiling,light switch,thermostat" \
@@ -66,7 +80,7 @@ import numpy as np, torch
 from PIL import Image
 
 
-# ── COLMAP ──
+# -- COLMAP --
 def _q2r(q):
     w,x,y,z=q
     return np.array([[1-2*y*y-2*z*z,2*x*y-2*w*z,2*x*z+2*w*y],
@@ -123,7 +137,8 @@ def load_cams(d):
     return out
 
 def write_ply(path, xyz):
-    """per-object 초기 포인트(depth voxel 센터)를 binary PLY로 저장 → prepare_folder가 points3d.ply로."""
+    """Per-object init points (depth voxel centres) as a binary PLY -> prepare_folder reads
+    it as points3d.ply."""
     xyz = np.asarray(xyz, np.float32); n = len(xyz)
     with open(path, "wb") as f:
         f.write(b"ply\nformat binary_little_endian 1.0\n")
@@ -141,9 +156,9 @@ def jac(a, b):
     i = len(a & b); return i / (len(a) + len(b) - i)
 
 
-# ── ★ v2.3: bit-packed 마스크 (CPU RAM 8×↓) ★ ──
+# -- v2.3: bit-packed masks (8x less CPU RAM) --
 def pack_mask(m):
-    """bool HxW → (packed bytes, shape). np.packbits: 0.8MB → ~0.1MB."""
+    """bool HxW -> (packed bytes, shape). np.packbits: 0.8 MB -> ~0.1 MB."""
     m = np.asarray(m, bool)
     return (np.packbits(m), m.shape)
 
@@ -152,7 +167,7 @@ def unpack_mask(p):
     return np.unpackbits(b, count=shape[0]*shape[1]).reshape(shape).astype(bool)
 
 def or_masks(p1, p2):
-    """packed OR packed → packed (같은 shape 가정; 다르면 unpack 경로)."""
+    """packed OR packed -> packed (assumes equal shape; falls back to unpacking)."""
     if p1[1] == p2[1] and len(p1[0]) == len(p2[0]):
         return (np.bitwise_or(p1[0], p2[0]), p1[1])
     return pack_mask(unpack_mask(p1) | unpack_mask(p2))
@@ -165,9 +180,9 @@ def rss_gb():
     return float("nan")
 
 
-# ── ★ depth-dense 3D signature ★ ──
+# -- dense 3-D signature from depth --
 def load_depth(stem, dcfg, cache):
-    """stem(frameNNNNNN) → 대응 depth 맵(meters). dcfg=(dir,pfrom,pto,ext,scale). 캐시."""
+    """stem (frameNNNNNN) -> its depth map in metres. dcfg=(dir,pfrom,pto,ext,scale). Cached."""
     if stem in cache: return cache[stem]
     ddir,pfrom,pto,ext,scale = dcfg
     dn = stem.replace(pfrom, pto) + ext
@@ -176,31 +191,34 @@ def load_depth(stem, dcfg, cache):
         cache[stem]=None; return None
     D = np.asarray(Image.open(path)).astype(np.float32)
     if D.ndim==3: D=D[...,0]
-    cache[stem]=D/scale          # meters
+    cache[stem]=D/scale          # metres
     return cache[stem]
 
 def backproject_voxels(mask, cam, D, vox, max_px, zmin=0.05, zmax=20.0):
-    """마스크 픽셀을 GT depth로 역투영 → world 좌표 → voxel-key(tuple) 집합."""
+    """Back-project the mask pixels through the depth map -> world coordinates -> a set of
+    voxel keys (tuples)."""
     if cam is None or D is None: return set()
     ys, xs = np.nonzero(mask)
     if len(xs)==0: return set()
     if len(xs)>max_px:
         sel=np.random.choice(len(xs),max_px,replace=False); xs,ys=xs[sel],ys[sel]
     Hd,Wd = D.shape
-    sx=Wd/cam["W"]; sy=Hd/cam["H"]                 # depth 해상도가 RGB와 다를 수 있음
+    sx=Wd/cam["W"]; sy=Hd/cam["H"]                 # the depth map may differ in resolution from the RGB
     xd=np.clip((xs*sx).astype(np.int64),0,Wd-1); yd=np.clip((ys*sy).astype(np.int64),0,Hd-1)
     d=D[yd,xd]
     ok=(d>zmin)&(d<zmax)
     if not ok.any(): return set()
     xs,ys,d=xs[ok].astype(np.float64),ys[ok].astype(np.float64),d[ok].astype(np.float64)
-    Xc=np.stack([(xs-cam["cx"])/cam["fx"]*d, (ys-cam["cy"])/cam["fy"]*d, d],1)  # 카메라좌표
+    Xc=np.stack([(xs-cam["cx"])/cam["fx"]*d, (ys-cam["cy"])/cam["fy"]*d, d],1)  # camera frame
     Xw=(Xc-cam["t"])@cam["R"]                       # world = R^T (Xc - t)
     keys=np.floor(Xw/vox).astype(np.int64)
     return set(map(tuple, keys.tolist()))
 
 def compute_sig(masks, cams, dcfg, dcache, vox, max_px, sig_frac):
-    """track 의 모든 프레임 마스크(packed) → depth voxel 집계 → multi-view 일관 voxel만 sig.
-    ★v2.2: 임계 분모 = cam+depth 유효 프레임 수만. ★v2.3: on-demand unpack."""
+    """Every frame mask of a track (packed) -> depth voxels -> only the multi-view consistent
+    voxels become the signature.
+    v2.2: the threshold's denominator counts only frames with both a camera and a depth map.
+    v2.3: unpack on demand."""
     vcount=Counter(); nvalid=0
     for stem,mp_ in masks.items():
         cam=cams.get(stem); D=load_depth(stem, dcfg, dcache)
@@ -218,51 +236,54 @@ def main():
     ap.add_argument("--colmap_dir",required=True)
     ap.add_argument("--vocab_json",default=None); ap.add_argument("--vocab",default=None)
     ap.add_argument("--bpe",default=None)
-    ap.add_argument("--stride",type=int,default=10,help="SAM3 propagate 프레임 subsample(메모리/속도)")
+    ap.add_argument("--stride",type=int,default=10,help="frame subsample for SAM3 propagate (memory / speed)")
     ap.add_argument("--window",type=int,default=0,
-                    help="★프레임을 이 개수 단위 window로 나눠 세션별 처리(0=전체 한 번). GPU 메모리 상한 고정.")
+                    help="split the frames into windows of this size, each its own session "
+                         "(0 = one pass over everything). Caps GPU memory.")
     ap.add_argument("--win_overlap",type=float,default=0.5,
-                    help="★window 겹침 비율(0~0.9). 경계/짧은 관측 객체를 한 window에 온전히 담아 누락 방지.")
+                    help="window overlap fraction (0-0.9). Keeps an object that only appears "
+                         "near a boundary wholly inside one window.")
     ap.add_argument("--posed_only",action="store_true",default=True,
-                    help="★v2.2: colmap pose 있는 프레임만 사용(기본 ON).")
+                    help="v2.2: use only frames that have a colmap pose (on by default).")
     ap.add_argument("--no_posed_only",dest="posed_only",action="store_false")
     ap.add_argument("--offload_state",action="store_true",default=True,
-                    help="★프레임별 state를 CPU로 offload. 기본 ON.")
+                    help="offload per-frame state to the CPU. On by default.")
     ap.add_argument("--no_offload_state",dest="offload_state",action="store_false")
     ap.add_argument("--offload_video",action="store_true",default=True,
-                    help="★비디오 프레임 텐서를 CPU로 offload. 기본 ON.")
+                    help="offload the video frame tensors to the CPU. On by default.")
     ap.add_argument("--no_offload_video",dest="offload_video",action="store_false")
     ap.add_argument("--resume",action="store_true",default=True,
-                    help="★v2.4: window 체크포인트에서 이어가기(기본 ON).")
+                    help="v2.4: continue from the window checkpoint (on by default).")
     ap.add_argument("--no_resume",dest="resume",action="store_false")
-    ap.add_argument("--prompt_frame",type=int,default=0,help="concept를 프롬프트할 window-로컬 프레임 인덱스")
+    ap.add_argument("--prompt_frame",type=int,default=0,help="window-local frame index at which to prompt each concept")
     ap.add_argument("--min_area",type=float,default=0.0008,
-                    help="프레임 마스크 최소 면적")
-    ap.add_argument("--min_track",type=int,default=2,help="유효 객체 최소 관측 프레임 수")
-    # ── depth-dense sig 파라미터 ──
-    ap.add_argument("--depth_dir",default=None,help="GT depth 폴더(기본: --frames 와 동일)")
-    ap.add_argument("--depth_from",default="frame",help="stem 의 이 접두어를")
-    ap.add_argument("--depth_to",default="depth",help="이걸로 치환해 depth 파일명 생성")
+                    help="minimum per-frame mask area")
+    ap.add_argument("--min_track",type=int,default=2,help="minimum observed frames for a valid object")
+    # -- dense depth signature parameters --
+    ap.add_argument("--depth_dir",default=None,help="GT depth directory (default: same as --frames)")
+    ap.add_argument("--depth_from",default="frame",help="replace this prefix in the stem")
+    ap.add_argument("--depth_to",default="depth",help="with this one, to form the depth file name")
     ap.add_argument("--depth_ext",default=".png")
-    ap.add_argument("--depth_scale",type=float,default=6553.5,help="uint16 → meters 나눗셈 인자")
-    ap.add_argument("--vox",type=float,default=0.03,help="voxel 크기(m). 3cm 기본")
-    ap.add_argument("--max_px",type=int,default=3000,help="프레임당 역투영 픽셀 상한(속도)")
-    ap.add_argument("--min_sig",type=int,default=8,help="안정 voxel 이보다 적으면 노이즈 track 폐기")
+    ap.add_argument("--depth_scale",type=float,default=6553.5,help="divisor converting uint16 to metres")
+    ap.add_argument("--vox",type=float,default=0.03,help="voxel size (m). 3 cm by default")
+    ap.add_argument("--max_px",type=int,default=3000,help="cap on back-projected pixels per frame (speed)")
+    ap.add_argument("--min_sig",type=int,default=8,help="discard a track as noise below this many stable voxels")
     ap.add_argument("--sig_frac",type=float,default=0.25,
-                    help="voxel 을 객체로 인정할 최소 프레임 비율(유효 프레임 기준)")
-    ap.add_argument("--reid_th",type=float,default=0.3,help="시간 배타 track re-id 병합 voxel-Jaccard 임계")
-    ap.add_argument("--iou_th",type=float,default=0.5,help="공존 프레임 2D 마스크 IoU 임계(이상=synonym/중복 병합)")
-    ap.add_argument("--cand_th",type=float,default=0.05,help="voxel-Jaccard 후보 하한")
+                    help="minimum fraction of frames (of the usable ones) in which a voxel must "
+                         "appear to count as part of the object")
+    ap.add_argument("--reid_th",type=float,default=0.3,help="voxel-Jaccard threshold to merge temporally exclusive tracks")
+    ap.add_argument("--iou_th",type=float,default=0.5,help="2-D mask IoU threshold on co-occurring frames (above = synonym / duplicate)")
+    ap.add_argument("--cand_th",type=float,default=0.05,help="voxel-Jaccard floor for a merge candidate")
     ap.add_argument("--exclude_concepts",default="")
     ap.add_argument("--out_root",required=True)
     args=ap.parse_args(); os.makedirs(args.out_root,exist_ok=True)
 
-    # ── ★v2.4: allocator 옵션 경고 ──
+    # -- v2.4: warn about the allocator option --
     acc=os.environ.get("PYTORCH_CUDA_ALLOC_CONF","")
     if "expandable_segments" in acc:
-        print(f"★★경고: PYTORCH_CUDA_ALLOC_CONF={acc}\n"
-              "  expandable_segments 는 NVML_SUCCESS INTERNAL ASSERT(CUDACachingAllocator) 유발 혐의.\n"
-              "  `unset PYTORCH_CUDA_ALLOC_CONF` 후 실행을 강력 권장.")
+        print(f"** WARNING: PYTORCH_CUDA_ALLOC_CONF={acc}\n"
+              "  expandable_segments is the suspected cause of the NVML_SUCCESS INTERNAL ASSERT\n"
+              "  in CUDACachingAllocator. Running after `unset PYTORCH_CUDA_ALLOC_CONF` is strongly advised.")
 
     VOCAB=(json.load(open(args.vocab_json))["vocab"] if args.vocab_json
            else [v.strip() for v in args.vocab.split(",")])
@@ -272,57 +293,60 @@ def main():
     dcache={}
     print(f"vocab={len(VOCAB)} cams={len(cams)} depth_dir={ddir} vox={args.vox}m")
 
-    # 전역 프레임 리스트 (stride 적용) — window 로 나눠 세션별 처리
+    # Global frame list (after --stride), split into windows processed as separate sessions.
     src=sorted(glob.glob(os.path.join(args.frames,f"*{args.img_ext}")))[::args.stride]
     stems_all=[os.path.splitext(os.path.basename(f))[0] for f in src]
 
-    # ── ★v2.2: cam coverage 진단 + posed-only 필터 ──
+    # -- v2.2: camera-coverage diagnostic and the posed-only filter --
     n_posed=sum(1 for s in stems_all if s in cams)
     cover=n_posed/max(len(stems_all),1)
-    print(f"★cam coverage: {n_posed}/{len(stems_all)} = {cover:.1%} (colmap={args.colmap_dir})")
+    print(f"*cam coverage: {n_posed}/{len(stems_all)} = {cover:.1%} (colmap={args.colmap_dir})")
     if cover<0.9:
-        print("★★경고: pose coverage <90% — colmap 이 프레임 서브셋만 커버. dense stride 를 줘도 "
-              "유효 감독 뷰는 posed 프레임 수를 넘지 못함. make_dense_colmap.py 로 dense pose 생성 권장.")
+        print("** WARNING: pose coverage below 90% -- colmap covers only a subset of the frames. "
+              "A dense stride cannot raise the number of usable supervision views above the "
+              "number of posed frames. Generate dense poses with make_dense_colmap.py.")
     if args.posed_only:
         keep=[i for i,s in enumerate(stems_all) if s in cams]
         if len(keep)<len(stems_all):
-            print(f"★posed_only: {len(stems_all)} → {len(keep)} 프레임 (unposed 제외)")
+            print(f"*posed_only: {len(stems_all)} -> {len(keep)} frames (unposed dropped)")
         src=[src[i] for i in keep]; stems_all=[stems_all[i] for i in keep]
     N=len(src)
 
     win = args.window if args.window>0 else N
     win = max(1, min(win, N)) if N else 1
     if N and args.window>0:
-        step=max(1,int(round(win*(1.0-max(0.0,min(0.9,args.win_overlap))))))   # overlap → 경계 객체 온전 포착
+        step=max(1,int(round(win*(1.0-max(0.0,min(0.9,args.win_overlap))))))   # overlap -> boundary objects captured whole
         windows=[]
         for s in range(0, N, step):
             w=range(s, min(s+win, N))
-            if windows and w.stop<=windows[-1].stop: break                     # 끝 도달 → 중복 window 방지
+            if windows and w.stop<=windows[-1].stop: break                     # reached the end -- no duplicate window
             windows.append(w)
     else:
         windows=[range(0, N)] if N else []
-    # per-track min_track: window로 쪼갤 땐 완화(1). 최종 필터는 병합 객체 단위(아래).
+    # per-track min_track: relaxed to 1 when splitting into windows. The final filter is applied
+    # per merged object, below.
     mt_track = 1 if args.window>0 else args.min_track
     print(f"frames={N}  window={win}  n_windows={len(windows)}  (single-prompt @local frame {args.prompt_frame}, streaming)")
 
-    # ── ★v2.4: 체크포인트 로드 ──
+    # -- v2.4: load the checkpoint --
     ckpt_path=os.path.join(args.out_root,"tracks_ckpt.pkl")
     ckpt_key=dict(N=N,stride=args.stride,window=args.window,win_overlap=args.win_overlap,
                   n_windows=len(windows),vocab=len(VOCAB))
-    tracks=[]; done_windows=0; partial_ci=0; split_lv=0   # partial_ci/split_lv: 재개 지점·분할 레벨
+    tracks=[]; done_windows=0; partial_ci=0; split_lv=0   # partial_ci / split_lv: resume point and split level
     if args.resume and os.path.isfile(ckpt_path):
         try:
             with open(ckpt_path,"rb") as f: ck=pickle.load(f)
             if ck.get("key")==ckpt_key:
                 tracks=ck["tracks"]; done_windows=ck["done_windows"]
                 partial_ci=ck.get("partial_ci",0); split_lv=ck.get("split_lv",0)
-                print(f"★resume: window {done_windows}/{len(windows)} 완료 + partial concept {partial_ci}"
+                print(f"*resume: loaded checkpoint at window {done_windows}/{len(windows)} "
+                      f"+ partial concept {partial_ci}"
                       + (f" (split_lv={split_lv})" if split_lv else "")
-                      + f" 체크포인트 로드 (tracks={len(tracks)})")
+                      + f" (tracks={len(tracks)})")
             else:
-                print(f"★ckpt 무시: 파라미터 불일치 {ck.get('key')} != {ckpt_key}")
+                print(f"*ckpt ignored: parameters differ {ck.get('key')} != {ckpt_key}")
         except Exception as e:
-            print(f"★ckpt 로드 실패({e}) — 처음부터 실행")
+            print(f"*ckpt failed to load ({e}) -- running from the start")
 
     def save_ckpt(dw, pci=0, slv=0):
         with open(ckpt_path+".tmp","wb") as f:
@@ -330,12 +354,20 @@ def main():
                         f,protocol=4)
         os.replace(ckpt_path+".tmp",ckpt_path)
 
-    # depth 접근성 sanity check (첫 프레임)
+    # Depth sanity check on the first frame. Without depth every signature comes back empty and
+    # every track is discarded below min_sig -- the run then reports zero objects and exits 0,
+    # which reads as a successful no-op. Stop here instead.
     if N:
         _D=load_depth(stems_all[0],dcfg,dcache)
-        print(f"depth probe [{stems_all[0]}]: "
-              + (f"OK shape={_D.shape} range=[{_D[_D>0].min():.2f},{_D.max():.2f}]m" if _D is not None
-                 else "★없음★ — --depth_dir/--depth_from/--depth_to 확인 필요"))
+        if _D is None:
+            print(f"[abort] depth probe [{stems_all[0]}] found nothing at "
+                  f"{os.path.join(ddir, stems_all[0].replace(args.depth_from, args.depth_to) + args.depth_ext)}")
+            print("        The 3-D signature is a back-projection through depth, so without it every")
+            print("        track is discarded and this run would produce zero objects without failing.")
+            print("        Check --depth_dir / --depth_from / --depth_to / --depth_ext.")
+            sys.exit(1)
+        print(f"depth probe [{stems_all[0]}]: OK shape={_D.shape} "
+              f"range=[{_D[_D>0].min():.2f},{_D.max():.2f}]m")
 
     from sam3.model_builder import build_sam3_video_predictor
     def build_predictor():
@@ -346,11 +378,11 @@ def main():
             return build_sam3_video_predictor(gpus_to_use=range(torch.cuda.device_count()))
     predictor=build_predictor()
 
-    # ── window별 세션 → concept별 single-prompt streaming → track 수집 ──
+    # -- per-window session -> one prompt per concept, streaming -> collect tracks --
     with torch.inference_mode(), torch.autocast("cuda",dtype=torch.bfloat16):
         for wi,wr in enumerate(windows):
-            if wi<done_windows: continue                     # ★v2.4: resume skip
-            # window 프레임을 정수명으로 심링크 (로컬 idx→전역 stem)
+            if wi<done_windows: continue                     # v2.4: resume skip
+            # Symlink the window's frames under integer names (local idx -> global stem).
             wdir=tempfile.mkdtemp(prefix=f"sam3relabel_w{wi}_"); local2stem=[]
             for li,gi in enumerate(wr):
                 os.symlink(os.path.abspath(src[gi]),os.path.join(wdir,f"{li}.jpg"))
@@ -362,16 +394,16 @@ def main():
                         offload_state_to_cpu=args.offload_state))["session_id"]
             sid=open_session()
             wtracks=0
-            ci=partial_ci if wi==done_windows else 0    # ★v2.5: 죽은 concept 부터 재개
-            slv=split_lv if wi==done_windows else 0     # ★v2.6: 죽은 concept 의 분할 레벨
+            ci=partial_ci if wi==done_windows else 0    # v2.5: resume from the concept that died
+            slv=split_lv if wi==done_windows else 0     # v2.6: that concept's split level
             partial_ci=0; split_lv=0
-            if ci>0: print(f"  ★partial resume: window {wi+1} concept {ci}({VOCAB[ci]}) 부터"
+            if ci>0: print(f"  *partial resume: window {wi+1} from concept {ci}({VOCAB[ci]})"
                            + (f" split_lv={slv}" if slv else ""))
             while ci<len(VOCAB):
                 c=VOCAB[ci]
-                cur_slv,slv = slv,0                     # 분할 레벨은 재개된 concept 에만 적용
+                cur_slv,slv = slv,0                     # the split level applies only to the resumed concept
                 try:
-                    # ★v2.3: propagate 스트림을 모아두지 않고 즉시 필터 + bit-pack
+                    # v2.3: do not accumulate the propagate stream -- filter and bit-pack at once
                     byid={}
                     def collect(stream, off):
                         for r in stream:
@@ -384,10 +416,10 @@ def main():
                                 dd=byid.setdefault((off,int(oid)),{"masks":{},"score":0.0})
                                 dd["masks"][stem]=pack_mask(m>0); dd["score"]=max(dd["score"],float(probs[k]))
                     if cur_slv>0:
-                        # ★v2.6: 이 concept 이 full-window 에서 OOM → 2^lv 조각으로 분할 처리.
-                        #        조각 track 은 시간 배타 → 3D re-id 가 재결합.
+                        # v2.6: this concept hit OOM over the full window -> process it in 2^lv pieces.
+                        #       The pieces are temporally exclusive, so the 3-D re-id reunites them.
                         nsub=2**cur_slv
-                        print(f"  ★[{c}] split mode: {Nw}프레임 → {nsub}조각")
+                        print(f"  *[{c}] split mode: {Nw} frames -> {nsub} pieces")
                         try: predictor.handle_request(dict(type="close_session",session_id=sid))
                         except Exception: pass
                         gc.collect(); torch.cuda.empty_cache()
@@ -406,54 +438,57 @@ def main():
                                 dict(type="propagate_in_video",session_id=ssid)), lo)
                             predictor.handle_request(dict(type="close_session",session_id=ssid))
                             gc.collect(); torch.cuda.empty_cache()
-                        sid=open_session()              # 다음 concept 용 main 세션 복구
+                        sid=open_session()              # restore the main session for the next concept
                     else:
                         predictor.handle_request(dict(type="reset_session",session_id=sid))
                         predictor.handle_request(dict(type="add_prompt",session_id=sid,frame_index=pf,text=c))
                         collect(predictor.handle_stream_request(
                             dict(type="propagate_in_video",session_id=sid)), 0)
                 except RuntimeError as e:
-                    # ★v2.5/2.6: NVML assert 후 이 프로세스는 회생 불가 → ckpt 저장 후 종료.
-                    #   같은 concept 반복 실패 시 분할 레벨 상승(2→4조각), 그래도 실패면 skip.
-                    print(f"  ★RuntimeError @[{c}] window {wi+1} (split_lv={cur_slv}): {str(e).splitlines()[0]}")
+                    # v2.5 / v2.6: after an NVML assert this process cannot recover -> save the
+                    #   checkpoint and exit. Repeated failure on the same concept raises the split
+                    #   level (2 then 4 pieces); if that still fails, skip it.
+                    print(f"  *RuntimeError @[{c}] window {wi+1} (split_lv={cur_slv}): {str(e).splitlines()[0]}")
                     if cur_slv>=2:
                         with open(os.path.join(args.out_root,"skipped_concepts.txt"),"a") as f:
                             f.write(f"window{wi} {c}\n")
-                        print(f"  ★[{c}] 4조각에서도 실패 → skipped_concepts.txt 기록, 다음 concept 부터 재개")
+                        print(f"  *[{c}] failed even in 4 pieces -> recorded in skipped_concepts.txt, "
+                              f"resuming from the next concept")
                         save_ckpt(wi, ci+1, 0)
                     else:
                         save_ckpt(wi, ci, cur_slv+1)
-                        print(f"  ★ckpt 저장(window {wi}, concept {ci}, split_lv={cur_slv+1}) → exit 3. "
-                              f"재실행하면 [{c}] 를 분할 처리로 재개.")
-                    print("    무인 완주: until bash run_full_pipeline.sh relabel; do sleep 5; done")
+                        print(f"  *ckpt saved (window {wi}, concept {ci}, split_lv={cur_slv+1}) -> exit 3. "
+                              f"Re-running resumes [{c}] in split mode.")
+                    print("    to run unattended: until bash run_full_pipeline.sh relabel; do sleep 5; done")
                     sys.exit(3)
                 kept=0
                 for oid,dd in byid.items():
-                    if len(dd["masks"])<mt_track: continue        # window: 완화(1)
+                    if len(dd["masks"])<mt_track: continue        # windowed: relaxed to 1
                     sig=compute_sig(dd["masks"],cams,dcfg,dcache,args.vox,args.max_px,args.sig_frac)
-                    if len(sig)<args.min_sig: continue    # 안정 표면 voxel 부족 → 폐기
+                    if len(sig)<args.min_sig: continue    # too few stable surface voxels -> discard
                     tracks.append(dict(concept=c,masks=dd["masks"],frames=set(dd["masks"].keys()),
                                        sig=sig,score=dd["score"]))
                     kept+=1; wtracks+=1
-                print(f"  [{c}] SAM3 ids={len(byid)} → valid tracks={kept}"
+                print(f"  [{c}] SAM3 ids={len(byid)} -> valid tracks={kept}"
                       + (f"  (window {wi+1}/{len(windows)})" if len(windows)>1 else ""))
                 del byid
-                torch.cuda.empty_cache()                  # ★v2.2: concept 축 누적 완화
+                torch.cuda.empty_cache()                  # v2.2: relieve the accumulation along the concept axis
                 ci+=1
-            # window 세션 해제 → GPU 메모리 반환 + ★v2.3: depth 캐시/RSS 관리
+            # Close the window's session -> GPU memory returned. v2.3: manage the depth cache and RSS.
             predictor.handle_request(dict(type="close_session",session_id=sid))
             dcache.clear(); gc.collect(); torch.cuda.empty_cache()
-            # ★v2.4/2.5: window 체크포인트 저장 (원자적 rename)
+            # v2.4 / v2.5: save the window checkpoint (atomic rename)
             save_ckpt(wi+1, 0)
             print(f"  [window {wi+1}/{len(windows)}] frames {wr.start}..{wr.stop-1}  "
-                  f"new tracks={wtracks}  total={len(tracks)}  RSS={rss_gb():.1f}GB  ckpt✓")
+                  f"new tracks={wtracks}  total={len(tracks)}  RSS={rss_gb():.1f}GB  ckpt ok")
     try: predictor.shutdown()
     except Exception: pass
-    print(f"\nnative tracks(전 concept·전 window): {len(tracks)}  RSS={rss_gb():.1f}GB")
+    print(f"\nnative tracks (all concepts, all windows): {len(tracks)}  RSS={rss_gb():.1f}GB")
 
-    # ── co-occurrence 기반 instance unification (union-find) ──
-    #     overlap window: 같은 객체의 인접-window track 은 프레임 공유 → mask-IoU(synonym) 경로.
-    #     non-overlap 경계/재등장: 프레임 배타 → voxel-Jaccard re-id 경로.
+    # -- instance unification by co-occurrence (union-find) --
+    #     With overlapping windows, two tracks of the same object in adjacent windows share
+    #     frames -> the mask-IoU (synonym) path. Non-overlapping boundaries and re-appearances
+    #     are frame-exclusive -> the voxel-Jaccard re-id path.
     parent=list(range(len(tracks)))
     def find(x):
         while parent[x]!=x: parent[x]=parent[parent[x]]; x=parent[x]
@@ -475,19 +510,19 @@ def main():
     for i in range(len(tracks)):
         for j in range(i+1,len(tracks)):
             A,B=tracks[i],tracks[j]
-            j3=jac(A["sig"],B["sig"])               # voxel-Jaccard (dense, 배경 없음)
+            j3=jac(A["sig"],B["sig"])               # voxel-Jaccard (dense, no background)
             if j3<args.cand_th: continue
-            if A["frames"] & B["frames"]:           # 공존: 마스크 IoU로 synonym vs 접촉 구분
+            if A["frames"] & B["frames"]:           # co-occurring: mask IoU separates synonym from contact
                 if mask_iou_shared(A,B)>args.iou_th:
                     union(i,j); n_syn+=1
-            else:                                   # 시간 배타(다른 window 포함): 같은 위치=같은 객체(re-id)
+            else:                                   # temporally exclusive (incl. across windows): same place = same object
                 if j3>args.reid_th:
                     union(i,j); n_reid+=1
     groups=defaultdict(list)
     for i in range(len(tracks)): groups[find(i)].append(i)
-    print(f"unification: synonym/dup 병합={n_syn}, re-id 병합={n_reid} → 그룹 {len(groups)}")
+    print(f"unification: synonym/dup merges={n_syn}, re-id merges={n_reid} -> {len(groups)} groups")
 
-    # ── 그룹 → 객체 (masks OR — packed 상태 유지, sig union, concept 다수결) ──
+    # -- group -> object (masks OR'd while staying packed, sig unioned, concept by majority) --
     excl={c.strip() for c in args.exclude_concepts.split(",") if c.strip()}
     objs=[]
     for members in groups.values():
@@ -497,18 +532,23 @@ def main():
             for stem,mp_ in t["masks"].items():
                 masks[stem]=or_masks(masks[stem],mp_) if stem in masks else mp_
         if concepts.most_common(1)[0][0] in excl: continue
-        if len(masks)<args.min_track: continue      # ★최종 필터: 병합된 객체의 전체 관측 프레임 수
+        if len(masks)<args.min_track: continue      # final filter: total observed frames of the merged object
         objs.append(dict(masks=masks,sig=sig,concepts=concepts))
     objs.sort(key=lambda o:-len(o["masks"]))
-    print(f"구조물 제외+min_track 후 유효 객체: {len(objs)}")
+    print(f"valid objects after structural exclusion + min_track: {len(objs)}")
 
-    # ── ★v2.4: 이전 런 잔재 제거 (숫자 폴더만) — 크래시 잔재의 '성공 위장' 방지 ──
+    # -- v2.4: remove leftovers from a previous run (numeric directories only), so a crashed
+    #    run's remains cannot pass for success. concepts.json goes with them: keeping an old
+    #    one beside new gids would silently caption the wrong objects.
     stale=[d for d in glob.glob(os.path.join(args.out_root,"[0-9]*")) if os.path.isdir(d)]
     if stale:
-        print(f"★기존 객체 폴더 {len(stale)}개 제거 후 새로 저장")
+        print(f"*removing {len(stale)} existing object directories before saving")
         for d in stale: shutil.rmtree(d)
+    _cj=os.path.join(args.out_root,"concepts.json")
+    if os.path.isfile(_cj): os.remove(_cj)
 
-    # ── 저장 (sig voxel-key → 센터 점) ──
+    # -- save (sig voxel keys -> centre points) --
+    concept_rows={}
     for gid,o in enumerate(objs):
         od=os.path.join(args.out_root,str(gid)); os.makedirs(od,exist_ok=True)
         for stem,mp_ in o["masks"].items():
@@ -519,12 +559,26 @@ def main():
         else:
             pts=np.zeros((0,3),np.float64)
         write_ply(os.path.join(od,"points3d.ply"),pts.astype(np.float32))
-        print(f"  obj{gid}: frames={len(o['masks'])} init_pts={len(pts)} "
-              f"concept~{o['concepts'].most_common(1)[0][0]}")
-    # 정상 완료 → 체크포인트 삭제
+        top,votes=o["concepts"].most_common(1)[0]
+        concept_rows[str(gid)]=dict(concept=top,votes=int(votes),
+                                    votes_total=int(sum(o["concepts"].values())),
+                                    frames=len(o["masks"]),
+                                    all={k:int(v) for k,v in o["concepts"].items()})
+        print(f"  obj{gid}: frames={len(o['masks'])} init_pts={len(pts)} concept~{top}")
+
+    # The vocabulary term each object came from. Until this was written down it existed only in
+    # this script's stdout, so the only object names available downstream came from the GT
+    # semantic mesh -- which made the ShapeR captions depend on a Replica-only file, not just
+    # the evaluation. gid here is the same gid every later stage uses.
+    with open(_cj,"w") as f:
+        json.dump(concept_rows,f,indent=1,ensure_ascii=False)
+
+    # Normal completion -> delete the checkpoint
     if os.path.isfile(ckpt_path): os.remove(ckpt_path)
-    print(f"저장: {args.out_root}/<gid>/<stem>.png + points3d.ply")
-    print("판정(v2.4): window 체크포인트 + NVML/OOM 자동 복구 — 크래시가 나도 완료 window 는 보존.")
+    print(f"saved: {args.out_root}/<gid>/<stem>.png + points3d.ply")
+    print(f"concepts: {_cj} ({len(concept_rows)} objects)")
+    print("v2.4 verdict: window checkpoints + automatic NVML/OOM recovery -- a crash preserves "
+          "the completed windows.")
 
 
 if __name__=="__main__":
