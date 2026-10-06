@@ -312,7 +312,13 @@ FRAMES_CMD=${FRAMES_CMD:-}
 COLMAP_SFM=${COLMAP_SFM:-0}
 
 cd "${ROOT}" || exit 1
-mkdir -p "${RUNDIR}" "${PRIOR}"
+# --dry has to leave the tree exactly as it found it. Creating output/<scene>/runs/<RUN>/ and
+# output/<scene>/prior/ on a path check is how an otherwise-empty output/<scene>/ appears
+# before that scene has ever been built -- and an existing destination silently turns a later
+# `mv <real tree> output/<scene>` into a nesting instead of a rename.
+if [ "${DRY}" -eq 0 ]; then
+  mkdir -p "${RUNDIR}" "${PRIOR}"
+fi
 
 # ---------------------------------------------------------------- helpers
 ORDER="stage0 colmap relabel masks labels train carve objects name mesh cond pkl field fuse eval"
@@ -386,11 +392,18 @@ say() { echo ""; echo "=== $* ==="; }
 # ---------------------------------------------------------------- preflight
 GITREV=$(git -C "${ROOT}" rev-parse --short HEAD 2>/dev/null || echo "no-git")
 MANIFEST=${RUNDIR}/manifest.txt
+# Same reason: the manifest is the one thing written before the --dry exit, so on a dry run it
+# goes to a scratch file outside the repo and is removed on exit. The printout is identical.
+if [ "${DRY}" -eq 1 ]; then
+  mkdir -p "${HOME}/tmp" || exit 1
+  MANIFEST=$(mktemp "${HOME}/tmp/refinegs_dry_manifest.XXXXXX") || exit 1
+  trap 'rm -f "${MANIFEST}"' EXIT
+fi
 # Re-entering an existing RUN (a FROM=eval pass over meshes already produced) would otherwise
 # overwrite that run's manifest with this pass's, erasing the stage span, the date and the
 # ONLY list -- which is exactly the record used to decide the run was a valid baseline in the
 # first place. Keep it, the way the batch script keeps a superseded results.csv.
-if [ -f "${MANIFEST}" ]; then
+if [ "${DRY}" -eq 0 ] && [ -f "${MANIFEST}" ]; then
   _oldman=${MANIFEST%.txt}_$(date +%m%d_%H%M%S).txt
   cp "${MANIFEST}" "${_oldman}" && echo "  previous manifest kept at $(basename "${_oldman}")"
 fi
