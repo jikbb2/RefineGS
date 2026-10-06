@@ -66,13 +66,13 @@ done
 
 # ---------------------------------------------------------------- scene name -> GT paths
 # This run needs five paths to agree (SCENE, TRAJ, GTD, GT_MESH, GT_INFO), and they come from
-# two directory trees with different naming -- nice-slam writes `room1`, the Replica v1
-# tarball writes `room_1`. room0 sits in a third place again (~/room_0), because it was
-# up evaluating one room's reconstruction against another room's GT mesh: nothing downstream
+# two separate downloads with different naming -- nice-slam writes `room1`, the original
+# Replica tarball writes `room_1`. Typing those five by hand per scene is how a run ends up
+# evaluating one room's reconstruction against another room's GT mesh: nothing downstream
 # checks, and the numbers look plausible.
 ROOT=${ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}
 REPLICA_ROOT=${REPLICA_ROOT:-}
-REPLICA_HABITAT=${REPLICA_HABITAT:-}
+REPLICA_SEMANTIC=${REPLICA_SEMANTIC:-}
 
 if [ -n "${SCENE_NAME}" ]; then
   [ -n "${REPLICA_ROOT}" ] || {
@@ -92,7 +92,8 @@ if [ -n "${SCENE_NAME}" ]; then
   fi
   # A scene name is authoritative, and `${VAR:-derived}` is not: a value still exported in
   # the shell wins over it silently. Measured 0928, that produced a run whose manifest read
-  # `scene_name room2` and `scene replica_room1_v2` at the same time -- SCENE, TRAJ, GTD,
+  # `scene_name room2` and `scene replica_room1` at the same time -- SCENE, TRAJ, GTD,
+  # GT_MESH and GT_INFO were all left over from an earlier room1 session, every one of those
   # paths exists, so the preflight printed four `ok` lines and the probe rebuilt room1's
   # object 14 under room2's name. Only `habitat` disagreed, because it is the one value
   # recomputed from the name every time.
@@ -106,7 +107,7 @@ if [ -n "${SCENE_NAME}" ]; then
       && echo "  [env override] ${v}=${cur}" && echo "                 -> ${val}   (shell value ignored)"
     export "${v}=${val}"
   }
-    set_scene REPLICA_SCENE "${REPLICA_ROOT}/${SCENE_NAME}"
+  set_scene REPLICA_SCENE "${REPLICA_ROOT}/${SCENE_NAME}"
   set_scene SCENE         "replica_${SCENE_NAME}"
   set_scene TRAJ          "${REPLICA_ROOT}/${SCENE_NAME}/traj.txt"
   set_scene GTD           "${REPLICA_ROOT}/${SCENE_NAME}/results"
@@ -153,7 +154,9 @@ if [ -z "${COLMAP:-}" ]; then
   done
 fi
 COLMAP=${COLMAP:-${DATA}/sparse/0}
-# Fallbacks for a run with no scene name, i.e. the room0 layout this driver was written on.
+# No defaults. These used to fall back to one room0 layout on one machine, so a run with no
+# scene name silently measured against that room. Empty is the honest value; the preflight
+# below refuses only the stages that actually read them.
 GTD=${GTD:-}
 GT_MESH=${GT_MESH:-}
 GT_INFO=${GT_INFO:-}
@@ -501,7 +504,7 @@ if [ "${CLEAN}" = "1" ]; then
   at_or_after mesh    && retire "${OBJ}"/*/train/ours_"${ITER}"/fuse.ply \
                                 "${OBJ}"/*/train/ours_"${ITER}"/fuse_post.ply
   at_or_after cond    && retire "${OBJ}"/*/train/ours_"${ITER}"/"${COND_NAME}"
-  at_or_after pkl     && retire "${SHAPER_DIR}/data/${PKL_SUBDIR}"
+  at_or_after pkl     && retire "${PKL_DIR}"
   at_or_after field   && retire "${PRIOR}"/obj*_field*.npz
   # Fused meshes and the CSV carry ${RUN}: CLEAN removes inputs to redo, never evidence
   # for numbers already reported.

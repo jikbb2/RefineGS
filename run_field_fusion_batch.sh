@@ -23,15 +23,12 @@ shopt -s nullglob
 
 ROOT=${ROOT:-$HOME/RefineGS}
 SCENE=${SCENE:-}
-echo "[abort] no GT mesh for SCENE=${SCENE} (looked for ${_scene_v1}/habitat and"
-echo "        ${_scene}/habitat under REPLICA_SEMANTIC='${REPLICA_SEMANTIC}')."
-echo "        Set REPLICA_SEMANTIC, or set GT_MESH explicitly."
+[ -n "${SCENE}" ] || { echo "[abort] SCENE is empty -- set SCENE=<name>"; exit 1; }
 OUT=${OUT:-${ROOT}/output/${SCENE}/refinegs_full}
 ITER=${ITER:-7000}
-PRIOR=${PRIOR:-$HOME/prior}
+PRIOR=${PRIOR:-${ROOT}/output/${SCENE}/prior}
 SHAPER_DIR=${SHAPER_DIR:-$HOME/ShapeR}
-# pkl files live under ShapeR so shaper_field.py can take a relative --input_pkl. Set
-# PKL_SUBDIR per pipeline: without it, the per-object and scene runs write the same
+# PKL_SUBDIR separates the pipelines: without it, the per-object and scene runs write the same
 # obj<gid>.pkl, and the stale-prior guard then rebuilds one pipeline's field from the
 # other's input, silently.
 PKL_SUBDIR=${PKL_SUBDIR:-}
@@ -134,15 +131,16 @@ MATCH_MIN_SHARE=${MATCH_MIN_SHARE:-0.10}
 CSV=${CSV:-${OUT}/_field_${RUN}.csv}
 FAILCSV=${FAILCSV:-${OUT}/_field_${RUN}_failures.csv}
 LOGDIR=${LOGDIR:-${PRIOR}/logs/${RUN}}
-PKL_DIR=${PKL_DIR:-${SHAPER_DIR}/data${PKL_SUBDIR:+/${PKL_SUBDIR}}}
+PKL_DIR=${PKL_DIR:-${ROOT}/output/${SCENE}/prior/pkl}
 PKL_REL=${PKL_DIR}
 mkdir -p "${PRIOR}" "${LOGDIR}" "${PKL_DIR}"
 cd "${ROOT}" || exit 1
 
 # Fail on a missing GT path rather than evaluating against whatever happens to be there.
 [ -n "${GT_MESH}" ] && [ -f "${GT_MESH}" ] || {
-  echo "[abort] no GT mesh for SCENE=${SCENE} (looked for ${_scene_v1}/habitat under"
-  echo "        ${REPLICA_DL}, \$HOME and ${REPLICA_ROOT}). Set GT_MESH explicitly."
+  echo "[abort] no GT mesh for SCENE=${SCENE} (looked for ${_scene_v1}/habitat and"
+  echo "        ${_scene}/habitat under REPLICA_SEMANTIC='${REPLICA_SEMANTIC}')."
+  echo "        Set REPLICA_SEMANTIC, or set GT_MESH explicitly."
   exit 1; }
 [ -d "${GTD}" ] || [ -n "${CARVE_DEPTH}" ] || {
   echo "[abort] no GT depth directory for SCENE=${SCENE}: ${GTD}"
