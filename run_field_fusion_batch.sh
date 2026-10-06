@@ -34,6 +34,15 @@ SHAPER_DIR=${SHAPER_DIR:-$HOME/ShapeR}
 PKL_SUBDIR=${PKL_SUBDIR:-}
 SHAPER_ENV=${SHAPER_ENV:-shaper}
 SHAPER_DIRECT=${SHAPER_DIRECT:-0}
+# shaper_field.py and infer_shape_pinhole.py are OURS -- cloning ShapeR does not produce
+# them, which is why a fresh checkout of this repository could not run the field phase at
+# all. They live here and run against the ShapeR checkout: sys.path[0] is their directory,
+# so shaper_field.py's `import infer_shape_pinhole` finds the copy beside it, and
+# SHAPER_DIR on PYTHONPATH supplies dataset.* and model.*. shaper_field.py chdir's into
+# --shaper_root itself, because ShapeR resolves checkpoints/ relative to the working
+# directory. Keep ONLY those two files in SHAPER_PY's directory: a dataset.py or model.py
+# there would shadow ShapeR's own packages.
+SHAPER_PY=${SHAPER_PY:-${ROOT}/shaper/shaper_field.py}
 COLMAP=${COLMAP:-${ROOT}/data/${SCENE}/sparse/0}
 IMAGES=${IMAGES:-${ROOT}/data/${SCENE}/images}
 MASKS=${MASKS:-${ROOT}/data/${SCENE}/masks}
@@ -93,6 +102,10 @@ COMBINE=${COMBINE:-best}
 # generation drifts, which invalidates any A/B.
 SEED=${SEED:-0}
 EVAL_SEED=${EVAL_SEED:-0}
+# The flow-matching initial noise. SEED above is the conditioning-point subsample, a
+# different thing, and shaper_field.py was never given a seed at all -- it ran on its own
+# default of 0. Separate names, so changing one cannot silently move the other.
+FIELD_SEED=${FIELD_SEED:-0}
 
 BOUNDS_MARGIN=${BOUNDS_MARGIN:-1.15}
 SEEN_MARGIN=${SEEN_MARGIN:-0.02}
@@ -136,12 +149,24 @@ PKL_REL=${PKL_DIR}
 mkdir -p "${PRIOR}" "${LOGDIR}" "${PKL_DIR}"
 cd "${ROOT}" || exit 1
 
-# Fail on a missing GT path rather than evaluating against whatever happens to be there.
-[ -n "${GT_MESH}" ] && [ -f "${GT_MESH}" ] || {
-  echo "[abort] no GT mesh for SCENE=${SCENE} (looked for ${_scene_v1}/habitat and"
-  echo "        ${_scene}/habitat under REPLICA_SEMANTIC='${REPLICA_SEMANTIC}')."
-  echo "        Set REPLICA_SEMANTIC, or set GT_MESH explicitly."
-  exit 1; }
+# The GT mesh is read by eval_seen_unseen.py and by nothing else here: it supplies the
+# per-face object_id and the visibility oracle. Demanding it for every phase is what used to
+# make a pkl or field run impossible without one, and the way past it was to point GT_MESH at
+# some other scene's file -- which evaluates one room against another and still looks
+# plausible. So: required for PHASE=eval, and otherwise the fusion runs and the evaluation is
+# skipped. Reconstruction needs no GT; the seen/unseen metrics do.
+HAVE_GT_MESH=0
+[ -n "${GT_MESH}" ] && [ -f "${GT_MESH}" ] && HAVE_GT_MESH=1
+if [ "${HAVE_GT_MESH}" -eq 0 ]; then
+  if [ "${PHASE}" = "eval" ]; then
+    echo "[abort] PHASE=eval needs a GT mesh for SCENE=${SCENE} (looked for"
+    echo "        ${_scene_v1}/habitat and ${_scene}/habitat under"
+    echo "        REPLICA_SEMANTIC='${REPLICA_SEMANTIC}')."
+    echo "        Set REPLICA_SEMANTIC, or set GT_MESH explicitly."
+    exit 1
+  fi
+  echo "  note: no GT mesh -- fusion will run, the seen/unseen evaluation will be SKIPPED"
+fi
 [ -d "${GTD}" ] || [ -n "${CARVE_DEPTH}" ] || {
   echo "[abort] no GT depth directory for SCENE=${SCENE}: ${GTD}"
   echo "        Set GTD explicitly, or set CARVE_DEPTH to use rendered scene depth."
@@ -166,6 +191,8 @@ echo "  out=${OUT} iter=${ITER} prior=${PRIOR} pkl=${PKL_DIR}"
 echo "  scene=${SCENE} -> gt_mesh=${GT_MESH}"
 echo "  carve=$([ -n "${CARVE_DEPTH}" ] && echo "rendered scene depth ${CARVE_DEPTH}" || echo "GT depth ${GTD}")"
 echo "  recon=${RECON_NAME} -> ${FUSE_NAME}_post.ply   grid=${GRID} cfg=${CFG} ensemble=${ENSEMBLE}/${COMBINE}${FUSE_EXTRA:+   ${FUSE_EXTRA}}"
+echo "  field=${SHAPER_PY}   shaper_root=${SHAPER_DIR}   seed=${FIELD_SEED} (pkl seed=${SEED})"
+echo "  eval=$([ "${HAVE_GT_MESH}" -eq 1 ] && echo "on" || echo "SKIPPED -- no GT mesh")"
 [ -f "${CAPTIONS}" ] || echo "  WARN no caption file (${CAPTIONS}); generating from generic text"
 # RUN tags every output, so nothing here can overwrite an earlier result; a field npz is
 # shared on purpose and the stale guard moves the old one aside rather than deleting it.
@@ -276,6 +303,22 @@ fi
 
 # ---------------- field ----------------
 if [ "${PHASE}" = "field" ] || [ "${PHASE}" = "all" ]; then
+  # Without this the missing file surfaces as "field FAILED" plus a 20-line python traceback
+  # per object, which reads like a model problem rather than a missing file.
+  [ -f "${SHAPER_PY}" ] || {
+    echo "[abort] no ${SHAPER_PY}"
+    echo "        shaper_field.py belongs to THIS repository (cloning ShapeR does not"
+    echo "        provide it). Put it, and infer_shape_pinhole.py, in ${ROOT}/shaper/,"
+    echo "        or point SHAPER_PY at them."
+    exit 1; }
+  [ -f "$(dirname "${SHAPER_PY}")/infer_shape_pinhole.py" ] || {
+    echo "[abort] no infer_shape_pinhole.py beside ${SHAPER_PY}"
+    echo "        shaper_field.py imports it to bypass the fisheye rectify; without it the"
+    echo "        pinhole images are unwarped as if they were Aria fisheye."
+    exit 1; }
+  [ -d "${SHAPER_DIR}" ] || {
+    echo "[abort] SHAPER_DIR=${SHAPER_DIR} does not exist -- it holds ShapeR and its checkpoints/"
+    exit 1; }
   echo "=== [2/3] ShapeR signed field (grid=${GRID}) ==="
   for gid in "${gids[@]}"; do
     PKL=${PKL_DIR}/obj${gid}.pkl
@@ -297,9 +340,12 @@ if [ "${PHASE}" = "field" ] || [ "${PHASE}" = "all" ]; then
         continue
       fi
     fi
-    CMD="cd '${SHAPER_DIR}' && LD_LIBRARY_PATH= python shaper_field.py \
+    # Run the repository's copy; shaper_field.py chdir's into --shaper_root itself, so there
+    # is no `cd` here any more and nothing is written into the user's ShapeR checkout.
+    CMD="LD_LIBRARY_PATH= PYTHONPATH='$(dirname "${SHAPER_PY}"):${SHAPER_DIR}' \
+         python '${SHAPER_PY}' --shaper_root '${SHAPER_DIR}' \
          --input_pkl ${PKL_REL}/obj${gid}.pkl --config balance --grid ${GRID} \
-         --cfg ${CFG} --min_comp_frac ${MIN_COMP_FRAC} \
+         --cfg ${CFG} --min_comp_frac ${MIN_COMP_FRAC} --seed ${FIELD_SEED} \
          $([ "${ENSEMBLE}" -gt 1 ] && echo --ensemble ${ENSEMBLE} --combine ${COMBINE}) \
          $([ "${GUIDE_FREE_W}" != "0" ] && echo --guide_free_w ${GUIDE_FREE_W}) \
          --out '${NPZ}'"
@@ -365,6 +411,10 @@ if [ "${PHASE}" = "fuse" ] || [ "${PHASE}" = "eval" ] || [ "${PHASE}" = "all" ];
         --out "${OUTD}/${FUSE_NAME}.ply" ${FUSE_EXTRA} \
         || { note_fail "${gid}" fuse "sdf_distill";
              show_tail "${LOGDIR}/fuse_${gid}.log" 20; ng=$((ng+1)); continue; }
+    fi
+    if [ "${HAVE_GT_MESH}" -eq 0 ]; then
+      echo "    [${gid}] fused; eval skipped (no GT mesh)"
+      ok=$((ok+1)); continue
     fi
     python eval_seen_unseen.py --gt_mesh "${GT_MESH}" \
       --recon "${OUTD}/fuse_post.ply" --recon2 "${OUTD}/${FUSE_NAME}_post.ply" \
