@@ -381,6 +381,7 @@ n_traj() { if [ -f "$1" ]; then awk 'NF{n++} END{print n+0}' "$1"; else echo 0; 
 count_dirs() {                                # count_dirs ROOT [numeric-only]
   local d b n=0
   for d in "$1"/*/; do
+    [ -d "${d}" ] || continue                 # no nullglob: an empty dir yields the literal
     b=$(basename "${d}")
     [ -n "${2:-}" ] && ! [[ "${b}" =~ ^[0-9]+$ ]] && continue
     n=$((n + 1))
@@ -476,6 +477,14 @@ if [ "${PIPELINE}" = "scene" ] && want objects; then
   want train  || chk "${SCENE_MODEL}/point_cloud/iteration_${ITER}/point_cloud.ply" "stage: train"
 fi
 want_any objects pkl fuse && chk "${GTD}"
+# mesh, cond, pkl, field and fuse all iterate ${OBJ}/<gid>/. When that tree is absent or holds
+# no numeric directory, every loop body is skipped: the stage prints its header, the script
+# exits 0, and the only hint anywhere is the trailing "objects 0 extracted". That is how a
+# moved output tree read as a successful no-op run. Fail here instead.
+if ! want objects && want_any mesh cond pkl field fuse; then
+  [ "$(count_dirs "${OBJ}" numeric)" -gt 0 ] \
+    || { echo "  MISSING per-object trees under ${OBJ}   (stage: objects)"; fail=1; }
+fi
 want carve || { want_any objects fuse && [ ! -d "${CARVE_DEPTH}" ] \
   && echo "  note: no ${CARVE_DEPTH} -- vote and fusion will fall back to GT depth"; }
 [ "${fail}" -eq 0 ] || { echo "[abort] start earlier with FROM=, or fix the paths above"; exit 1; }
@@ -781,11 +790,13 @@ if want mesh; then
   say "mesh: per-object TSDF -> fuse_post.ply (side A)"
   # Same tool as cond, weaker filters, so the only difference between the reported
   # surface and the conditioning surface is one line of arguments.
+  n_mesh=0
   for MDIR in "${OBJ}"/*/; do
     gid=$(basename "${MDIR}")
     [[ "${gid}" =~ ^[0-9]+$ ]] || continue
     [ -z "${ONLY}" ] || [[ " ${ONLY} " == *" ${gid} "* ]] || continue
     [ -f "${MDIR}point_cloud/iteration_${ITER}/point_cloud.ply" ] || continue
+    n_mesh=$((n_mesh + 1))
     MSH=${MDIR}train/ours_${ITER}/fuse_post.ply
     if fresh "${MSH}" mesh_tsdf_views.py "${MDIR}point_cloud" \
        && stamp "${MDIR}train/ours_${ITER}/.mesh_config" "${MESH_ARGS}"; then
@@ -797,6 +808,13 @@ if want mesh; then
       | grep -E "^\[comp\]|^\[out\]|kept" | tail -3 | sed "s/^/  [${gid}] /"
     [ -f "${MSH}" ] || echo "  [${gid}] FAILED -- no side A for this object"
   done
+  # Zero matches is not success. Without this the stage is indistinguishable from "all reuse".
+  [ "${n_mesh}" -gt 0 ] || {
+    echo "[abort] no object matched${ONLY:+ ONLY='${ONLY}'} under ${OBJ}"
+    echo "        every candidate lacked point_cloud/iteration_${ITER}/point_cloud.ply,"
+    echo "        or the gids in ONLY do not exist. Nothing was meshed."
+    exit 1
+  }
 fi
 
 # ---------------------------------------------------------------- cond
@@ -821,11 +839,13 @@ if want cond; then
   # COND_NAME therefore leaves the stamp holding the probe's arguments, which is the safe
   # direction: the next production run sees a mismatch and rebuilds tsdf_clean.ply rather
   # than reusing a file whose provenance is no longer recorded.
+  n_cond=0
   for MDIR in "${OBJ}"/*/; do
     gid=$(basename "${MDIR}")
     [[ "${gid}" =~ ^[0-9]+$ ]] || continue
     [ -z "${ONLY}" ] || [[ " ${ONLY} " == *" ${gid} "* ]] || continue
     [ -f "${MDIR}point_cloud/iteration_${ITER}/point_cloud.ply" ] || continue
+    n_cond=$((n_cond + 1))
     CLN=${MDIR}train/ours_${ITER}/${COND_NAME}
     if fresh "${CLN}" mesh_tsdf_views.py "${MDIR}point_cloud" \
        && stamp "${MDIR}train/ours_${ITER}/.cond_config" "${COND_ARGS}"; then
@@ -836,6 +856,10 @@ if want cond; then
       --out "${CLN}" ${COND_ARGS} 2>&1 | grep -E "^\[out\]|kept" | tail -2 | sed "s/^/  [${gid}] /"
     [ -f "${CLN}" ] || echo "  [${gid}] FAILED -- pkl will report a missing recon"
   done
+  [ "${n_cond}" -gt 0 ] || {
+    echo "[abort] no object matched${ONLY:+ ONLY='${ONLY}'} under ${OBJ} -- nothing conditioned."
+    exit 1
+  }
 fi
 
 # ---------------------------------------------------------------- pkl / field / fuse
