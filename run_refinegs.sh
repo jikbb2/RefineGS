@@ -195,7 +195,10 @@ PKL_SUBDIR=${PKL_SUBDIR:-${SCENE}_${PIPELINE}}
 RUNDIR=${RUNDIR:-${ROOT}/output/${SCENE}/runs/${RUN}}
 CSV=${CSV:-${RUNDIR}/results.csv}
 SHAPER_DIR=${SHAPER_DIR:-$HOME/ShapeR}
-PKL_DIR=${PKL_DIR:-${ROOT}/output/${SCENE}/prior/pkl}
+# Beside the field npz, under PRIOR -- which already carries ${PIPELINE}. A path without
+# it would put the scene and per-object runs' obj<gid>.pkl in ONE directory again, and
+# the stale guard would then rebuild one pipeline's field from the other's input.
+PKL_DIR=${PKL_DIR:-${PRIOR}/pkl}
 RELABEL=${RELABEL:-${ROOT}/output/${SCENE}/relabel}
 AMODAL=${AMODAL:-${ROOT}/output/${SCENE}/amodal}
 # The scene model's own rendered depth, used wherever the pipeline needs to know what a
