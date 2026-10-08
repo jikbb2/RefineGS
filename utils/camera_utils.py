@@ -3,7 +3,7 @@
 # Copyright (c) 2023.
 #
 # Split&Splat - Copyright (c) 2026, MEDIALab, University of Padova.
-# (RefineGS: S&S 원본 그대로 사용 — backbone-무관, mask/depth 카메라 로딩)
+# (RefineGS: used exactly as S&S has it -- backbone-agnostic, loads mask/depth cameras)
 ################################################################################
 
 from scene.cameras import Camera
@@ -139,7 +139,7 @@ def camera_to_JSON(id, camera : Camera):
     pos = W2C[:3, 3]
     rot = W2C[:3, :3]
     serializable_array_2d = [x.tolist() for x in rot]
-    # [RefineGS fix] cameras.py 의 Camera 속성명에 맞춤
+    # [RefineGS fix] match the attribute names in cameras.py's Camera
     #   width/height/FovX/FovY  ->  image_width/image_height/FoVx/FoVy
     width = getattr(camera, "image_width", getattr(camera, "width", None))
     height = getattr(camera, "image_height", getattr(camera, "height", None))
@@ -159,7 +159,7 @@ def camera_to_JSON(id, camera : Camera):
 
 
 def is_alpha_mostly_zero(image: Image.Image, threshold: float = 0.999) -> bool:
-    """더 많은(threshold 초과) alpha 픽셀이 0이면 True (검은 마스크 뷰 판정)."""
+    """True when more alpha pixels than the threshold are zero -- i.e. a black mask view."""
     if image.mode != "RGBA":
         raise ValueError("Image must be in RGBA mode to check alpha channel.")
     alpha = image.getchannel("A")

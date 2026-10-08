@@ -1,32 +1,38 @@
 #!/usr/bin/env python3
-"""RefineGS — GT depth forward-warp to novel pose (See3D 입력, noisy 렌더 대체).
+"""Forward-warp GT depth to a novel pose, as input for See3D in place of a noisy render.
 
-[v2 패치]
-  - cross-source z-buffer 버그 수정: 색 기록에 z-테스트 적용(이전엔 나중 소스가 무조건 덮어써
-    먼 표면이 가까운 표면을 뚫고 나옴 — k_nearest 클수록 증폭).
-  - depth 경계(streamer) 필터: 실루엣 경계의 전경/배경 혼합 depth 픽셀 제거(--edge_thr).
-    큰 baseline novel pose에서 '공중에 뜬 조각'의 원인.
+[v2]
+  - Fixed a cross-source z-buffer bug: the colour write now passes a z-test. Previously a
+    later source overwrote unconditionally, so a far surface punched through a near one --
+    worse the larger k_nearest is.
+  - Added a depth-boundary (streamer) filter: depth pixels on a silhouette that mix
+    foreground and background are dropped (--edge_thr). They are what produces fragments
+    floating in mid-air at a wide-baseline novel pose.
 
-근본 문제: 2DGS 를 unseen pose 에서 렌더하면 floater/streak 노이즈 → See3D 입력으로 부적합.
-해결(See3D 원래 방식): *실제 GT 픽셀*을 GT depth 로 target novel pose 에 forward-projection.
-  → 관측면 = 진짜 색(노이즈 없음), hole = 진짜 미관측/disocclusion 만(작음).
+The problem: rendering 2DGS at an unseen pose gives floaters and streaks, which makes a poor
+See3D input. The fix, which is See3D's own approach: forward-project the ACTUAL GT pixels to
+the target novel pose using GT depth. The observed surface then carries true colour with no
+noise, and a hole is a real unobserved or disoccluded region, which is small.
 
-입력 pose: render_hole_novel --soft_out 의 poses.npz (reachable novel pose, 우리가 잘 추정).
-출력: soft_in 포맷(기존 See3D 파이프라인과 호환)
-  view_<i>.jpg   GT-warp (실색, hole 은 검정)
-  weight_<i>.png hole map (255=hole/미관측, 0=known/실색) ← generate_novel_views see3d 가 mask 로 사용
-  poses.npz      복사
-scene_mesh 지정 시 weight = 3단계: 255=관측 / 128=미관측 실제표면(See3D 대상) / 0=frustum-밖(제외).
+Input poses: poses.npz from render_hole_novel --soft_out (reachable novel poses, which we
+estimate well).
+Output, in the soft_in layout the existing See3D pipeline expects:
+  view_<i>.jpg    the GT warp (true colour; holes are black)
+  weight_<i>.png  hole map (255 = hole / unobserved, 0 = known / true colour), which
+                  generate_novel_views see3d reads as its mask
+  poses.npz       copied through
+With --scene_mesh the weight has three levels instead: 255 = observed, 128 = unobserved real
+surface (what See3D should generate), 0 = outside the frustum (excluded).
 
-실행(권장 stride=1):
+Run (stride 1 advised):
   python warp_gt_to_pose.py \
-    --poses ~/See3D/dataset/obj24_v2/soft/poses.npz \
-    --gt_images data/replica_room0_v2/images \
-    --gt_depth /home/elicer/nice-slam/Datasets/Replica/room0/results \
-    --colmap data/replica_room0_v2/sparse/0 \
+    --poses ~/See3D/dataset/obj24/soft/poses.npz \
+    --gt_images data/<scene>/images \
+    --gt_depth "$HOME"/nice-slam/Datasets/Replica/room0/results \
+    --colmap data/<scene>/sparse/0 \
     --depth_scale 6553.5 --k_nearest 24 --src_stride 1 --edge_thr 0.05 \
-    --scene_mesh output/replica_room0_v2/scene_mono_reg/train/ours_30000/fuse_post.ply \
-    --out ~/See3D/dataset/obj24_v2/soft_in_gtwarp
+    --scene_mesh output/<scene>/scene_mono_reg/train/ours_30000/fuse_post.ply \
+    --out ~/See3D/dataset/obj24/soft_in_gtwarp
 
 Deps: numpy, PIL.
 """
@@ -115,21 +121,26 @@ def main():
     ap.add_argument("--colmap", required=True)
     ap.add_argument("--depth_scale", type=float, default=6553.5)
     ap.add_argument("--k_nearest", type=int, default=6)
-    ap.add_argument("--src_stride", type=int, default=1, help="src 픽셀 stride(속도). 1=full(권장)")
+    ap.add_argument("--src_stride", type=int, default=1,
+                    help="pixel stride on the source, for speed. 1 = full, and advised")
     ap.add_argument("--edge_thr", type=float, default=0.05,
-                    help="depth 경계 필터: 인접 픽셀 상대 depth 변화가 이 비율 초과면 drop(streamer 방지). 0=off")
+                    help="depth boundary filter: drop a pixel whose relative depth change "
+                         "against its neighbour exceeds this, which prevents streamers. 0 = off")
     ap.add_argument("--scene_margin", type=float, default=0.10,
-                    help="[v4] warp depth 가 scene mesh 표면보다 이 거리(m) 이상 뒤면 phantom-known 취소")
+                    help="[v4] cancel a phantom-known pixel when the warped depth lies this "
+                         "far (m) behind the scene mesh surface")
     ap.add_argument("--void_fallback", default="aabb", choices=["aabb", "off"],
-                    help="[v5] 메쉬 놓친 ray 를 방 AABB 로 2차 판정 — 실내 메쉬 구멍을 128(생성 대상)로 승격")
+                    help="[v5] second test, against the room AABB, for a ray that missed the "
+                         "mesh -- promotes a hole in the indoor mesh to 128 (to be generated)")
     ap.add_argument("--scene_mesh", default="",
-                    help="장면(방) 메쉬(예 base fuse_cropped.ply). 지정 시 weight=3단계 학습weight: "
-                         "255=관측(실색), 128=미관측 실제표면(See3D 대상, 0.5), 0=frustum-밖(void, 제외). "
-                         "미지정 시 weight=hole(구식).")
+                    help="the scene (room) mesh, e.g. a base fuse_cropped.ply. With it the "
+                         "weight has three levels: 255 = observed (true colour), 128 = "
+                         "unobserved real surface (See3D's target, 0.5), 0 = outside the "
+                         "frustum (void, excluded). Without it the weight is the old hole map.")
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
 
-    # scene raycast (frustum-밖 vs 미관측표면 구분)
+    # Scene raycast: tells "outside the frustum" apart from "unobserved surface".
     rc_scene, aabb_lo, aabb_hi = None, None, None
     if a.scene_mesh and os.path.exists(a.scene_mesh):
         import open3d as o3d
@@ -138,8 +149,9 @@ def main():
         rc_scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(_m))
         _vv = np.asarray(_m.vertices)
         aabb_lo, aabb_hi = _vv.min(0) - 0.05, _vv.max(0) + 0.05
-        print(f"scene raycast on {a.scene_mesh} → 3단계 weight"
-              f" (void fallback={a.void_fallback}: 메쉬 구멍 방향은 미관측표면(128)으로 승격)")
+        print(f"scene raycast on {a.scene_mesh} -> three-level weight"
+              f" (void fallback={a.void_fallback}: a direction through a hole in the mesh is"
+              f" promoted to unobserved surface, 128)")
 
     cams = read_colmap(a.colmap)
     src = []
@@ -152,7 +164,8 @@ def main():
             c["center"] = cam_center(c["R"], c["t"])
             src.append(c)
     if not src:
-        raise SystemExit("GT 이미지/depth 매칭 0 — 경로/이름(frame↔depth) 확인")
+        raise SystemExit("no GT image/depth pair matched -- check the paths and the "
+                         "frame<->depth naming")
     print(f"source GT frames: {len(src)}")
     src_centers = np.stack([c["center"] for c in src])
 
@@ -168,14 +181,15 @@ def main():
 
         zbuf = np.full(H*W, np.inf, np.float32)
         color = np.zeros((H*W, 3), np.float32)
-        # ---- pass 1: 전 소스에 대해 전역 min-z 누적 ----
+        # ---- pass 1: accumulate a global min-z over every source ----
         cache = []
         for si in order:
             c = src[si]
             img = np.asarray(Image.open(c["img_path"]).convert("RGB")).astype(np.float32)
             Hs, Ws = img.shape[:2]
             dep = load_depth(c["depth_path"], a.depth_scale, Ws, Hs)
-            # depth 경계 필터: 실루엣 혼합 depth 픽셀 제거 (공중 조각 방지)
+            # Depth boundary filter: drop the mixed depth pixels on a silhouette, which is
+            # what puts fragments in mid-air.
             if a.edge_thr > 0:
                 gy, gx = np.gradient(dep)
                 edge = (np.abs(gx) + np.abs(gy)) > a.edge_thr * np.clip(dep, 1e-3, None)
@@ -200,7 +214,8 @@ def main():
             flat = vt[inb]*W + ut[inb]; zz = z[inb]; cc = col[inb]
             np.minimum.at(zbuf, flat, zz)
             cache.append((flat, zz, cc))
-        # ---- pass 2: 전역 z-테스트 통과 픽셀만 색 기록 (cross-source 관통 방지) ----
+        # ---- pass 2: write colour only where the global z-test passes, so one source
+        #      cannot punch through another ----
         for flat, zz, cc in cache:
             win = zz <= zbuf[flat] * 1.002
             color[flat[win]] = cc[win]
@@ -209,7 +224,8 @@ def main():
         filled = (zbuf < np.inf).reshape(H, W)
         view = color.reshape(H, W, 3).astype(np.uint8)
         Image.fromarray(view).save(os.path.join(a.out, f"view_{i:04d}.jpg"), quality=95)
-        # [v3] warp depth 저장 — phantom-known(객체 뒤 배경이 관통해 보이는 픽셀) 재분류용
+        # [v3] Save the warped depth, to reclassify phantom-known pixels: background behind
+        #      an object that shows through it.
         np.save(os.path.join(a.out, f"depth_{i:04d}.npy"),
                 np.where(zbuf < np.inf, zbuf, 0).reshape(H, W).astype(np.float16))
 
@@ -224,8 +240,10 @@ def main():
             rays = np.concatenate([np.broadcast_to(ccam, dwn.shape), dwn], 1).astype(np.float32)
             thit = rc_scene.cast_rays(o3d.core.Tensor(rays))["t_hit"].numpy()
             scene_hit = np.isfinite(thit).reshape(H, W)
-            # [v5] void fallback: 메쉬를 놓친 ray 라도 방 AABB 를 통과하면 실내 = 표면 존재 확실
-            #      (mono 메쉬 구멍 — 예: 바닥 구멍 — 이 0(제외) 대신 128(생성 대상) 이 되도록)
+            # [v5] void fallback: a ray that missed the mesh but still crosses the room's
+            #      AABB is indoors, so a surface certainly exists there. This is what turns a
+            #      hole in the mono mesh -- in the floor, say -- into 128 (to be generated)
+            #      rather than 0 (excluded).
             if a.void_fallback == "aabb" and aabb_lo is not None:
                 inv = 1.0 / np.where(np.abs(dwn) < 1e-9, 1e-9, dwn)
                 t0s = (aabb_lo[None, :] - ccam[None, :]) * inv
@@ -234,9 +252,11 @@ def main():
                 tmax = np.maximum(t0s, t1s).min(1)
                 aabb_hit = (tmax >= np.maximum(tmin, 0.0)).reshape(H, W)
                 scene_hit = scene_hit | aabb_hit
-            # [v4] 씬 수준 phantom 필터: mesh 표면보다 '뒤'에서 온 known 픽셀 = 관통 배경 →
-            #      known 취소(검정+미관측 승격). 소파 관통 바닥, 떠 있는 꽃 같은 아티팩트 제거.
-            #      hit점 = ccam + dwn*thit → 카메라 z = Rt[2]·hit + tt[2]
+            # [v4] Scene-level phantom filter: a known pixel that came from BEHIND the mesh
+            #      surface is background showing through, so its known status is cancelled
+            #      (blacked out and promoted to unobserved). This removes the floor seen
+            #      through a sofa, the flower floating in the air, and similar artefacts.
+            #      hit point = ccam + dwn*thit, so the camera z is Rt[2] . hit + tt[2].
             hitp = ccam[None, :] + dwn * thit[:, None]
             z_mesh_cam = np.where(np.isfinite(thit), hitp @ Rt[2] + tt[2], np.inf).reshape(H, W)
             zb = np.where(zbuf < np.inf, zbuf, 0).reshape(H, W)
@@ -249,15 +269,16 @@ def main():
             w[filled] = 255
             w[(~filled) & scene_hit] = 128
             Image.fromarray(w).save(os.path.join(a.out, f"weight_{i:04d}.png"))
-            print(f"[{i:04d}] known {filled.mean():.3f}  미관측표면 {((~filled)&scene_hit).mean():.3f}  "
-                  f"frustum밖 {((~filled)&~scene_hit).mean():.3f}  phantom {phantom.mean():.3f}")
+            print(f"[{i:04d}] known {filled.mean():.3f}  unobserved surface "
+                  f"{((~filled)&scene_hit).mean():.3f}  outside frustum "
+                  f"{((~filled)&~scene_hit).mean():.3f}  phantom {phantom.mean():.3f}")
         else:
             hole = ~filled
             Image.fromarray((hole*255).astype(np.uint8)).save(os.path.join(a.out, f"weight_{i:04d}.png"))
             print(f"[{i:04d}] filled {filled.mean():.3f}  hole {hole.mean():.3f}")
 
     shutil.copy(a.poses, os.path.join(a.out, "poses.npz"))
-    print(f"\n→ {a.out} (view=GT-warp, weight, poses.npz).")
+    print(f"\n-> {a.out} (view = GT warp, weight, poses.npz).")
 
 
 if __name__ == "__main__":

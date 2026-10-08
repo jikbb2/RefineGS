@@ -468,9 +468,10 @@ def extract_by_name(elements, name):
 
 
 def filterPLY(path_ply, folder_path, intrinsics, extrinsics):
-    """[v2 벡터화] 뷰별 전체 점 일괄 투영 — 기존 O(views×points) Python 루프 대체.
-    동작 보존: hit 카운트 > len(images)/2 → instance / > 5 → bbox / fallback 순 저장.
-    (개선: 카메라 뒤(z<=0) 점의 가짜 적중 제거)"""
+    """[v2, vectorised] Project all points for a view at once, replacing the previous
+    O(views x points) Python loop.
+    Behaviour preserved: hit count > len(images)/2 -> instance, > 5 -> bbox, else fallback.
+    (Improved: a point behind the camera (z <= 0) no longer counts as a hit.)"""
     point_cloud = o3d.io.read_point_cloud(path_ply)
     points = np.asarray(point_cloud.points)          # (N,3)
     N = len(points)
@@ -502,7 +503,7 @@ def filterPLY(path_ply, folder_path, intrinsics, extrinsics):
         mask = np.array(mask_img)[:, :, 3] > 0       # (H,W)
         H, W = mask.shape
 
-        # ---- 전체 점 일괄 투영 (기존 per-point 루프 대체) ----
+        # ---- project all points at once (replaces the per-point loop) ----
         pc = points @ R.T + t                        # (N,3) camera
         z = pc[:, 2]
         front = z > 1e-6
@@ -515,8 +516,8 @@ def filterPLY(path_ply, folder_path, intrinsics, extrinsics):
         print("NO POINTS!")
         return
 
-    idx_inst = np.where(counts > len(images) / 2)[0]     # 기존 dup(과반) 의미 보존
-    idx_bb   = np.where(counts > 5)[0]                    # 기존 dup_1 의미 보존
+    idx_inst = np.where(counts > len(images) / 2)[0]     # the old dup (majority) meaning
+    idx_bb   = np.where(counts > 5)[0]                    # the old dup_1 meaning
 
     filtered_pcd = point_cloud.select_by_index(idx_inst)
     if len(idx_bb) > 0:

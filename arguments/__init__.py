@@ -1,13 +1,14 @@
 #
 # RefineGS - arguments/__init__.py
 # ---------------------------------------------------------------------------
-# 머지 방향: 2DGS base + Split&Splat graft
-#   - [2DGS] depth_ratio, lambda_dist, lambda_normal, opacity_cull, render_items
-#   - [S&S]  composition, is_instance, depths, init_rec, train_test_exp,
-#            optimizer_type, random_background
-#   - [제거]  exposure_lr_*, depth_l1_weight_*(inverse-depth), antialiasing, max_num_splats
+# Merge: a 2DGS base with the Split&Splat layer grafted on.
+#   - [2DGS]    depth_ratio, lambda_dist, lambda_normal, opacity_cull, render_items
+#   - [S&S]     composition, is_instance, depths, init_rec, train_test_exp,
+#               optimizer_type, random_background
+#   - [removed] exposure_lr_*, depth_l1_weight_* (inverse depth), antialiasing, max_num_splats
 #
-# 각 필드에 base 표시: [2DGS] / [S&S].  표시 없으면 양쪽 공통(3DGS lineage).
+# Each field is tagged with where it comes from: [2DGS] or [S&S]. Untagged fields are common
+# to both, from the shared 3DGS lineage.
 # ---------------------------------------------------------------------------
 
 from argparse import ArgumentParser, Namespace
@@ -54,16 +55,16 @@ class ModelParams(ParamGroup):
         self._source_path = ""
         self._model_path = ""
         self._images = "images"
-        self._depths = ""                 # [S&S] depth 디렉토리
+        self._depths = ""                 # [S&S] depth directory
         self._resolution = -1
-        self.is_instance = False          # [S&S] 뷰를 마스킹할지 여부
-        self._composition = False         # [S&S] composition 모델인지
-        self.init_rec = False             # [S&S] mask dilation 적용
+        self.is_instance = False          # [S&S] whether to mask the views
+        self._composition = False         # [S&S] whether this is a composition model
+        self.init_rec = False             # [S&S] apply mask dilation
         self._white_background = False
-        self.train_test_exp = False       # [S&S] 좌우 이미지 분할(노출 평가)
+        self.train_test_exp = False       # [S&S] split the image left/right, for exposure evaluation
         self.data_device = "cuda"
         self.eval = False
-        self.render_items = ['RGB', 'Alpha', 'Normal', 'Depth', 'Edge', 'Curvature']  # [2DGS] mesh 렌더 항목
+        self.render_items = ['RGB', 'Alpha', 'Normal', 'Depth', 'Edge', 'Curvature']  # [2DGS] mesh render items
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -76,9 +77,9 @@ class PipelineParams(ParamGroup):
     def __init__(self, parser):
         self.convert_SHs_python = False
         self.compute_cov3D_python = False
-        self.depth_ratio = 0.0            # [2DGS] 0: expected depth(부드러움) / 1: median(평면 선명)
+        self.depth_ratio = 0.0            # [2DGS] 0 = expected depth (smoother), 1 = median (sharper planes)
         self.debug = False
-        # [제거] antialiasing — 3DGS-accel 전용, surfel rasterizer 미사용
+        # [removed] antialiasing -- specific to the 3DGS accelerated path, unused by the surfel rasteriser
         super().__init__(parser, "Pipeline Parameters")
 
 
@@ -90,26 +91,27 @@ class OptimizationParams(ParamGroup):
         self.position_lr_delay_mult = 0.01
         self.position_lr_max_steps = 30_000
         self.feature_lr = 0.0025
-        self.opacity_lr = 0.05            # [2DGS] 기본 0.05 (S&S per-object 튜닝은 0.025)
+        self.opacity_lr = 0.05            # [2DGS] default 0.05 (S&S tuned 0.025 for per-object)
         self.scaling_lr = 0.005
         self.rotation_lr = 0.001
         self.percent_dense = 0.01
         self.lambda_dssim = 0.2
-        self.lambda_dist = 0.0            # [2DGS] depth distortion (LERF 실내: 100 권장)
+        self.lambda_dist = 0.0            # [2DGS] depth distortion (LERF indoor: 100 advised)
         self.lambda_normal = 0.05         # [2DGS] normal consistency
         self.opacity_cull = 0.05          # [2DGS] densify_and_prune min_opacity
 
         self.densification_interval = 100
-        self.opacity_reset_interval = 3000   # [2DGS] 기본 3000 (S&S per-object 튜닝은 1000)
+        self.opacity_reset_interval = 3000   # [2DGS] default 3000 (S&S tuned 1000 for per-object)
         self.densify_from_iter = 500
-        self.densify_until_iter = 15_000     # [2DGS] 기본 15000 (S&S per-object 튜닝은 10000)
+        self.densify_until_iter = 15_000     # [2DGS] default 15000 (S&S tuned 10000 for per-object)
         self.densify_grad_threshold = 0.0002
 
         self.random_background = False    # [S&S]
-        self.optimizer_type = "default"   # [S&S] (sparse_adam 미사용 — 항상 default)
-        # [제거] exposure_lr_*  (exposure 서브시스템 제거)
-        # [제거] depth_l1_weight_*  (inverse-depth 감독 제거 — 직접 depth 감독은 가이드 §5.3)
-        # [제거] max_num_splats  (train.py densify cap 제거)
+        self.optimizer_type = "default"   # [S&S] sparse_adam is unused -- always default
+        # [removed] exposure_lr_*       the exposure subsystem is gone
+        # [removed] depth_l1_weight_*   inverse-depth supervision is gone; depth is supervised
+        #                               directly instead
+        # [removed] max_num_splats      the densify cap in train.py is gone
         super().__init__(parser, "Optimization Parameters")
 
 

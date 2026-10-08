@@ -272,7 +272,6 @@ class GaussianExtractor(object):
         
         # coloring the mesh
         torch.cuda.empty_cache()
-        # as_open3d 수동변환 (trimesh 버전 호환)
         import open3d as _o3d, numpy as _np
         _om = _o3d.geometry.TriangleMesh()
         _om.vertices = _o3d.utility.Vector3dVector(_np.asarray(mesh.vertices))

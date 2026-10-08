@@ -1,31 +1,31 @@
 #
 # RefineGS - scene/gaussian_model.py
 # ---------------------------------------------------------------------------
-# BASE:  2D Gaussian Splatting (hbb1/2d-gaussian-splatting) — Inria GRAPHDECO
-# GRAFT: Split&Splat (LTTM/Split_and_Splat) instance layer
+# BASE:  2D Gaussian Splatting (hbb1/2d-gaussian-splatting) -- Inria GRAPHDECO
+# GRAFT: the Split&Splat (LTTM/Split_and_Splat) instance layer
 #
-# 머지 원칙
-#   - 2DGS 고유 geometry는 전부 보존:
-#       * 2D scaling: create_from_pcd 의 scales = ...repeat(1, 2)
+# Merge rules
+#   - Keep every piece of geometry that is specific to 2DGS:
+#       * 2D scaling: scales = ...repeat(1, 2) in create_from_pcd
 #       * surfel covariance: build_covariance_from_scaling_rotation(center, ...)
-#       * densify_and_split 의 stds 3D 패딩
-#       * add_densification_stats 의 전체 grad norm (3DGS 의 [...,:2] 아님)
-#   - Split&Splat 인스턴스 레이어만 graft:
+#       * the 3D padding of stds in densify_and_split
+#       * the full gradient norm in add_densification_stats (NOT 3DGS's [..., :2])
+#   - Graft on the Split&Splat instance layer, and nothing else:
 #       * _id (N,3), _desc_test (N,384)
 #       * get_id / get_desc / get_id_color / get_black / get_no_opacity
 #       * filter_by_id / filter_points
-#       * save_large_ply (청크 바이너리, desc 384차원 대응)
+#       * save_large_ply (chunked binary, for the 384-dimensional desc)
 #       * create_from_pcd(color_id=...)
-#       * capture/restore/prune/densify 에 id/desc 엮기
+#       * threading id/desc through capture / restore / prune / densify
 #
-# 제거된 3DGS-mip 기능 (2DGS 베이스와 정합 위해)
-#   - exposure 서브시스템 (_exposure, exposure_optimizer, get_exposure_from_name)
-#   - SparseGaussianAdam (2DGS 는 plain Adam)
+# 3DGS-mip features removed, to stay consistent with the 2DGS base:
+#   - the exposure subsystem (_exposure, exposure_optimizer, get_exposure_from_name)
+#   - SparseGaussianAdam (2DGS uses plain Adam)
 #
-# 변경 지점은 모두 "# [S&S]" 주석으로 표시.
+# Every changed site is marked with a "# [S&S]" comment.
 # ---------------------------------------------------------------------------
 
-import copy                                   # [S&S] filter_by_id / filter_points 의 deepcopy
+import copy                                   # [S&S] the deepcopy in filter_by_id / filter_points
 import os
 import struct                                 # [S&S] save_large_ply
 import numpy as np
@@ -42,10 +42,10 @@ from utils.general_utils import strip_symmetric, build_scaling_rotation
 
 
 # ---------------------------------------------------------------------------
-# [S&S] 청크 바이너리 PLY 라이터
-#   desc(384차원) 때문에 plyfile.PlyElement 일괄 변환이 무거워 S&S 는
-#   직접 바이너리로 스트리밍한다. RefineGS 도 동일하게 사용.
-#   concat 순서는 construct_list_of_attributes() 의 순서와 반드시 일치해야 함:
+# [S&S] Chunked binary PLY writer.
+#   The 384-dimensional desc makes converting everything through plyfile.PlyElement at once
+#   expensive, so S&S streams the binary itself. Kept as is.
+#   The concatenation order MUST match construct_list_of_attributes():
 #     xyz, normals, f_dc, f_rest, ids, desc, opacities, scale, rotation
 # ---------------------------------------------------------------------------
 def save_large_ply(path, xyz, normals, f_dc, f_rest, ids, desc,
@@ -84,7 +84,7 @@ def save_large_ply(path, xyz, normals, f_dc, f_rest, ids, desc,
 class GaussianModel:
 
     def setup_functions(self):
-        # [2DGS] surfel covariance: scaling(2D) 에 1 을 패딩해 4x4 변환 행렬 구성
+        # [2DGS] surfel covariance: pad the 2D scaling with 1 to build the 4x4 transform
         def build_covariance_from_scaling_rotation(center, scaling, scaling_modifier, rotation):
             RS = build_scaling_rotation(
                 torch.cat([scaling * scaling_modifier, torch.ones_like(scaling)], dim=-1),
@@ -103,7 +103,7 @@ class GaussianModel:
         self.inverse_opacity_activation = inverse_sigmoid
         self.rotation_activation = torch.nn.functional.normalize
 
-    # [S&S] active_sh_degree / optimizer_type 인자 추가 (composition 시 sh_degree=3 등)
+    # [S&S] added the active_sh_degree / optimizer_type arguments (sh_degree=3 for composition, etc.)
     def __init__(self, sh_degree: int, active_sh_degree: int = 0, optimizer_type: str = "default"):
         self.active_sh_degree = active_sh_degree
         self.optimizer_type = optimizer_type
@@ -114,11 +114,11 @@ class GaussianModel:
         self._scaling = torch.empty(0)
         self._rotation = torch.empty(0)
         self._opacity = torch.empty(0)
-        self._id = torch.empty(0)            # [S&S] 인스턴스 id (N,3)
+        self._id = torch.empty(0)            # [S&S] instance id (N,3)
         # [scene] lr for using _id as a learnable label embedding.
         # 0 keeps the original behaviour (constant per-object color).
         self._label_lr = 0.0
-        self._desc_test = torch.empty(0)     # [S&S] CLIP 디스크립터 (N,384)
+        self._desc_test = torch.empty(0)     # [S&S] CLIP descriptor (N,384)
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
@@ -196,10 +196,10 @@ class GaussianModel:
 
     @property
     def get_no_opacity(self):
-        # [S&S] full-opacity 렌더(α=1)용 — mask reprojection(3.2.2)
+        # [S&S] for a full-opacity render (alpha = 1) -- mask reprojection, section 3.2.2
         return self.opacity_activation(torch.zeros_like(self._opacity) + 1.0)
 
-    # [S&S] 인스턴스 id / descriptor 접근자
+    # [S&S] instance id / descriptor accessors
     @property
     def get_id(self):
         return self._id
@@ -210,13 +210,13 @@ class GaussianModel:
 
     @property
     def get_id_color(self):
-        # id 를 색(DC)으로 인코딩한 feature → 2-pass 마스크 렌더링에 사용
+        # The id encoded as a colour (DC) feature, for the two-pass mask rendering.
         features_dc = self._id.unsqueeze(1)                 # (N,1,3)
         features_rest = torch.zeros_like(self._features_rest)  # (N,K,3)
         return torch.cat((features_dc, features_rest), dim=1)
 
     def get_black(self, black_th=-1.75):
-        # [S&S] occlusion(검은) 가우시안 개수
+        # [S&S] how many occlusion (black) gaussians there are
         is_black = (self._features_dc < black_th).all(dim=-1).squeeze(-1)
         return is_black.sum().item()
 
@@ -224,7 +224,7 @@ class GaussianModel:
         self._desc_test[idx] = desc
 
     def get_covariance(self, scaling_modifier=1):
-        # [2DGS] center 전달
+        # [2DGS] pass the centre
         return self.covariance_activation(self.get_xyz, self.get_scaling, scaling_modifier, self._rotation)
 
     def oneupSHdegree(self):
@@ -232,7 +232,7 @@ class GaussianModel:
             self.active_sh_degree += 1
 
     # --------------------------- init ---------------------------
-    # [S&S] color_id 인자 추가 (per-object 재구성 시 인스턴스 색 지정)
+    # [S&S] added the color_id argument, which sets the instance colour for a per-object run
     def create_from_pcd(self, pcd: BasicPointCloud, spatial_lr_scale: float, color_id=None):
         self.spatial_lr_scale = spatial_lr_scale
         fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
@@ -258,7 +258,7 @@ class GaussianModel:
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
-        # [S&S] 인스턴스 id / descriptor 초기화
+        # [S&S] initialise the instance id and descriptor
         if color_id is None:
             color_id = [0.0, 0.0, 0.0]
         self._id = torch.tensor(color_id, dtype=torch.float, device="cuda").repeat(self._xyz.shape[0], 1)
@@ -304,7 +304,7 @@ class GaussianModel:
                 "call enable_label_learning() before training_setup"
             l.append({'params': [self._id], 'lr': self._label_lr, "name": "id"})
 
-        # [2DGS] plain Adam (SparseGaussianAdam 제거)
+        # [2DGS] plain Adam (SparseGaussianAdam removed)
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         self.xyz_scheduler_args = get_expon_lr_func(
             lr_init=training_args.position_lr_init * self.spatial_lr_scale,
@@ -340,7 +340,8 @@ class GaussianModel:
         mkdir_p(os.path.dirname(path))
 
         xyz = self._xyz.detach().cpu().numpy()
-        # [2DGS] normal 은 rotation 에서 렌더 시 유도되므로 PLY 에는 zeros 저장(공식 2DGS 동일)
+        # [2DGS] The normal is derived from the rotation at render time, so the PLY stores
+        #        zeros, exactly as upstream 2DGS does.
         normals = np.zeros_like(xyz)
         f_dc = self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
         f_rest = self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
@@ -351,7 +352,7 @@ class GaussianModel:
         rotation = self._rotation.detach().cpu().numpy()
 
         attrs = self.construct_list_of_attributes()
-        # [S&S] 청크 바이너리 라이터 (desc 384차원 대응)
+        # [S&S] chunked binary writer, for the 384-dimensional desc
         save_large_ply(path, xyz, normals, f_dc, f_rest, ids, descs,
                        opacities, scale, rotation, attrs, chunk=150000)
 
@@ -374,7 +375,7 @@ class GaussianModel:
         features_dc[:, 1, 0] = np.asarray(plydata.elements[0]["f_dc_1"])
         features_dc[:, 2, 0] = np.asarray(plydata.elements[0]["f_dc_2"])
 
-        # [S&S] id / descriptor 파싱
+        # [S&S] parse the id and the descriptor
         ids = np.stack((np.asarray(plydata.elements[0]["id_0"]),
                         np.asarray(plydata.elements[0]["id_1"]),
                         np.asarray(plydata.elements[0]["id_2"])), axis=1)
@@ -382,7 +383,8 @@ class GaussianModel:
         desc_keys = sorted(desc_keys, key=lambda x: int(x.split("_")[-1]))
         desc_test = np.stack([np.asarray(plydata.elements[0][k]) for k in desc_keys], axis=1)
 
-        # [S&S] f_rest 개수로 SH degree 자동 판정 (per-object 는 degree 0 일 수 있음)
+        # [S&S] Infer the SH degree from the number of f_rest entries; a per-object model can
+        #       be degree 0.
         extra_f_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("f_rest_")]
         extra_f_names = sorted(extra_f_names, key=lambda x: int(x.split('_')[-1]))
         if len(extra_f_names) == 0:
@@ -401,7 +403,7 @@ class GaussianModel:
         features_extra = features_extra.reshape((features_extra.shape[0], 3, (self.max_sh_degree + 1) ** 2 - 1))
 
         scale_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("scale_")]
-        scale_names = sorted(scale_names, key=lambda x: int(x.split('_')[-1]))  # [2DGS] 2개여야 정상
+        scale_names = sorted(scale_names, key=lambda x: int(x.split('_')[-1]))  # [2DGS] 2 is correct
         scales = np.zeros((xyz.shape[0], len(scale_names)))
         for idx, attr_name in enumerate(scale_names):
             scales[:, idx] = np.asarray(plydata.elements[0][attr_name])
@@ -493,7 +495,7 @@ class GaussianModel:
                 optimizable_tensors[group["name"]] = group["params"][0]
         return optimizable_tensors
 
-    # [S&S] new_id / new_desc 인자 추가
+    # [S&S] added the new_id / new_desc arguments
     def densification_postfix(self, new_xyz, new_features_dc, new_features_rest,
                               new_id, new_desc, new_opacities, new_scaling, new_rotation):
         d = {"xyz": new_xyz,
@@ -532,7 +534,7 @@ class GaussianModel:
             selected_pts_mask,
             torch.max(self.get_scaling, dim=1).values > self.percent_dense * scene_extent)
 
-        # [2DGS] 2D scaling → 3D 샘플링 위해 세 번째 축에 0 패딩
+        # [2DGS] 2D scaling: pad a third axis with 0 so the sampling can be 3D
         stds = self.get_scaling[selected_pts_mask].repeat(N, 1)
         stds = torch.cat([stds, 0 * torch.ones_like(stds[:, :1])], dim=-1)
         means = torch.zeros_like(stds)
@@ -588,14 +590,15 @@ class GaussianModel:
         torch.cuda.empty_cache()
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
-        # [2DGS] grad 전체 norm (3DGS 의 [...,:2] 아님)
+        # [2DGS] the full gradient norm, NOT 3DGS's [..., :2]
         self.xyz_gradient_accum[update_filter] += torch.norm(
             viewspace_point_tensor.grad[update_filter], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
 
     # --------------------------- [S&S] instance filters ---------------------------
     def filter_by_id(self, obj_id, keep_occlusions=False):
-        """인스턴스 id 로 가우시안 선택. keep_occlusions=False 면 비대상은 사실상 제거(α↓, 색 어둡게)."""
+        """Select gaussians by instance id. With keep_occlusions=False the others are
+        effectively removed: opacity down, colour darkened."""
         if not torch.is_tensor(obj_id):
             obj_id = torch.tensor(obj_id, dtype=self._id.dtype, device=self._id.device)
         if obj_id.ndim == 1:
@@ -613,7 +616,7 @@ class GaussianModel:
         return masked_gs
 
     def filter_points(self, black_th=-1.75, alpha_th=4.5):
-        """검은/투명 floater 제거된 GaussianModel 복사본 반환."""
+        """Return a copy of the GaussianModel with the black and transparent floaters removed."""
         f_dc = self._features_dc.detach().cpu().transpose(1, 2).squeeze().numpy()  # (N,3)
         opacity = self._opacity.detach().cpu().squeeze().numpy()                   # (N,)
         is_black = np.all(f_dc < black_th, axis=1)

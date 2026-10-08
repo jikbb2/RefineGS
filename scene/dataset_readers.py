@@ -258,7 +258,7 @@ def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8 ,
             filterPLY(ply_scene_path, path, cam_intrinsics, cam_extrinsics)
 
     if instance and os.path.exists(os.path.join(path, "points3d.ply")):
-        ply_path = os.path.join(path, "points3d.ply")  # [RefineGS] filterPLY 객체 init
+        ply_path = os.path.join(path, "points3d.ply") 
     try:
         pcd = fetchPly(ply_path)
     except:

@@ -1,14 +1,13 @@
 #
 # RefineGS - scene/__init__.py
-# ---------------------------------------------------------------------------
-# BASE: Split&Splat scene/__init__.py (composition/mask/instance 로직 포함)
-# 적용된 RefineGS 수정 (merged gaussian_model 와 정합):
-#   [fix1] create_from_pcd 호출에서 cam_infos 인자 제거 → (pcd, spatial_lr_scale, color_id=)
-#   [fix2] load_ply 호출 3곳에서 두 번째 인자 제거 → load_ply(path)
-#   [fix3] save() 의 exposure 블록 제거 (exposure 서브시스템 미사용)
+# BASE: Split&Splat scene/__init__.py (includes the composition / mask / instance logic)
+# RefineGS changes applied, to match the merged gaussian_model:
+#   [fix1] dropped the cam_infos argument from the create_from_pcd call
+#          -> (pcd, spatial_lr_scale, color_id=)
+#   [fix2] dropped the second argument from all three load_ply calls -> load_ply(path)
+#   [fix3] removed the exposure block from save() (the exposure subsystem is unused)
 #
-# ※ 2DGS 버전(3-인자 Colmap 호출)을 이 파일로 교체할 것.
-# ---------------------------------------------------------------------------
+# NOTE: replace the 2DGS version (which calls Colmap with three arguments) with this file.
 
 from scene.cameras import Camera
 import os
@@ -97,7 +96,7 @@ class Scene:
                                          scene_info.is_nerf_synthetic, True, mask_color=mask_color)
 
         if self.loaded_iter:
-            # [fix2] load_ply(path) — cam_infos/train_test_exp 인자 제거
+            # [fix2] load_ply(path) -- cam_infos / train_test_exp arguments dropped
             self.gaussians.load_ply(os.path.join(self.model_path, "point_cloud",
                                                  "iteration_" + str(self.loaded_iter), "point_cloud.ply"))
         else:
@@ -109,7 +108,7 @@ class Scene:
                     self.gaussians.load_ply(os.path.join(args.source_path, "sparse", "0", "points3D.ply"))  # [fix2]
             else:
                 color_id = RGB2SH(mask_color / 255)
-                # [fix1] create_from_pcd(pcd, spatial_lr_scale, color_id=) — cam_infos 제거
+                # [fix1] create_from_pcd(pcd, spatial_lr_scale, color_id=) -- cam_infos dropped
                 self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent, color_id=color_id)
 
     def save(self, iteration):
@@ -117,7 +116,7 @@ class Scene:
         save_folder = os.path.join(point_cloud_path, f"iteration_{iteration}")
         os.makedirs(save_folder, exist_ok=True)
         self.gaussians.save_ply(os.path.join(save_folder, "point_cloud.ply"))
-        # [fix3] exposure 블록 제거 (exposure 서브시스템 미사용)
+        # [fix3] exposure block removed (the exposure subsystem is unused)
 
     def getTrainCameras(self, scale=1.0):
         return self.train_cameras[scale]
